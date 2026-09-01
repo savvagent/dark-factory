@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/df-core",
+  "crates/df-auth",
+  "crates/df-mcp",
+  "crates/df-billing",
+  "crates/df-trackers",
+  "crates/df-web",
+  "crates/df-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+rust-version = "1.85"
+
+[workspace.dependencies]
+df-core = { path = "crates/df-core" }
+df-auth = { path = "crates/df-auth" }
+df-mcp = { path = "crates/df-mcp" }
+df-billing = { path = "crates/df-billing" }
+df-trackers = { path = "crates/df-trackers" }
+df-web = { path = "crates/df-web" }
+
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "macros", "migrate", "json",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+http = "1"
+rmcp = { version = "=2.0.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+schemars = { version = "1.1", features = ["chrono04"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-trait = "0.1"
+futures = "0.3"
+regex = "1"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
+aes-gcm = "0.10"
+argon2 = "0.5"
+totp-rs = { version = "5", features = ["gen_secret"] }
+jsonwebtoken = "9"
+
+[profile.release]
+lto = "thin"
+strip = true

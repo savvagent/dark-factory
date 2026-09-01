@@ -1,0 +1,126 @@
+# CLAUDE.md
+
+Guidance for Claude Code working in this repository.
+
+## What this is
+
+**dark-factory** is a hosted, multi-tenant MCP server for coordinating agentic coding work
+across enterprises and teams. Server-only — no TUI, no PTY, no local binary, no plugin.
+
+Read [`docs/specs/2026-09-01-dark-factory-design.md`](docs/specs/2026-09-01-dark-factory-design.md)
+before any non-trivial change. The build order is in
+[`docs/plans/2026-09-01-milestone-1.md`](docs/plans/2026-09-01-milestone-1.md).
+
+## The three constraints
+
+These decide scope disputes. When a change conflicts with one of them, the change is wrong.
+
+1. **Coordination is anchored on repos.** A repo is a first-class entity, not a config
+   string. Jobs belong to repos (`repo_id` is `NOT NULL`); leases are repo-scoped; an
+   unresolvable repo is an error naming the registered slugs, never a silent fallback.
+2. **Substrate, not workflow.** dark-factory ships no opinion about how work is specified,
+   planned, reviewed, or measured. If a capability could live either in the server or in a
+   customer's own skill calling the server, **it belongs in the skill**. Jobs carry an
+   opaque `metadata` JSONB field for exactly this reason — the server never interprets it.
+3. **Coding-agent agnostic.** Claude Code, Copilot CLI, Cursor, Codex and anything else
+   speaking MCP are equally first-class. Never depend on a specific client's hook, plugin,
+   or skill system; never validate `agentType` against a list; never add a client-specific
+   tool annotation. If a feature only works in one agent, it does not ship.
+
+## Tenant isolation — the rule that outranks convenience
+
+One org must never see or touch another's data. Two independent guards, and **both** are
+required for any new tenant table:
+
+1. **API shape.** Tenant data is reachable only through `Tx`, which cannot be constructed
+   without an `OrgId`. Every statement carries `org_id = $1` explicitly, even though RLS
+   would also filter it — the predicate keeps plans index-friendly and intent legible.
+2. **Row-level security.** `Db::begin` issues `SET LOCAL ROLE df_app` **and**
+   `SET LOCAL app.org_id`. Both matter. Postgres exempts superusers and table owners from
+   their own RLS policies, and the connecting user is frequently one or both, so **without
+   the `SET LOCAL ROLE` the policies do nothing at all**. This was verified empirically,
+   not assumed.
+
+When you add a tenant table: give it a `NOT NULL org_id`, add it to the `tenant_tables`
+array in `0007_rls.sql`, and add a cross-org negative test. A tenant-scoped function
+without a cross-org negative test is not done.
+
+Note that ordinary cross-org tests pass on the strength of guard 1 alone. The tests that
+actually exercise RLS are the `rls_scopes_*` ones in `tests/isolation.rs`, which issue
+deliberately **unscoped** SQL inside a pinned transaction. Keep that distinction — a test
+suite that cannot tell the two guards apart cannot tell you when one has broken.
+
+## Commands
+
+```bash
+podman compose up -d          # Postgres 16 on host port 15433
+cp .env.example .env          # DATABASE_URL for sqlx
+cargo test                    # everything
+cargo test -p df-core --test isolation   # tenant isolation
+cargo test -p df-core --test queue       # queue behaviour
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all
+```
+
+Integration tests are `#[sqlx::test]` against a real Postgres — one fresh throwaway
+database per test, migrations auto-applied. There are no mocks for the database, on
+purpose: RLS, `FOR UPDATE`, `LISTEN`/`NOTIFY`, and enum round-tripping are the things most
+likely to be wrong, and a mock cannot tell you about any of them.
+
+## Architecture
+
+One binary (`df-server`) mounts every HTTP surface on one port. The crates are a
+compile-time layering discipline, not separate services.
+
+| Crate | Responsibility |
+|---|---|
+| `df-core` | Domain + **all** SQL. No HTTP, no auth. Every tenant fn takes an `OrgId`. |
+| `df-auth` | OAuth 2.1 AS, TOTP, enterprise OIDC federation, personal access tokens. |
+| `df-mcp` | `rmcp` Streamable HTTP server, tool surface, resource-server middleware. |
+| `df-billing` | Usage recording, period counters, tier limits. |
+| `df-trackers` | GitHub App + JIRA clients, webhook ingest, two-way sync. |
+| `df-web` | Console REST API, session cookies, the AS's HTML endpoints. |
+| `df-server` | Config, migrations, router assembly, graceful shutdown. |
+
+**Every SQL statement lives in `df-core`.** A query in `df-mcp` or `df-web` is a bug — it
+bypasses the `Tx` pinning that guard 2 depends on.
+
+## Migrations
+
+Forward-only, one file per concern, in `crates/df-core/migrations/`. Never edit a migration
+that has been applied anywhere; add a new one. `0007_rls.sql` runs last so earlier
+migrations' tests are not fighting policies mid-build.
+
+## Authentication
+
+Two layers that must not be conflated:
+
+- **Layer 1 — what a client may do**: OAuth 2.1 (PKCE S256 mandatory, RFC 7591 dynamic
+  registration, RFC 8707 resource indicators enforced), plus personal access tokens for
+  clients with incomplete OAuth support. Tokens are opaque and stored only as SHA-256
+  hashes. A token's org is fixed at issuance and cannot be pivoted.
+- **Layer 2 — who the human is**: passwordless TOTP for individuals, enterprise OIDC
+  federation for orgs that bind an IdP. No password is ever accepted or stored.
+
+TOTP without recovery is not shippable — recovery codes and the email magic link are part
+of the feature, not a follow-up.
+
+## Metering
+
+The billable unit is the MCP tool call, but the free/billable classification in
+`df-billing` is load-bearing: `watch` is a continuous long poll, and billing it flat would
+charge an idle agent tens of thousands of calls a month. Record every call regardless of
+class so the classification can be repriced without losing history. Counter increments go
+in the **same transaction** as the tool's own work — a failed call is not billed, and a
+successful one is never billed twice.
+
+## Style
+
+- Errors are written for an LLM caller that has never read the docs: say what went wrong,
+  what the valid options were, and what to call next. `Error::code()` is the stable
+  machine-readable branch point; `retriable()` tells an agent whether to back off or
+  rethink.
+- Comments explain **why**, especially where the obvious implementation is wrong (see
+  `Db::begin`, `normalize_remote`, `Watcher::wait`). Do not narrate what the code says.
+- No `unwrap()` outside tests. No silent fallbacks on a resolution failure — errors that
+  guess are worse than errors that stop.
