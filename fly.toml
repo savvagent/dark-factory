@@ -22,6 +22,11 @@ primary_region = "iad"
   # calls the client — is attacker-chosen. Keying a rate limiter on that is
   # worse than not having one, because it looks like it is working.
   # Fly-Client-IP is written by the proxy and holds exactly one address.
+  #
+  # If Cloudflare is put in front of this app, both of these change: the header
+  # becomes cf-connecting-ip, and DF_ALLOWED_HOSTS has to name this app's own
+  # hostname because the Worker's subrequest arrives with it in Host. See
+  # docs/deploy/cloudflare.md — neither is optional and neither fails loudly.
   DF_CLIENT_IP_HEADER = "fly-client-ip"
 
 [http_service]

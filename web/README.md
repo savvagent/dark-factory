@@ -9,9 +9,10 @@ client how to connect.
 ```bash
 npm install
 npm run dev      # Vite on :5173, proxying /api /oauth /.well-known to DF_API_ORIGIN
-npm run check    # svelte-check — the type gate
+npm run check    # svelte-check + tsc over worker/ — the type gate
 npm run lint     # prettier --check
 npm run build    # static bundle in build/
+npm run deploy   # build, then wrangler deploy — see docs/deploy/cloudflare.md
 ```
 
 `npm run dev` needs a server behind it. Set `DF_API_ORIGIN` if it is not on
@@ -73,11 +74,34 @@ points at production.
 | `src/lib/org.svelte.ts`     | The org the current route is about, via context.                             |
 | `src/lib/clients.ts`        | One recipe per coding agent, all the same shape.                             |
 | `src/routes/`               | Public pages at the root; org pages under `/o/[org]`.                        |
+| `worker/index.ts`           | The Cloudflare Worker: serves this bundle, proxies the API to `df-server`.   |
+| `wrangler.jsonc`            | That Worker's config. `worker/tsconfig.json` type-checks it separately.      |
 
 Org pages live under `/o/[org]` rather than `/[org]` so that no org slug can ever collide
 with a page name. The routes the _server_ names — `/login`, `/verify`, `/recover`,
 `/invite/{org}`, `/settings/billing` — are fixed by what goes in email and in
 `df-billing`'s upgrade prompt, and must not be renamed here alone.
+
+## Deploying to Cloudflare
+
+`npm run deploy` uploads `build/` and `worker/index.ts` as one Worker: Cloudflare serves the
+SPA from its own network and the Worker forwards `/api`, `/oauth`, `/.well-known`, `/mcp`,
+`/healthz` and `/readyz` to `df-server`.
+
+It proxies rather than redirecting for the same reason the app is a SPA at all — the
+`__Host-` cookie is bound to one origin, so the API cannot live on a second hostname. The
+prefix list in `worker/index.ts` mirrors `API_PREFIXES` in `crates/df-server/src/lib.rs` and
+must not drift from it.
+
+Two things on the `df-server` side are not optional and are easy to miss:
+`DF_ALLOWED_HOSTS` must name the origin's own hostname, or every authenticated MCP call
+fails while everything else looks healthy; and the origin must refuse traffic that did not
+come through Cloudflare, because `DF_CLIENT_IP_HEADER=cf-connecting-ip` is only trustworthy
+while Cloudflare is the one writing it. [`docs/deploy/cloudflare.md`](../docs/deploy/cloudflare.md)
+has both, and what a local `wrangler dev` run proved about each.
+
+None of this is required to run the console. `df-server` still serves `build/` itself, which
+is what a self-hosted deployment does.
 
 ## Adding a client to the connect page
 

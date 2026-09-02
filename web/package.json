@@ -7,15 +7,18 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && npm run check:worker",
+    "check:worker": "tsc -p worker/tsconfig.json --noEmit",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "format": "prettier --write .",
-    "lint": "prettier --check ."
+    "lint": "prettier --check .",
+    "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260902.1",
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.70.3",
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
@@ -28,6 +31,7 @@
     "svelte-check": "^4.7.6",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
-    "vite": "^8.2.2"
+    "vite": "^8.2.2",
+    "wrangler": "^4.128.0"
   }
 }
