@@ -16,11 +16,13 @@ pub mod audit;
 pub mod db;
 pub mod error;
 pub mod ids;
+pub mod invites;
 pub mod jobs;
 pub mod leases;
 pub mod messages;
 pub mod orgs;
 pub mod repos;
+pub mod teams;
 pub mod usage;
 pub mod watch;
 

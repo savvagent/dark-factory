@@ -103,7 +103,15 @@ pub struct RepoRef {
 pub struct RepoPatch {
     pub name: Option<String>,
     pub default_branch: Option<String>,
-    pub team_id: Option<TeamId>,
+    /// Three states, not two: `None` leaves the team alone, `Some(Some(id))`
+    /// moves the repo to that team, and `Some(None)` makes it org-wide.
+    ///
+    /// A plain `Option<TeamId>` cannot express the last one — "absent" and
+    /// "clear it" collapse into the same value — so a repo could be scoped to a
+    /// team and never unscoped. That is not a cosmetic gap: `delete_team`
+    /// refuses while repos are still scoped to it, so without a way to unassign
+    /// them a team becomes undeletable.
+    pub team_id: Option<Option<TeamId>>,
     pub default_agent_type: Option<String>,
     pub tracker_binding: Option<serde_json::Value>,
     pub active: Option<bool>,
@@ -203,10 +211,34 @@ const REPO_COLS: &str = "id, org_id, slug, name, provider, default_branch, team_
                          default_agent_type, tracker_binding, active, created_at, created_by";
 
 impl Tx<'_> {
+    /// Prove a team id belongs to this transaction's org before it is written
+    /// onto a repo. The schema's foreign key alone cannot express that — it is
+    /// `REFERENCES teams(id)`, not a composite `(org_id, team_id)` one — so
+    /// without this check a leaked or guessed team id from another tenant
+    /// would attach silently, and deleting that foreign team would later null
+    /// out this repo's assignment out from under it.
+    async fn require_team_in_org(&mut self, team: TeamId) -> Result<()> {
+        self.get_team(team)
+            .await?
+            .ok_or_else(|| Error::TeamNotFound {
+                slug: team.to_string(),
+                known: "unknown".into(),
+            })?;
+        Ok(())
+    }
+
     /// Register a repo and its remotes.
     pub async fn register_repo(&mut self, new: NewRepo) -> Result<Repo> {
         if new.slug.trim().is_empty() {
             return Err(Error::Invalid("repo slug must not be empty".into()));
+        }
+
+        // `team_id` only has a schema-level `REFERENCES teams(id)`, not a
+        // composite `(org_id, team_id)` one, so a team UUID from another
+        // tenant would otherwise attach silently. Resolving it through this
+        // same pinned `Tx` proves it belongs to this org before the insert.
+        if let Some(team) = new.team_id {
+            self.require_team_in_org(team).await?;
         }
 
         let normalized: Vec<String> = new
@@ -417,22 +449,31 @@ impl Tx<'_> {
     /// registration, so a remote already claimed by a sibling repo is an error
     /// naming that repo rather than a silent re-point.
     pub async fn update_repo(&mut self, id: RepoId, patch: RepoPatch) -> Result<Repo> {
+        // Same cross-tenant risk as registration: a bare foreign key would
+        // accept a team id from another org.
+        if let Some(Some(team)) = patch.team_id {
+            self.require_team_in_org(team).await?;
+        }
+
         let org = self.org();
 
         let repo: Repo = sqlx::query_as(&format!(
             "UPDATE repos SET name = COALESCE($3, name), \
                     default_branch = COALESCE($4, default_branch), \
-                    team_id = COALESCE($5, team_id), \
-                    default_agent_type = COALESCE($6, default_agent_type), \
-                    tracker_binding = COALESCE($7, tracker_binding), \
-                    active = COALESCE($8, active) \
+                    team_id = CASE WHEN $5 THEN $6 ELSE team_id END, \
+                    default_agent_type = COALESCE($7, default_agent_type), \
+                    tracker_binding = COALESCE($8, tracker_binding), \
+                    active = COALESCE($9, active) \
              WHERE org_id = $1 AND id = $2 RETURNING {REPO_COLS}"
         ))
         .bind(org)
         .bind(id)
         .bind(patch.name.as_deref())
         .bind(patch.default_branch.as_deref())
-        .bind(patch.team_id)
+        // COALESCE cannot express "set this to NULL", so the team is written
+        // through an explicit "was it named?" flag instead.
+        .bind(patch.team_id.is_some())
+        .bind(patch.team_id.flatten())
         .bind(patch.default_agent_type.as_deref())
         .bind(patch.tracker_binding.as_ref())
         .bind(patch.active)

@@ -464,6 +464,70 @@ pub async fn list_tokens(db: &Db, user: UserId, org: OrgId) -> Result<Vec<TokenS
     Ok(rows)
 }
 
+/// Revoke every token a user holds **in one org**.
+///
+/// What removing someone from an org has to do, and the reason it is scoped
+/// rather than global: a token's org is fixed at issuance, so a person who is
+/// still a member of two other orgs keeps working there. Leaving these behind
+/// is the failure worth naming — a removed member's agent would keep claiming
+/// jobs on a token that outlives their membership by up to its full lifetime,
+/// and nothing in the console would explain why.
+pub async fn revoke_all_in_org(db: &Db, user: UserId, org: OrgId) -> Result<u64> {
+    // Both updates run in one transaction: if the refresh-token statement
+    // failed after the access-token one had already committed, a removed
+    // member's refresh token would still mint a fresh access token, undoing
+    // the revocation this function exists to guarantee.
+    let mut tx = db.begin_unpinned().await?;
+    let revoked = revoke_all_in_org_on(&mut tx, user, org).await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
+
+/// The same revocation as [`revoke_all_in_org`], but run against a connection
+/// the caller already holds a transaction on.
+///
+/// Membership removal calls this: deleting the `org_members` row and revoking
+/// the removed member's tokens for that org must commit together, or a
+/// failure of the second half after the first has committed leaves a
+/// dangling member-shaped bearer token — introspection does not re-check
+/// membership, so it would go on working until it naturally expired.
+pub async fn revoke_all_in_org_tx(
+    conn: &mut sqlx::PgConnection,
+    user: UserId,
+    org: OrgId,
+) -> Result<u64> {
+    revoke_all_in_org_on(conn, user, org).await
+}
+
+async fn revoke_all_in_org_on(
+    conn: &mut sqlx::PgConnection,
+    user: UserId,
+    org: OrgId,
+) -> Result<u64> {
+    let access = sqlx::query(
+        "UPDATE access_tokens SET revoked_at = now() \
+         WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+
+    // Refresh tokens too, or the next refresh quietly mints a working access
+    // token for someone who was just removed.
+    sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now() \
+         WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(access)
+}
+
 /// Revoke one token by id, scoped to its owner so a user cannot revoke another's.
 pub async fn revoke_by_id(db: &Db, user: UserId, org: OrgId, id: Uuid) -> Result<bool> {
     let n = sqlx::query(
