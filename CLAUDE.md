@@ -136,11 +136,25 @@ of the feature, not a follow-up.
 ## Metering
 
 The billable unit is the MCP tool call, but the free/billable classification in
-`df-billing` is load-bearing: `watch` is a continuous long poll, and billing it flat would
-charge an idle agent tens of thousands of calls a month. Record every call regardless of
-class so the classification can be repriced without losing history. Counter increments go
-in the **same transaction** as the tool's own work — a failed call is not billed, and a
-successful one is never billed twice.
+`df-billing::classify` is load-bearing: `watch` is a continuous long poll, and billing it
+flat would charge an idle agent tens of thousands of calls a month. Record every call
+regardless of class so the classification can be repriced without losing history.
+
+Three rules hold, and the first is what makes the other two true:
+
+1. **The meter runs inside the tool's own transaction, before the work.** `Factory::charge`
+   is the first thing after `self.tx(...)`. A failed call rolls the meter back with
+   everything else, so it is never billed; a successful one has no second transaction to
+   retry, so it is never billed twice. `watch` is the one exception — it meters in a short
+   transaction of its own, because holding one open across a thirty-second poll would pin
+   a connection per idle agent.
+2. **A new tool must be classified.** `exhaustive_over` compares the router against the
+   price list and `every_tool_has_a_price` fails when they disagree. An unclassified tool
+   is treated as free and logged: over-billing a customer for something nobody decided to
+   charge for is a worse failure than under-billing ourselves.
+3. **Enforcement never blocks a read.** It is behind `DF_ENFORCE_QUOTAS`, off by default,
+   and refuses only billable tools on hard-stop plans. An org that runs out mid-task keeps
+   full read access to its own queue.
 
 ## Style
 

@@ -104,6 +104,7 @@ impl Factory {
         caller.require_scope(scope::REPOS_WRITE).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "register_repo").await?;
         let repo = tx
             .register_repo(NewRepo {
                 slug: args.slug,
@@ -137,6 +138,7 @@ impl Factory {
         caller.require_scope(scope::REPOS_READ).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "list_repos").await?;
         let repos = tx.list_repos(args.include_inactive).await.mcp()?;
         tx.commit().await.mcp()?;
 
@@ -159,6 +161,7 @@ impl Factory {
         caller.require_scope(scope::REPOS_READ).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "resolve_repo").await?;
         let repo = repo_of(&mut tx, args.repo, args.remote).await?;
         tx.commit().await.mcp()?;
 
@@ -182,6 +185,7 @@ impl Factory {
         caller.require_scope(scope::REPOS_WRITE).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "update_repo").await?;
         let repo = repo_of(&mut tx, args.repo, args.remote).await?;
         let updated = tx
             .update_repo(

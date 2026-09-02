@@ -32,6 +32,7 @@
 use std::sync::Arc;
 
 use df_auth::tokens::Principal;
+use df_billing::Meter;
 use df_core::watch::Watcher;
 use df_core::{Db, Tx};
 use rmcp::handler::server::tool::ToolRouter;
@@ -71,21 +72,27 @@ changes and returns 'changed' or 'timeout'; call it again either way. Your own \
 messages never wake you.
 
 Jobs carry a free-form `metadata` object that this server never reads or \
-interprets. Put whatever your own workflow needs in it.";
+interprets. Put whatever your own workflow needs in it.
+
+You are billed for work performed, not for looking: reads, watch, and lease \
+renewals cost nothing, while queueing, claiming, completing and messaging \
+consume the plan's monthly allowance. Call usage to see where you stand.";
 
 /// The service. Cheap to clone, because `rmcp` builds one per session.
 #[derive(Clone)]
 pub struct Factory {
     db: Db,
     watcher: Arc<Watcher>,
+    meter: Arc<Meter>,
     tool_router: ToolRouter<Self>,
 }
 
 impl Factory {
-    pub fn new(db: Db, watcher: Arc<Watcher>) -> Self {
+    pub fn new(db: Db, watcher: Arc<Watcher>, meter: Meter) -> Self {
         Self {
             db,
             watcher,
+            meter: Arc::new(meter),
             tool_router: crate::tools::router(),
         }
     }
@@ -96,6 +103,35 @@ impl Factory {
 
     pub fn watcher(&self) -> &Arc<Watcher> {
         &self.watcher
+    }
+
+    pub fn meter(&self) -> &Meter {
+        &self.meter
+    }
+
+    /// Meter this call inside the tool's own transaction, refusing it if the
+    /// org is out of budget.
+    ///
+    /// Called immediately after the transaction opens and **before** the tool
+    /// does anything. That ordering is what makes "a failed call is not billed"
+    /// true rather than aspirational: the usage row lives in the same
+    /// transaction as the work, so a tool that returns an error rolls back the
+    /// meter along with everything else. Charging afterwards would need a
+    /// second transaction, which can fail on its own, and a bill that
+    /// disagrees with what happened is worse than no bill.
+    ///
+    /// It also puts the quota check where a refusal is cheapest — before the
+    /// work, not after it.
+    pub async fn charge(
+        &self,
+        tx: &mut Tx<'_>,
+        caller: &Principal,
+        tool: &str,
+    ) -> Result<df_billing::Charge, ErrorData> {
+        self.meter
+            .charge(tx, caller.user_id, tool)
+            .await
+            .map_err(|e| error::from_billing(&e))
     }
 
     /// The principal for the HTTP request this tool call arrived on.
@@ -148,6 +184,12 @@ impl<T> McpResult<T> for df_auth::Result<T> {
     }
 }
 
+impl<T> McpResult<T> for df_billing::Result<T> {
+    fn mcp(self) -> Result<T, ErrorData> {
+        self.map_err(|e| error::from_billing(&e))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +208,7 @@ mod tests {
             "complete_job",
             "acquire_lease",
             "watch",
+            "usage",
         ] {
             assert!(
                 INSTRUCTIONS.contains(tool),

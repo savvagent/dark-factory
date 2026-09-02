@@ -69,6 +69,15 @@ pub struct Config {
     /// the check, which is right for a surface reached by CLI agents rather
     /// than by pages.
     pub allowed_origins: Vec<String>,
+    /// Refuse billable calls once an org on a hard-stop plan is past its
+    /// bucket. **Off by default**, and off for milestone 1: recording history
+    /// is worth having long before anyone's work is refused over it, and a
+    /// counter that starts rejecting calls before the numbers have been
+    /// watched in anger is a support incident rather than a revenue feature.
+    pub enforce_quotas: bool,
+    /// Where a caller who has run out is sent. Named in the refusal itself,
+    /// because an error that says "upgrade" without saying where is a dead end.
+    pub upgrade_url: String,
 }
 
 impl Config {
@@ -83,6 +92,8 @@ impl Config {
             resource_uri: resource_uri.into(),
             allowed_hosts: if host.is_empty() { vec![] } else { vec![host] },
             allowed_origins: vec![],
+            enforce_quotas: false,
+            upgrade_url: format!("{}/settings/billing", public_url.trim_end_matches('/')),
             public_url,
         }
     }
@@ -118,7 +129,11 @@ pub fn router(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
     transport.allowed_hosts = config.allowed_hosts;
     transport.allowed_origins = config.allowed_origins;
 
-    let factory = Factory::new(db, watcher);
+    let factory = Factory::new(
+        db,
+        watcher,
+        df_billing::Meter::new(config.enforce_quotas, config.upgrade_url),
+    );
     let service = StreamableHttpService::new(
         // Called per session. `Factory` is cheap to clone — a pool handle, an
         // `Arc`, and the tool router — so this is not a per-request cost worth

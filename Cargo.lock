@@ -430,6 +430,7 @@ dependencies = [
  "hmac",
  "http",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",

@@ -184,6 +184,7 @@ impl Factory {
 
         let job = args.job.map(JobId::from);
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "acquire_lease").await?;
         let repo = repo_of(&mut tx, args.repo, args.remote).await?;
         let lease = tx
             .acquire_lease(
@@ -217,6 +218,7 @@ impl Factory {
 
         let id = lease_id(&args.lease)?;
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "renew_lease").await?;
         let lease = tx
             .renew_lease(id, caller.user_id, args.ttl_seconds)
             .await
@@ -241,6 +243,7 @@ impl Factory {
 
         let id = lease_id(&args.lease)?;
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "release_lease").await?;
         tx.release_lease(id, caller.user_id).await.mcp()?;
         tx.commit().await.mcp()?;
 
@@ -262,6 +265,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_READ).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "list_leases").await?;
         let repo_id = maybe_repo_of(&mut tx, args.repo, args.remote).await?;
         let leases = tx.list_leases(repo_id).await.mcp()?;
         tx.commit().await.mcp()?;
@@ -291,6 +295,7 @@ impl Factory {
         };
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "send_message").await?;
         let repo_id = maybe_repo_of(&mut tx, args.repo, args.remote).await?;
         let message = tx
             .send_message(
@@ -340,6 +345,7 @@ impl Factory {
         };
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "inbox").await?;
         let messages = tx.inbox(caller.user_id, &q).await.mcp()?;
         tx.commit().await.mcp()?;
 
@@ -361,6 +367,7 @@ impl Factory {
         caller.require_scope(scope::MESSAGES).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "ack_messages").await?;
         let cursor = tx.ack_messages(caller.user_id, args.up_to).await.mcp()?;
         tx.commit().await.mcp()?;
 
@@ -381,6 +388,7 @@ impl Factory {
         caller.require_scope(scope::MESSAGES).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "unread_count").await?;
         let unread = tx.unread_count(caller.user_id).await.mcp()?;
         tx.commit().await.mcp()?;
 
@@ -409,9 +417,17 @@ impl Factory {
             .unwrap_or(WATCH_DEFAULT_SECS)
             .clamp(1, WATCH_MAX_SECS);
 
-        // No transaction is open across the wait. Holding one for thirty
-        // seconds per connected agent would pin a pool connection per idle
-        // agent and exhaust the pool long before the queue was busy.
+        // Metered in a transaction of its own, committed before the wait
+        // starts. Every other tool records inside the transaction doing the
+        // work, which is what makes a failed call unbilled — but this call's
+        // "work" is to sit still for thirty seconds, and holding a transaction
+        // open for that long would pin a pool connection per idle agent and
+        // exhaust the pool long before the queue was ever busy. `watch` is
+        // free, so there is no billing consequence to recording it up front.
+        let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "watch").await?;
+        tx.commit().await.mcp()?;
+
         let outcome = self
             .watcher()
             .wait(

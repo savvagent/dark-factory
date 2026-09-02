@@ -21,6 +21,7 @@ pub mod leases;
 pub mod messages;
 pub mod orgs;
 pub mod repos;
+pub mod usage;
 pub mod watch;
 
 pub use db::{Db, Tx};

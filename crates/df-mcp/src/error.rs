@@ -111,6 +111,27 @@ fn auth_code(e: &df_auth::AuthError) -> &'static str {
     }
 }
 
+/// Convert a metering failure.
+///
+/// A quota refusal is not an argument error and must not read like one: the
+/// call was well-formed and the agent should stop rather than rewrite it. The
+/// message names the plan, the limit, and the URL a human goes to, because an
+/// agent that cannot say *what to do about it* just retries.
+pub fn from_billing(e: &df_billing::BillingError) -> ErrorData {
+    if let df_billing::BillingError::Core(inner) = e {
+        return from_core(inner);
+    }
+
+    ErrorData::new(
+        ErrorCode::INVALID_REQUEST,
+        e.to_string(),
+        Some(serde_json::json!({
+            "code": e.code(),
+            "retriable": e.retriable(),
+        })),
+    )
+}
+
 /// The error a tool returns when it cannot find an authenticated caller.
 ///
 /// This should be unreachable in production — the middleware refuses the
@@ -175,6 +196,40 @@ mod tests {
         assert_eq!(converted.code, ErrorCode::INTERNAL_ERROR);
         assert!(!converted.message.to_lowercase().contains("row"));
         assert_eq!(converted.data.unwrap()["retriable"], true);
+    }
+
+    /// A refusal an agent cannot fix by trying again has to say so, and say
+    /// where a human can fix it, or the agent retries until something gives up.
+    #[test]
+    fn a_quota_refusal_is_actionable_and_not_retriable() {
+        let e = from_billing(&df_billing::BillingError::QuotaExceeded {
+            tool: "add_job".into(),
+            used: 500,
+            included: 500,
+            plan: "Free".into(),
+            upgrade_url: "https://example.test/settings/billing".into(),
+        });
+
+        let data = e.data.as_ref().unwrap();
+        assert_eq!(data["code"], "quota_exceeded");
+        assert_eq!(data["retriable"], false);
+        assert!(e.message.contains("add_job"));
+        assert!(e.message.contains("Free"));
+        assert!(e.message.contains("https://example.test/settings/billing"));
+        assert!(
+            e.message.contains("Reads still work"),
+            "the caller needs to know what it can still do"
+        );
+    }
+
+    /// A database failure that reaches us through billing is still a database
+    /// failure, and must not be reported as a quota problem.
+    #[test]
+    fn a_core_failure_under_billing_keeps_its_own_identity() {
+        let e = from_billing(&df_billing::BillingError::Core(CoreError::Db(
+            sqlx::Error::RowNotFound,
+        )));
+        assert_eq!(e.code, ErrorCode::INTERNAL_ERROR);
     }
 
     /// Credential failures collapse to one answer; a missing scope does not,

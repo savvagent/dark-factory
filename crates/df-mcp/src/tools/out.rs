@@ -135,6 +135,11 @@ pub struct WhoAmI {
     /// The caller's role in this org, if they are still a member.
     pub role: Option<Role>,
     pub token: TokenOut,
+    /// Where this org stands against its monthly allowance. Here as well as in
+    /// `usage` because an agent that calls one thing at the start of a session
+    /// calls this one, and finding out it is nearly out of budget after the
+    /// work is queued is finding out too late.
+    pub usage: df_billing::Status,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -163,4 +168,10 @@ pub struct TokenOut {
     pub client_id: Option<String>,
     pub scopes: Vec<String>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOut {
+    pub usage: df_billing::Status,
 }

@@ -168,6 +168,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_WRITE).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "add_job").await?;
         let repo = repo_of(&mut tx, args.repo, args.remote).await?;
         let job = tx
             .add_job(NewJob {
@@ -202,6 +203,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_READ).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "get_job").await?;
         let job = tx.get_job(&JobId::from(args.job)).await.mcp()?;
         tx.commit().await.mcp()?;
 
@@ -232,6 +234,7 @@ impl Factory {
             .mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "list_jobs").await?;
         let repo_id = maybe_repo_of(&mut tx, args.repo, args.remote).await?;
         let jobs = tx
             .list_jobs(&JobFilter {
@@ -264,6 +267,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_WRITE).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "update_job").await?;
         let job = tx
             .update_job(
                 &JobId::from(args.job),
@@ -294,6 +298,7 @@ impl Factory {
 
         let id = JobId::from(args.job);
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "delete_job").await?;
         tx.delete_job(&id).await.mcp()?;
         tx.commit().await.mcp()?;
 
@@ -317,6 +322,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_WRITE).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "claim_jobs").await?;
         let jobs = tx
             .claim_jobs(&ids(args.jobs), caller.user_id, args.agent.as_deref())
             .await
@@ -340,6 +346,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_WRITE).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "complete_job").await?;
         let job = tx
             .complete_job(&JobId::from(args.job), args.result.as_deref())
             .await
@@ -364,6 +371,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_WRITE).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "fail_job").await?;
         let job = tx
             .fail_job(&JobId::from(args.job), args.error.as_deref())
             .await
@@ -387,6 +395,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_WRITE).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "repend_job").await?;
         let job = tx.repend_job(&JobId::from(args.job)).await.mcp()?;
         tx.commit().await.mcp()?;
 
@@ -410,6 +419,7 @@ impl Factory {
 
         let job = JobId::from(args.job);
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "set_dependencies").await?;
         let deps = tx
             .set_dependencies(&job, &ids(args.add), &ids(args.remove))
             .await
@@ -436,6 +446,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_READ).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "ready").await?;
         let repo_id = maybe_repo_of(&mut tx, args.repo, args.remote).await?;
         let jobs = tx.ready(repo_id).await.mcp()?;
         tx.commit().await.mcp()?;
@@ -457,6 +468,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_READ).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "blocked").await?;
         let repo_id = maybe_repo_of(&mut tx, args.repo, args.remote).await?;
         let jobs = tx.blocked(repo_id).await.mcp()?;
         tx.commit().await.mcp()?;
@@ -479,6 +491,7 @@ impl Factory {
         caller.require_scope(scope::JOBS_READ).mcp()?;
 
         let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "stats").await?;
         let repo_id = maybe_repo_of(&mut tx, args.repo, args.remote).await?;
         let stats = tx.stats(repo_id).await.mcp()?;
         tx.commit().await.mcp()?;

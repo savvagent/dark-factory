@@ -8,6 +8,7 @@
 //! skipped them would let the whole zero-install premise break silently.
 
 use df_auth::tokens::{Principal, TokenKind};
+use df_billing::Meter;
 use df_core::ids::{OrgId, UserId};
 use df_core::orgs::Role;
 use df_core::watch::Watcher;
@@ -22,6 +23,7 @@ use sqlx::PgPool;
 const RESOURCE: &str = "https://mcp.dark-factory.test/mcp";
 const PUBLIC: &str = "https://mcp.dark-factory.test";
 const REMOTE: &str = "git@github.com:acme/api.git";
+const UPGRADE_URL: &str = "https://mcp.dark-factory.test/settings/billing";
 
 /// Everything a token can carry, for the tests that are not about scopes.
 fn all_scopes() -> Vec<String> {
@@ -100,6 +102,12 @@ struct Env {
 }
 
 async fn env(pool: PgPool) -> (Env, Principal) {
+    // Enforcement off, matching the milestone-1 default: recording is on,
+    // refusing is not.
+    env_metered(pool, Meter::new(false, UPGRADE_URL)).await
+}
+
+async fn env_metered(pool: PgPool, meter: Meter) -> (Env, Principal) {
     let db = Db::from_pool(pool.clone());
     let watcher = Watcher::spawn(pool).await.expect("watcher");
 
@@ -110,7 +118,7 @@ async fn env(pool: PgPool) -> (Env, Principal) {
     let caller = principal(user.id, org.id, all_scopes());
     (
         Env {
-            factory: Factory::new(db.clone(), watcher),
+            factory: Factory::new(db.clone(), watcher, meter),
             db,
         },
         caller,
@@ -143,6 +151,15 @@ impl Env {
                 }),
             )
             .await)["repo"]
+            .clone()
+    }
+
+    /// This org's standing, read through the `usage` tool.
+    async fn usage(&self, caller: &Principal) -> serde_json::Value {
+        ok(self
+            .factory
+            .usage(Extension(parts(caller)), Parameters(tools::org::NoArgs {}))
+            .await)["usage"]
             .clone()
     }
 
@@ -869,6 +886,7 @@ fn the_advertised_surface_is_exactly_what_the_design_specifies() {
         "watch",
         // Org
         "whoami",
+        "usage",
     ];
     expected.sort();
 
@@ -1010,5 +1028,263 @@ async fn a_token_for_another_resource_is_refused(pool: PgPool) {
     assert!(
         challenge.contains("different resource"),
         "the caller needs to know that re-authenticating will not help: {challenge}"
+    );
+}
+
+// ------------------------------------------------------------------ metering
+
+/// The tool surface and the price list are two lists in two crates that have to
+/// agree. Nothing else notices when they stop.
+#[test]
+fn every_tool_has_a_price() {
+    let names: Vec<String> = tools::router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+
+    let problems = df_billing::classify::exhaustive_over(names.iter().map(String::as_str));
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// The rule as customers are told it: you pay for work performed, not for
+/// looking. Both kinds are recorded either way, so the split can be repriced
+/// later against real history.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn work_is_billed_and_looking_is_not(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    let before = env.usage(&caller).await;
+    let billable_before = before["billableUsed"].as_i64().unwrap();
+    let total_before = before["totalCalls"].as_i64().unwrap();
+
+    // One billable call.
+    env.add_job(&caller, "work").await;
+
+    // Three free ones.
+    for _ in 0..3 {
+        ok(env
+            .factory
+            .ready(
+                Extension(parts(&caller)),
+                Parameters(tools::jobs::RepoScopeArgs::default()),
+            )
+            .await);
+    }
+
+    let after = env.usage(&caller).await;
+    assert_eq!(
+        after["billableUsed"].as_i64().unwrap() - billable_before,
+        1,
+        "only the add_job should have consumed the bucket"
+    );
+    assert_eq!(
+        after["totalCalls"].as_i64().unwrap() - total_before,
+        // add_job + 3 reads + the `usage` call that produced `after`.
+        5,
+        "every call is recorded, billable or not"
+    );
+    assert!(after["remaining"].as_i64().unwrap() < after["includedOps"].as_i64().unwrap());
+}
+
+/// The half of the billing promise that only a shared transaction can deliver:
+/// the meter and the work commit or roll back together.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_failed_call_is_not_billed(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    let before = env.usage(&caller).await;
+
+    // Billable, well-formed, and doomed: the remote resolves to nothing.
+    let e = err(env
+        .factory
+        .add_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::AddJobArgs {
+                title: "work".into(),
+                repo: None,
+                remote: Some("git@github.com:someone/else.git".into()),
+                description: None,
+                ticket_ref: None,
+                agent_type: None,
+                metadata: None,
+                depends_on: vec![],
+            }),
+        )
+        .await);
+    assert_eq!(code_of(&e), "repo_unresolved");
+
+    let after = env.usage(&caller).await;
+    assert_eq!(
+        after["billableUsed"], before["billableUsed"],
+        "a call that failed must not have consumed the bucket"
+    );
+    assert_eq!(
+        after["totalCalls"].as_i64().unwrap() - before["totalCalls"].as_i64().unwrap(),
+        1,
+        "the failed call left no trace at all — only the second usage call counted"
+    );
+}
+
+/// `whoami` is the one tool an agent reliably calls at the start of a session,
+/// so it is where finding out about the allowance is still useful.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn whoami_reports_the_allowance(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+
+    let out = ok(env
+        .factory
+        .whoami(Extension(parts(&caller)), Parameters(tools::org::NoArgs {}))
+        .await);
+
+    assert_eq!(out["usage"]["plan"], "Free");
+    assert_eq!(out["usage"]["includedOps"], 500);
+    assert_eq!(out["usage"]["hardStop"], true);
+    assert_eq!(
+        out["usage"]["enforced"], false,
+        "enforcement is off by default for milestone 1"
+    );
+    assert_eq!(out["usage"]["warning"], false);
+}
+
+/// Past the bucket on a hard-stop plan, work is refused and reading is not —
+/// so an org that runs out mid-task can still see its own queue, understand
+/// what happened, and go and upgrade.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn enforcement_stops_work_but_never_reads(pool: PgPool) {
+    let (env, caller) = env_metered(pool, Meter::new(true, UPGRADE_URL)).await;
+    env.register(&caller).await;
+
+    // Spend the Free plan's entire bucket.
+    sqlx::query(
+        "INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
+         VALUES ($1, date_trunc('month', now() AT TIME ZONE 'utc')::date, 500, 500) \
+         ON CONFLICT (org_id, period_start) DO UPDATE SET billable_count = 500",
+    )
+    .bind(caller.org_id)
+    .execute(env.db.pool())
+    .await
+    .unwrap();
+
+    let e = err(env
+        .factory
+        .add_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::AddJobArgs {
+                title: "one job too many".into(),
+                repo: Some("api".into()),
+                description: None,
+                remote: None,
+                ticket_ref: None,
+                agent_type: None,
+                metadata: None,
+                depends_on: vec![],
+            }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "quota_exceeded");
+    assert_eq!(
+        e.data.as_ref().unwrap()["retriable"],
+        false,
+        "retrying an exhausted bucket only burns the agent's time"
+    );
+    assert!(e.message.contains("500"), "{}", e.message);
+    assert!(e.message.contains(UPGRADE_URL), "{}", e.message);
+
+    // Reads keep working, which is the point.
+    ok(env
+        .factory
+        .ready(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::RepoScopeArgs::default()),
+        )
+        .await);
+
+    let usage = env.usage(&caller).await;
+    assert_eq!(usage["remaining"], 0);
+    assert_eq!(usage["warning"], true);
+    assert_eq!(usage["enforced"], true);
+}
+
+/// The same org, one operation short of the limit, must be allowed the call
+/// that lands exactly on it. A plan sold as 500 operations has to deliver 500.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn the_last_included_operation_is_allowed(pool: PgPool) {
+    let (env, caller) = env_metered(pool, Meter::new(true, UPGRADE_URL)).await;
+    env.register(&caller).await;
+
+    sqlx::query(
+        "INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
+         VALUES ($1, date_trunc('month', now() AT TIME ZONE 'utc')::date, 499, 499) \
+         ON CONFLICT (org_id, period_start) DO UPDATE SET billable_count = 499",
+    )
+    .bind(caller.org_id)
+    .execute(env.db.pool())
+    .await
+    .unwrap();
+
+    env.add_job(&caller, "the five hundredth").await;
+
+    let usage = env.usage(&caller).await;
+    assert_eq!(usage["billableUsed"], 500);
+    assert_eq!(usage["remaining"], 0);
+}
+
+/// Enforcement off is the milestone-1 default, and it must mean *recorded but
+/// not refused* rather than "not counted".
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn with_enforcement_off_an_over_budget_org_keeps_working(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    sqlx::query(
+        "INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
+         VALUES ($1, date_trunc('month', now() AT TIME ZONE 'utc')::date, 9_000, 9_000) \
+         ON CONFLICT (org_id, period_start) DO UPDATE SET billable_count = 9000",
+    )
+    .bind(caller.org_id)
+    .execute(env.db.pool())
+    .await
+    .unwrap();
+
+    env.add_job(&caller, "well past the bucket").await;
+
+    let usage = env.usage(&caller).await;
+    assert_eq!(usage["billableUsed"], 9001);
+    assert_eq!(usage["remaining"], 0);
+    assert_eq!(usage["warning"], true);
+    assert_eq!(usage["enforced"], false);
+}
+
+/// A tenant's meter is its own. Two orgs sharing a counter would be a billing
+/// error and a data leak in the same bug.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn usage_is_counted_per_org(pool: PgPool) {
+    let (env, acme) = env(pool).await;
+    env.register(&acme).await;
+    env.add_job(&acme, "acme work").await;
+    env.add_job(&acme, "more acme work").await;
+
+    let globex = env.db.create_org("globex", "Globex").await.unwrap();
+    let eve = env.db.upsert_user("eve@globex.test", None).await.unwrap();
+    env.db
+        .add_member(globex.id, eve.id, Role::Owner)
+        .await
+        .unwrap();
+    let other = principal(eve.id, globex.id, all_scopes());
+
+    let theirs = env.usage(&other).await;
+    assert_eq!(
+        theirs["billableUsed"], 0,
+        "another org's work must not appear on this org's meter"
+    );
+
+    let ours = env.usage(&acme).await;
+    assert_eq!(
+        ours["billableUsed"], 3,
+        "register_repo plus two add_jobs; reading usage itself is free"
     );
 }
