@@ -248,6 +248,84 @@ async fn an_agent_gets_a_token_it_can_use_against_the_mcp_surface(pool: PgPool) 
     assert_eq!(replayed.body["error"], "invalid_grant");
 }
 
+/// A client that omits `scope` gets `DEFAULT_SCOPES`. The consent page shows
+/// exactly that list before the human decides — the token issued on "allow"
+/// must carry the same scopes, not the empty list a naive read of the
+/// original (scope-less) request would produce. Before this was fixed, the
+/// hidden `scope` field round-tripped the request's absence rather than the
+/// page's normalized default, so the agent came back with a token that
+/// failed every tool call after a consent screen had just promised it access.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_scopeless_request_is_granted_the_scopes_the_consent_page_showed(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let client_id = register(&h, "Test Agent", REDIRECT).await;
+    let (verifier, challenge) = pkce();
+
+    let page = Call::get(format!(
+        "/oauth/authorize?response_type=code&client_id={client_id}\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fcallback\
+         &code_challenge={challenge}&code_challenge_method=S256&state=s"
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    page.expect(StatusCode::OK);
+    assert!(
+        page.text.contains("See the work queue"),
+        "the consent page must show the default scopes it is about to grant"
+    );
+
+    let org_id = h.db.get_org_by_slug("acme").await.unwrap().unwrap().id;
+
+    // Mirrors what the rendered form actually submits: `scope` present but
+    // blank, exactly as `blank_to_none` expects from an unfilled hidden field.
+    let granted = Call::post("/oauth/authorize")
+        .with_session(&rob.session)
+        .form(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("scope", ""),
+            ("state", "s"),
+            ("org_id", &org_id.to_string()),
+            ("decision", "allow"),
+        ])
+        .send(&h.router)
+        .await;
+    granted.expect(StatusCode::SEE_OTHER);
+
+    let code = query_param(&location(&granted), "code").expect("no code in the callback");
+    let tokens = Call::post("/oauth/token")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("client_id", &client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &verifier),
+            ("resource", RESOURCE),
+        ])
+        .send(&h.router)
+        .await;
+    tokens.expect(StatusCode::OK);
+
+    assert_eq!(
+        tokens.body["scope"],
+        df_auth::oauth::DEFAULT_SCOPES.join(" "),
+        "the issued token must carry what the consent page displayed, not an \
+         empty scope list"
+    );
+
+    let access = tokens.body["access_token"].as_str().unwrap();
+    let principal = df_auth::tokens::introspect(&h.db, access, RESOURCE)
+        .await
+        .expect("the minted token must work against the MCP resource");
+    assert!(principal.has_scope("jobs:read"));
+}
+
 /// A signed-out visitor has to end up somewhere they can act, not at a 401.
 #[sqlx::test(migrations = "../df-core/migrations")]
 async fn an_unauthenticated_visitor_is_sent_to_log_in_and_comes_back(pool: PgPool) {

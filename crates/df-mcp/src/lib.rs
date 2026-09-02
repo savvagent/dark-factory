@@ -115,6 +115,15 @@ impl Config {
 /// request from one client landing on the replica that holds its session.
 /// Stateless means any replica can serve any request, with no sticky routing
 /// and no shared session store.
+///
+/// `df-web` also serves `/.well-known/oauth-protected-resource` — some clients
+/// look for it beside the authorization server's own metadata document — so a
+/// deployment that mounts both crates on one router has two handlers for the
+/// same path. Axum panics on that overlap rather than picking one silently, so
+/// a single-binary assembly (`df-server`) must use [`mcp_endpoint`] instead
+/// of this function and let `df-web` be the one copy. Both compute the same
+/// JSON from the same `resource_uri`/`public_url`, so which one answers is not
+/// observable to a client either way.
 pub fn router(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
     let rs = Arc::new(ResourceServer::new(
         db.clone(),

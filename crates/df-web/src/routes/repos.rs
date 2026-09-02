@@ -18,7 +18,7 @@ use df_core::leases::Lease;
 use df_core::repos::{NewRepo, Provider, Repo, RepoPatch};
 use serde::Deserialize;
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::session::OrgCtx;
 use crate::state::AppState;
 
@@ -93,6 +93,58 @@ pub struct ListReposQuery {
     pub include_inactive: bool,
 }
 
+/// Filter repos down to what the caller is allowed to see.
+///
+/// Per `docs/specs/2026-09-01-dark-factory-design.md`: a repo with a
+/// `team_id` is visible only to that team's members and org admins; a null
+/// `team_id` is org-wide. `OrgCtx` only proves org membership, so without this
+/// every member — not just the assigned team — could read every team-scoped
+/// repo's leases and metadata through the console.
+async fn visible_repos(
+    tx: &mut df_core::Tx<'_>,
+    ctx: &OrgCtx,
+    repos: Vec<Repo>,
+) -> ApiResult<Vec<Repo>> {
+    if ctx.role.can_administer() {
+        return Ok(repos);
+    }
+    let my_teams: std::collections::HashSet<TeamId> = tx
+        .list_user_teams(ctx.user.id)
+        .await?
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    Ok(repos
+        .into_iter()
+        .filter(|r| r.team_id.is_none_or(|t| my_teams.contains(&t)))
+        .collect())
+}
+
+/// As [`visible_repos`], for a single already-resolved repo. A repo the
+/// caller may not see is reported as not found, not forbidden — the same
+/// "an org you are not in is 404" rule this file already applies to orgs
+/// extends to a team-scoped repo a non-member should not learn exists.
+async fn require_visible(tx: &mut df_core::Tx<'_>, ctx: &OrgCtx, repo: Repo) -> ApiResult<Repo> {
+    if ctx.role.can_administer() {
+        return Ok(repo);
+    }
+    match repo.team_id {
+        None => Ok(repo),
+        Some(team) => {
+            let is_member = tx
+                .list_user_teams(ctx.user.id)
+                .await?
+                .iter()
+                .any(|t| t.id == team);
+            if is_member {
+                Ok(repo)
+            } else {
+                Err(ApiError::not_found("no repo with that slug in this org"))
+            }
+        }
+    }
+}
+
 /// `GET /api/orgs/{org}/repos`
 pub async fn list_repos(
     State(state): State<AppState>,
@@ -101,6 +153,7 @@ pub async fn list_repos(
 ) -> ApiResult<Json<Vec<Repo>>> {
     let mut tx = state.db.begin(ctx.org.id).await?;
     let repos = tx.list_repos(q.include_inactive).await?;
+    let repos = visible_repos(&mut tx, &ctx, repos).await?;
     tx.commit().await?;
     Ok(Json(repos))
 }
@@ -153,6 +206,7 @@ pub async fn get_repo(
             remote: None,
         })
         .await?;
+    let repo = require_visible(&mut tx, &ctx, repo).await?;
     tx.commit().await?;
     Ok(Json(repo))
 }
@@ -203,8 +257,10 @@ pub async fn update_repo(
 /// `GET /api/orgs/{org}/repos/{repo}/leases` — who is in this repo right now.
 ///
 /// The console's answer to "why is my agent waiting?". Read-only, and open to
-/// any member: a lease is a coordination signal, and one that only admins can
-/// see coordinates nothing.
+/// any member **of this repo's team** (or any admin): a lease is a
+/// coordination signal, but a team-scoped repo's leases are exactly the kind
+/// of team-scoped data `require_visible` exists to keep away from members of
+/// other teams.
 pub async fn list_leases(
     State(state): State<AppState>,
     ctx: OrgCtx,
@@ -217,6 +273,7 @@ pub async fn list_leases(
             remote: None,
         })
         .await?;
+    let repo = require_visible(&mut tx, &ctx, repo).await?;
     let leases = tx.list_leases(Some(repo.id)).await?;
     tx.commit().await?;
     Ok(Json(leases))

@@ -211,10 +211,34 @@ const REPO_COLS: &str = "id, org_id, slug, name, provider, default_branch, team_
                          default_agent_type, tracker_binding, active, created_at, created_by";
 
 impl Tx<'_> {
+    /// Prove a team id belongs to this transaction's org before it is written
+    /// onto a repo. The schema's foreign key alone cannot express that — it is
+    /// `REFERENCES teams(id)`, not a composite `(org_id, team_id)` one — so
+    /// without this check a leaked or guessed team id from another tenant
+    /// would attach silently, and deleting that foreign team would later null
+    /// out this repo's assignment out from under it.
+    async fn require_team_in_org(&mut self, team: TeamId) -> Result<()> {
+        self.get_team(team)
+            .await?
+            .ok_or_else(|| Error::TeamNotFound {
+                slug: team.to_string(),
+                known: "unknown".into(),
+            })?;
+        Ok(())
+    }
+
     /// Register a repo and its remotes.
     pub async fn register_repo(&mut self, new: NewRepo) -> Result<Repo> {
         if new.slug.trim().is_empty() {
             return Err(Error::Invalid("repo slug must not be empty".into()));
+        }
+
+        // `team_id` only has a schema-level `REFERENCES teams(id)`, not a
+        // composite `(org_id, team_id)` one, so a team UUID from another
+        // tenant would otherwise attach silently. Resolving it through this
+        // same pinned `Tx` proves it belongs to this org before the insert.
+        if let Some(team) = new.team_id {
+            self.require_team_in_org(team).await?;
         }
 
         let normalized: Vec<String> = new
@@ -448,6 +472,12 @@ impl Tx<'_> {
     /// registration, so a remote already claimed by a sibling repo is an error
     /// naming that repo rather than a silent re-point.
     pub async fn update_repo(&mut self, id: RepoId, patch: RepoPatch) -> Result<Repo> {
+        // Same cross-tenant risk as registration: a bare foreign key would
+        // accept a team id from another org.
+        if let Some(Some(team)) = patch.team_id {
+            self.require_team_in_org(team).await?;
+        }
+
         let org = self.org();
 
         let repo: Repo = sqlx::query_as(&format!(

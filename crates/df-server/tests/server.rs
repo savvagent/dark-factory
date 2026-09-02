@@ -29,6 +29,7 @@ fn config(static_dir: &str) -> Config {
         totp_issuer: "dark-factory".into(),
         client_ip_header: None,
         enforce_quotas: false,
+        allow_log_mailer: true,
         upgrade_url: format!("{PUBLIC}/settings/billing"),
         extra_allowed_hosts: vec![],
         allowed_origins: vec![],

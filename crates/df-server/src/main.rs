@@ -36,6 +36,23 @@ async fn main() -> Result<()> {
     df_auth::crypto::Cipher::from_base64_key(&config.encryption_key)
         .context("DF_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
+    // Refuse to start with a mailer that delivers nothing unless somebody said
+    // so. `LogMailer` writes each message to the log, which beats a silent
+    // no-op — but only for an operator who knows that is what they are running.
+    // Left implicit, a real deployment sends no verification, recovery, or
+    // invitation mail at all, and the first report comes from a user who never
+    // received a link.
+    if !config.allow_log_mailer {
+        anyhow::bail!(
+            "no production mailer is configured and DF_ALLOW_LOG_MAILER is not set. \
+             Starting anyway would accept sign-ups and then silently fail to deliver \
+             every verification, recovery, and invitation email. Set \
+             DF_ALLOW_LOG_MAILER=1 to run with LogMailer, which writes those emails \
+             to this process's log instead of sending them — that is a development \
+             transport, not delivery. See docs/deploy/fly.md."
+        );
+    }
+
     let db = Db::connect(&config.database_url)
         .await
         .context("could not connect to DATABASE_URL")?;

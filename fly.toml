@@ -1,17 +1,26 @@
-# dark-factory on Fly.io.
+# dark-factory on Fly.io, org "savvagent".
 #
-# Secrets are NOT here — `fly secrets set` puts DATABASE_URL, DF_ENCRYPTION_KEY,
-# and DF_PUBLIC_URL in the machine's environment. See README.md.
+# Database: a dedicated `dark_factory` database and `dark-factory` schema_admin
+# role on the shared `savvagent-pg` managed Postgres cluster (kyzl60xmdjxopj9g),
+# isolated from the `light_factory` / nels-api databases on the same cluster.
+# DATABASE_URL is already staged as a secret via `fly mpg attach`.
+#
+# Secrets are NOT in this file — `fly secrets set` puts DATABASE_URL and
+# DF_ENCRYPTION_KEY in the machine's environment. Everything below is
+# configuration a reader is meant to see.
 
-app = "dark-factory"
+app = "dark-factory-mcp"
 primary_region = "iad"
 
 [build]
+  dockerfile = "Dockerfile"
 
 [env]
   # Fly's proxy terminates TLS and forwards over the internal network, so the
   # process serves plain HTTP and the public origin is https.
   DF_BIND = "0.0.0.0:8080"
+  DF_PUBLIC_URL = "https://dark-factory-mcp.fly.dev"
+  DF_RESOURCE_URI = "https://dark-factory-mcp.fly.dev/mcp"
   DF_STATIC_DIR = "/srv/console"
   DF_LOG_FORMAT = "json"
   RUST_LOG = "info,df_server=info,df_mcp=info,df_web=info"
@@ -29,6 +38,15 @@ primary_region = "iad"
   # docs/deploy/cloudflare.md — neither is optional and neither fails loudly.
   DF_CLIENT_IP_HEADER = "fly-client-ip"
 
+  # No SMTP or mail-provider integration exists yet (milestone 1 scope), and
+  # df-server refuses to start without this explicit opt-in rather than run a
+  # mailer that delivers nothing. With it set, verification, recovery, and
+  # invitation emails are written to this process's log instead of being sent:
+  # at this RUST_LOG level LogMailer records only recipient and subject, so the
+  # links themselves are neither delivered nor visible here. A deploy in this
+  # state is API-usable and cannot onboard anybody.
+  DF_ALLOW_LOG_MAILER = "1"
+
 [http_service]
   internal_port = 8080
   # The session cookie carries the __Host- prefix, which browsers refuse to
@@ -40,6 +58,7 @@ primary_region = "iad"
   # thirty-second stall in the middle of somebody's work.
   auto_stop_machines = "suspend"
   min_machines_running = 1
+  processes = ["app"]
 
   [[http_service.checks]]
     # /readyz, not /healthz. This check decides whether traffic is routed

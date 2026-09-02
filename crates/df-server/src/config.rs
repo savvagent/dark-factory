@@ -45,6 +45,17 @@ pub struct Config {
     pub enforce_quotas: bool,
     pub upgrade_url: String,
 
+    /// Permission to start with `LogMailer`, which writes every email to this
+    /// process's log instead of delivering it.
+    ///
+    /// There is no production mailer yet, and starting without one silently is
+    /// how a deployment ends up never delivering a verification, recovery, or
+    /// invitation link, with nobody told until a user reports that nothing
+    /// arrived. `LogMailer` is loud on purpose, but loud only helps if an
+    /// operator chose it — so this is an explicit opt-in and its absence is a
+    /// startup error, not a default.
+    pub allow_log_mailer: bool,
+
     /// Extra authorities accepted in the MCP endpoint's `Host` header, beyond
     /// the one derived from `public_url`.
     pub extra_allowed_hosts: Vec<String>,
@@ -111,6 +122,7 @@ impl Config {
                 .filter(|v| !v.is_empty()),
 
             enforce_quotas: parse_var("DF_ENFORCE_QUOTAS", "0", parse_bool)?,
+            allow_log_mailer: parse_var("DF_ALLOW_LOG_MAILER", "0", parse_bool)?,
             upgrade_url: optional("DF_UPGRADE_URL")
                 .unwrap_or_else(|| format!("{public_url}/settings/billing")),
 
@@ -242,6 +254,7 @@ mod tests {
             client_ip_header: None,
             enforce_quotas: false,
             upgrade_url: "https://factory.example.com/settings/billing".into(),
+            allow_log_mailer: true,
             extra_allowed_hosts: vec!["dark-factory.fly.dev".into()],
             allowed_origins: vec![],
             static_dir: "web/build".into(),

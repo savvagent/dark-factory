@@ -306,7 +306,7 @@ pub async fn authorize_decision(
     Form(form): Form<ConsentForm>,
 ) -> Response {
     let params = form.params();
-    let req = params.to_request(&state.config.resource_uri);
+    let mut req = params.to_request(&state.config.resource_uri);
 
     // Re-validated on the way in. The form is user-supplied and could have been
     // edited between render and submit; nothing about having rendered a page is
@@ -314,6 +314,19 @@ pub async fn authorize_decision(
     if let Err(e) = oauth::validate_authorize(&state.db, &req, &state.config.resource_uri).await {
         return error_page(&e);
     }
+
+    // Normalize the same way `authorize_page` did before rendering the consent
+    // screen: a client that omits `scope` gets `DEFAULT_SCOPES`, which is what
+    // the human just looked at. Without this, the hidden form field resubmits
+    // the *original*, empty `scope`, and the code issued below would carry
+    // zero scopes while the page just displayed a list of grants — an agent
+    // whose every tool call then fails, with no visible reason why.
+    req.scopes = oauth::validate_scopes(&req.scopes).unwrap_or_else(|_| {
+        oauth::DEFAULT_SCOPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    });
 
     if form.decision != "allow" {
         return redirect_error(
@@ -366,9 +379,9 @@ pub async fn authorize_decision(
         )
         .await;
 
-    let mut location = format!("{}?code={}", params.redirect_uri, urlencode(&code));
+    let mut location = append_query(&params.redirect_uri, &[("code", &code)]);
     if let Some(s) = &params.state {
-        location.push_str(&format!("&state={}", urlencode(s)));
+        location = append_query(&location, &[("state", s)]);
     }
 
     // 303, not 302: the browser must turn a POST into a GET on the callback.
@@ -577,14 +590,12 @@ impl IntoResponse for OAuthError {
 
 /// Bounce an error back to a **validated** redirect URI.
 fn redirect_error(params: &AuthorizeParams, code: &str, description: &str) -> Response {
-    let mut location = format!(
-        "{}?error={}&error_description={}",
-        params.redirect_uri,
-        urlencode(code),
-        urlencode(description)
+    let mut location = append_query(
+        &params.redirect_uri,
+        &[("error", code), ("error_description", description)],
     );
     if let Some(s) = &params.state {
-        location.push_str(&format!("&state={}", urlencode(s)));
+        location = append_query(&location, &[("state", s)]);
     }
     (
         http::StatusCode::SEE_OTHER,
@@ -780,6 +791,31 @@ fn urlencode(raw: &str) -> String {
             }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
+    }
+    out
+}
+
+/// Append `key=value` query parameters onto a redirect URI that may already
+/// carry its own query string.
+///
+/// RFC 6749 §3.1.2 requires a registered redirect URI's existing query
+/// component to be retained, with the response parameters appended to it. A
+/// client registered at `https://app.example.com/cb?tenant=acme` still needs
+/// `code`/`state` (or `error`/`error_description`) appended with `&`, not a
+/// second `?` — `?tenant=acme?code=…` is not a query string any conformant
+/// parser reads correctly, and the client would never see `code` or `state`.
+/// `validate_registerable_redirect` accepts a query component (it only
+/// rejects fragments, wildcards, and non-loopback cleartext), so this case is
+/// reachable with any client that registers one.
+fn append_query(redirect_uri: &str, pairs: &[(&str, &str)]) -> String {
+    let mut out = redirect_uri.to_string();
+    let mut sep = if redirect_uri.contains('?') { '&' } else { '?' };
+    for (key, value) in pairs {
+        out.push(sep);
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&urlencode(value));
+        sep = '&';
     }
     out
 }

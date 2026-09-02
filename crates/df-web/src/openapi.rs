@@ -124,10 +124,10 @@ fn responses(endpoint: &Endpoint) -> Value {
     });
 
     let mut responses = json!({
-        "200": success,
         "400": error,
         "500": error,
     });
+    responses[endpoint.success.to_string()] = success;
 
     if endpoint.auth != Auth::Public {
         responses["401"] = error.clone();

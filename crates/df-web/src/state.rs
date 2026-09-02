@@ -47,6 +47,17 @@ pub struct Config {
     /// carries exactly one address. Behind nginx or a load balancer configured
     /// to replace the header, `x-forwarded-for` is correct.
     pub client_ip_header: Option<String>,
+
+    /// Whether hard-stop plans are currently being enforced against.
+    ///
+    /// Must match the flag `df-mcp` was built with (`DF_ENFORCE_QUOTAS`) — this
+    /// never gates anything here (the console's `Meter` never calls `charge`,
+    /// see `routes::usage`'s module doc), but `/api/orgs/{org}/usage` reports
+    /// this value as `enforced`, and a console reporting `false` while MCP
+    /// calls are actually being refused is a caller reading its own dashboard
+    /// and drawing the wrong conclusion about why its agent just got a
+    /// `quota_exceeded` error.
+    pub enforce_quotas: bool,
 }
 
 impl Config {
@@ -56,6 +67,7 @@ impl Config {
             resource_uri: resource_uri.into(),
             totp_issuer: "dark-factory".into(),
             client_ip_header: None,
+            enforce_quotas: false,
         }
     }
 
@@ -82,8 +94,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Db, cipher: Cipher, mailer: Arc<dyn Mailer>, config: Config) -> Self {
-        let meter =
-            df_billing::Meter::new(false, format!("{}/settings/billing", config.public_url));
+        let meter = df_billing::Meter::new(
+            config.enforce_quotas,
+            format!("{}/settings/billing", config.public_url),
+        );
         Self {
             db,
             cipher: Arc::new(cipher),

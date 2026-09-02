@@ -5,7 +5,7 @@
 //! "who is this, and which orgs may they act in?". Everything here is reachable
 //! only from df-auth and df-web; the MCP tool surface never calls it.
 
-use crate::db::Db;
+use crate::db::{Db, Tx};
 use crate::error::{Error, Result};
 use crate::ids::{OrgId, UserId};
 use serde::{Deserialize, Serialize};
@@ -107,12 +107,39 @@ pub struct OrgMember {
 const ORG_COLS: &str = "id, slug, name, plan, enforce_sso, created_at";
 const USER_COLS: &str = "id, email, name, email_verified_at, created_at, disabled_at";
 
+/// An org is addressed by its slug as one URL path segment for the rest of its
+/// life (`/api/orgs/{org}/...`), so the same character/length discipline team
+/// slugs already get applies here — a slug containing `/` would otherwise be
+/// stored and then never addressable again, and an empty-after-trim one would
+/// collide with every other org that also trimmed to nothing.
+fn validate_org_slug(slug: &str) -> Result<String> {
+    let slug = slug.trim().to_lowercase();
+    if slug.is_empty() {
+        return Err(Error::Invalid("an org needs a slug".into()));
+    }
+    if slug.len() > 64 {
+        return Err(Error::Invalid(
+            "an org slug must be 64 characters or fewer".into(),
+        ));
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::Invalid(format!(
+            "org slug {slug:?} may contain only letters, digits, '-' and '_'"
+        )));
+    }
+    Ok(slug)
+}
+
 impl Db {
     pub async fn create_org(&self, slug: &str, name: &str) -> Result<Org> {
+        let slug = validate_org_slug(slug)?;
         let org = sqlx::query_as(&format!(
             "INSERT INTO orgs (slug, name) VALUES ($1, $2) RETURNING {ORG_COLS}"
         ))
-        .bind(slug)
+        .bind(&slug)
         .bind(name)
         .fetch_one(self.pool())
         .await
@@ -122,6 +149,46 @@ impl Db {
             }
             _ => Error::Db(e),
         })?;
+        Ok(org)
+    }
+
+    /// Create an org and add its first owner in one transaction.
+    ///
+    /// `create_org` followed by a separate `add_member` call would leave a
+    /// window — a crash or a failed second statement between them — where the
+    /// org exists with no owner at all, the exact invariant the rest of this
+    /// module enforces everywhere else. Self-serve org creation always wants
+    /// both or neither.
+    pub async fn create_org_with_owner(
+        &self,
+        slug: &str,
+        name: &str,
+        owner: UserId,
+    ) -> Result<Org> {
+        let slug = validate_org_slug(slug)?;
+        let mut tx = self.begin_unpinned().await?;
+
+        let org: Org = sqlx::query_as(&format!(
+            "INSERT INTO orgs (slug, name) VALUES ($1, $2) RETURNING {ORG_COLS}"
+        ))
+        .bind(&slug)
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                Error::Invalid(format!("org slug {slug:?} is taken"))
+            }
+            _ => Error::Db(e),
+        })?;
+
+        sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'owner')")
+            .bind(org.id)
+            .bind(owner)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
         Ok(org)
     }
 
@@ -247,10 +314,13 @@ impl Db {
 
     /// How many owners this org has.
     ///
-    /// The console checks this before removing or demoting one. An org with no
-    /// owner has nobody who can change its billing, bind an IdP, or delete it —
-    /// a state only a human with database access can undo, so it is refused at
-    /// the last one rather than repaired later.
+    /// Read-only and unlocked — fine for a display, wrong for a guard. A
+    /// caller about to remove or demote an owner wants
+    /// [`Tx::count_owners_for_update`] instead, in the same transaction as the
+    /// write it is guarding: two concurrent callers reading this method's
+    /// answer on separate connections can each see the same count, each pass,
+    /// and both writes land, leaving an org with no owner — "a state only a
+    /// human with database access can undo".
     pub async fn count_owners(&self, org: OrgId) -> Result<i64> {
         let n = sqlx::query_scalar(
             "SELECT count(*) FROM org_members WHERE org_id = $1 AND role = 'owner'",
@@ -285,5 +355,59 @@ impl Db {
         .fetch_all(self.pool())
         .await?;
         Ok(rows)
+    }
+}
+
+impl Tx<'_> {
+    /// Owner rows locked for the rest of this transaction.
+    ///
+    /// A caller demoting or removing an owner reads this count and, if it
+    /// clears the guard, writes the membership change — both inside one
+    /// transaction. Without the lock, two concurrent callers (two owners
+    /// demoting each other, say) can each read `count == 2` on separate
+    /// connections, each pass the guard, and both writes land, leaving the
+    /// org with zero owners: "a state only a human with database access can
+    /// undo" (see [`Db::count_owners`]). `FOR UPDATE` cannot ride an
+    /// aggregate, so this locks the owner rows themselves and returns how
+    /// many there were; a second transaction reaching the same rows blocks
+    /// here until the first commits or rolls back, then sees the count that
+    /// transaction left behind.
+    pub async fn count_owners_for_update(&mut self) -> Result<i64> {
+        let org = self.org();
+        let owners: Vec<(UserId,)> = sqlx::query_as(
+            "SELECT user_id FROM org_members WHERE org_id = $1 AND role = 'owner' FOR UPDATE",
+        )
+        .bind(org)
+        .fetch_all(self.conn())
+        .await?;
+        Ok(owners.len() as i64)
+    }
+
+    /// As [`Db::add_member`], pinned to this transaction so a role change can
+    /// share a commit with [`Tx::count_owners_for_update`]'s guard.
+    pub async fn add_member(&mut self, user: UserId, role: Role) -> Result<()> {
+        let org = self.org();
+        sqlx::query(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES ($1,$2,$3) \
+             ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+        )
+        .bind(org)
+        .bind(user)
+        .bind(role)
+        .execute(self.conn())
+        .await?;
+        Ok(())
+    }
+
+    /// As [`Db::remove_member`], pinned to this transaction so the guard, the
+    /// team cleanup, and the audit entry either all land or none do.
+    pub async fn remove_member(&mut self, user: UserId) -> Result<()> {
+        let org = self.org();
+        sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+            .bind(org)
+            .bind(user)
+            .execute(self.conn())
+            .await?;
+        Ok(())
     }
 }
