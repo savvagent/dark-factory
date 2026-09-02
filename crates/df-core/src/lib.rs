@@ -12,6 +12,7 @@
 //!    security applies even when the connecting user owns the tables. A query
 //!    that forgets its `org_id` predicate returns nothing instead of leaking.
 
+pub mod audit;
 pub mod db;
 pub mod error;
 pub mod ids;

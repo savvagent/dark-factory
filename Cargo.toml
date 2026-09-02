@@ -54,7 +54,9 @@ hmac = "0.12"
 subtle = "2"
 aes-gcm = "0.10"
 argon2 = "0.5"
-totp-rs = { version = "5", features = ["gen_secret"] }
+# `otpauth` adds issuer/account_name and get_url() for the provisioning URI
+# an authenticator app scans; `gen_secret` gives Secret::generate_secret().
+totp-rs = { version = "5", default-features = false, features = ["gen_secret", "otpauth"] }
 jsonwebtoken = "9"
 
 [profile.release]
