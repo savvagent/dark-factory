@@ -85,6 +85,34 @@ compile-time layering discipline, not separate services.
 **Every SQL statement lives in `df-core`.** A query in `df-mcp` or `df-web` is a bug — it
 bypasses the `Tx` pinning that guard 2 depends on.
 
+## The MCP surface
+
+`df-mcp` is the only crate a customer's agent talks to, and four conventions hold across
+every tool in it:
+
+- **The caller comes from the request, not the session.** An MCP session spans many HTTP
+  requests; `require_bearer` introspects the token on each one and puts the `Principal` in
+  the request extensions, which the transport carries into the handler as
+  `Extension<http::request::Parts>`. This is what makes revocation take effect on the next
+  call instead of at some unbounded later point — do not cache a principal on the service.
+- **The org comes from the token and nowhere else.** No tool takes an org argument.
+- **Every result is a one-field object** — `{"job": …}`, `{"jobs": […]}` — defined in
+  `tools::out`. MCP requires `outputSchema` to be rooted at `object`, so a bare array is
+  not a legal result, and the envelope can gain a field without breaking callers.
+- **Descriptions are the documentation.** The reader is an LLM that has never seen these
+  docs: say what the tool does, when to reach for it instead of a neighbour, and what the
+  failure means. `tests/tools.rs` asserts the tool list and that every tool describes
+  itself, so a tool that silently disappears fails a test rather than a customer.
+
+## A trap in tests: the change listener holds a connection
+
+`Watcher::spawn` takes a connection out of the pool for `LISTEN` and **detaches** it, so
+dropping the pool does not reclaim it. A `#[sqlx::test]` cannot drop its throwaway database
+while a session is still attached, so a test that spawns a watcher and leaves it running
+hangs at teardown rather than failing. `Watcher::shutdown()` stops the task and waits for
+the connection to go; `Drop` does it best-effort. Anything that needs the connection
+released before it continues — graceful shutdown, a test tearing down — calls `shutdown`.
+
 ## Migrations
 
 Forward-only, one file per concern, in `crates/df-core/migrations/`. Never edit a migration

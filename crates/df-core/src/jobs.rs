@@ -10,7 +10,9 @@ use crate::ids::{JobId, OrgId, RepoId, TeamId, UserId};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, schemars::JsonSchema,
+)]
 #[sqlx(type_name = "job_status", rename_all = "lowercase")]
 #[serde(rename_all = "kebab-case")]
 pub enum Status {
@@ -52,7 +54,9 @@ impl std::str::FromStr for Status {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, schemars::JsonSchema,
+)]
 #[sqlx(type_name = "tracker", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum Tracker {
@@ -60,7 +64,7 @@ pub enum Tracker {
     Github,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
     pub id: JobId,
@@ -111,7 +115,7 @@ pub struct JobFilter {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, FromRow)]
+#[derive(Debug, Clone, Default, Serialize, FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
     pub pending: i64,

@@ -22,7 +22,18 @@ pub const MAX_BODY_LEN: usize = 16 * 1024;
 /// shared server by asking for a huge limit.
 pub const INBOX_LIMIT_MAX: i64 = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, sqlx::Type)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    sqlx::Type,
+    schemars::JsonSchema,
+)]
 #[sqlx(type_name = "message_kind", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum MessageKind {
@@ -39,7 +50,18 @@ pub enum MessageKind {
 /// distinguish them for authorization. The authoritative `sender_user_id` is
 /// always set server-side from the authenticated principal and is never accepted
 /// from the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, sqlx::Type)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    sqlx::Type,
+    schemars::JsonSchema,
+)]
 #[sqlx(type_name = "sender_kind", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum SenderKind {
@@ -48,7 +70,7 @@ pub enum SenderKind {
     Human,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: i64,

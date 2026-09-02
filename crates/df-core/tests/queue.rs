@@ -7,7 +7,7 @@ use common::{db, job, tenant};
 use df_core::ids::JobId;
 use df_core::jobs::{JobFilter, Status};
 use df_core::messages::{InboxQuery, NewMessage};
-use df_core::repos::{NewRepo, RepoRef};
+use df_core::repos::{NewRepo, RepoPatch, RepoRef};
 use sqlx::PgPool;
 
 #[sqlx::test]
@@ -647,4 +647,86 @@ async fn list_jobs_filters_by_repo(pool: PgPool) {
 
     assert_eq!(only_web.len(), 1);
     assert_eq!(only_web[0].title, "web work");
+}
+
+/// A patch touches only what it names. A caller written against three fields
+/// must not blank the two it has never heard of.
+#[sqlx::test]
+async fn update_repo_leaves_unnamed_fields_alone(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let before = tx.get_repo(t.repo).await.unwrap().unwrap();
+    assert_eq!(before.default_branch, "main");
+
+    let after = tx
+        .update_repo(
+            t.repo,
+            RepoPatch {
+                default_branch: Some("trunk".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(after.default_branch, "trunk");
+    assert_eq!(after.name, before.name, "name was not in the patch");
+    assert_eq!(after.slug, before.slug);
+    assert!(after.active);
+}
+
+/// Added remotes resolve afterwards, and a remote already claimed by a sibling
+/// repo is refused by name rather than silently re-pointed.
+#[sqlx::test]
+async fn update_repo_adds_remotes_and_refuses_stolen_ones(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let web = tx
+        .register_repo(NewRepo {
+            slug: "web".into(),
+            remotes: vec!["git@github.com:acme/web.git".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    tx.update_repo(
+        t.repo,
+        RepoPatch {
+            add_remotes: vec!["https://gitlab.com/acme/api-mirror".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let resolved = tx
+        .resolve_repo(&RepoRef {
+            remote: Some("git@gitlab.com:acme/api-mirror.git".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(resolved.id, t.repo, "the mirror must reach the same repo");
+
+    let err = tx
+        .update_repo(
+            web.id,
+            RepoPatch {
+                add_remotes: vec!["git@github.com:acme/api.git".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("api"),
+        "the error must name the repo already holding the remote: {err}"
+    );
+    let _ = tx.rollback().await;
 }

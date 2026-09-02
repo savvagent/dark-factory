@@ -10,7 +10,18 @@ use crate::ids::{OrgId, RepoId, TeamId, UserId};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, sqlx::Type)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    sqlx::Type,
+    schemars::JsonSchema,
+)]
 #[sqlx(type_name = "repo_provider", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -38,7 +49,7 @@ impl Provider {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Repo {
     pub id: RepoId,
@@ -77,6 +88,29 @@ pub struct RepoRef {
     pub slug: Option<String>,
     /// A raw git remote URL, in any form git would print.
     pub remote: Option<String>,
+}
+
+/// A partial update to a repo. Every field is `None` for "leave alone", so a
+/// caller that knows about three fields cannot blank the two it has never heard
+/// of — which is what a whole-object PUT does to a client written against an
+/// older version of the schema.
+///
+/// The slug is deliberately absent. It is the handle agents type, it appears in
+/// every error message listing what is registered, and renaming it silently
+/// breaks every skill and script that names the old one. Retiring a repo is
+/// [`Tx::set_repo_active`]; a genuine rename is a new registration.
+#[derive(Debug, Clone, Default)]
+pub struct RepoPatch {
+    pub name: Option<String>,
+    pub default_branch: Option<String>,
+    pub team_id: Option<TeamId>,
+    pub default_agent_type: Option<String>,
+    pub tracker_binding: Option<serde_json::Value>,
+    pub active: Option<bool>,
+    /// Raw remote URLs to add. Normalized, and additive — an existing remote is
+    /// never removed here, because a remote that has already resolved jobs to
+    /// this repo is load-bearing history.
+    pub add_remotes: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +407,46 @@ impl Tx<'_> {
                 known.join(", ")
             },
         })
+    }
+
+    /// Apply a partial update.
+    ///
+    /// `COALESCE($n, column)` per field: an omitted field keeps its stored
+    /// value rather than being overwritten with a default. New remotes are
+    /// attached after the update and go through the same conflict check as
+    /// registration, so a remote already claimed by a sibling repo is an error
+    /// naming that repo rather than a silent re-point.
+    pub async fn update_repo(&mut self, id: RepoId, patch: RepoPatch) -> Result<Repo> {
+        let org = self.org();
+
+        let repo: Repo = sqlx::query_as(&format!(
+            "UPDATE repos SET name = COALESCE($3, name), \
+                    default_branch = COALESCE($4, default_branch), \
+                    team_id = COALESCE($5, team_id), \
+                    default_agent_type = COALESCE($6, default_agent_type), \
+                    tracker_binding = COALESCE($7, tracker_binding), \
+                    active = COALESCE($8, active) \
+             WHERE org_id = $1 AND id = $2 RETURNING {REPO_COLS}"
+        ))
+        .bind(org)
+        .bind(id)
+        .bind(patch.name.as_deref())
+        .bind(patch.default_branch.as_deref())
+        .bind(patch.team_id)
+        .bind(patch.default_agent_type.as_deref())
+        .bind(patch.tracker_binding.as_ref())
+        .bind(patch.active)
+        .fetch_optional(self.conn())
+        .await?
+        .ok_or_else(|| Error::RepoNotFound(id.to_string()))?;
+
+        for raw in &patch.add_remotes {
+            self.add_remote(repo.id, raw).await?;
+        }
+
+        // Re-read only when remotes changed nothing about the row itself — they
+        // do not, so the UPDATE's RETURNING is still accurate.
+        Ok(repo)
     }
 
     pub async fn set_repo_active(&mut self, id: RepoId, active: bool) -> Result<()> {

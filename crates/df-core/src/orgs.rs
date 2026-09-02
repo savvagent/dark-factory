@@ -11,7 +11,9 @@ use crate::ids::{OrgId, UserId};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, schemars::JsonSchema,
+)]
 #[sqlx(type_name = "org_role", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -32,7 +34,18 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, sqlx::Type)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    sqlx::Type,
+    schemars::JsonSchema,
+)]
 #[sqlx(type_name = "org_plan", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum Plan {

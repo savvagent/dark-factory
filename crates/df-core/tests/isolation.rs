@@ -18,7 +18,7 @@ use common::{db, job, tenant};
 use df_core::ids::{JobId, OrgId};
 use df_core::jobs::JobFilter;
 use df_core::messages::{InboxQuery, NewMessage};
-use df_core::repos::RepoRef;
+use df_core::repos::{RepoPatch, RepoRef};
 use sqlx::PgPool;
 
 #[sqlx::test]
@@ -117,6 +117,37 @@ async fn cross_org_mutation_is_refused(pool: PgPool) {
     tx.commit().await.unwrap();
     assert_eq!(after.title, "acme work");
     assert_eq!(after.status, df_core::jobs::Status::Pending);
+}
+
+/// `update_repo` from the wrong org must not reach the row, and must not be
+/// able to steal a remote either — re-pointing a remote is how you would divert
+/// another tenant's agents to your own queue without ever reading their data.
+#[sqlx::test]
+async fn cross_org_repo_updates_are_refused(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(b.org).await.unwrap();
+    assert!(tx
+        .update_repo(
+            a.repo,
+            RepoPatch {
+                name: Some("pwned".into()),
+                active: Some(false),
+                add_remotes: vec!["git@github.com:globex/stolen.git".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err());
+    let _ = tx.rollback().await;
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let after = tx.get_repo(a.repo).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(after.name, "acme api");
+    assert!(after.active);
 }
 
 /// A job in org A cannot be made to depend on a job in org B, which would

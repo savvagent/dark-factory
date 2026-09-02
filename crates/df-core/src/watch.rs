@@ -17,8 +17,9 @@ use serde::Deserialize;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 /// How many changes a slow waiter may fall behind before it is told to resync.
 ///
@@ -50,6 +51,15 @@ pub enum Outcome {
 
 pub struct Watcher {
     orgs: Mutex<HashMap<OrgId, broadcast::Sender<Change>>>,
+    /// The listener task, so it can be stopped and its connection given back.
+    ///
+    /// `LISTEN` needs a connection all to itself, and `PgListener` takes one
+    /// out of the pool and detaches it — dropping the pool does not reclaim it.
+    /// Without a way to stop the task, that connection is held until the
+    /// process exits: fine for a server that runs forever, wrong for graceful
+    /// shutdown, and fatal in tests, where the throwaway database cannot be
+    /// dropped while a session is still attached to it.
+    listener: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Watcher {
@@ -63,17 +73,28 @@ impl Watcher {
     pub async fn spawn(pool: PgPool) -> Result<Arc<Self>> {
         let watcher = Arc::new(Self {
             orgs: Mutex::new(HashMap::new()),
+            listener: Mutex::new(None),
         });
 
         let mut listener = PgListener::connect_with(&pool).await?;
         listener.listen("df_changes").await?;
 
-        let w = watcher.clone();
-        tokio::spawn(async move {
+        // A `Weak`, deliberately. The task holding a strong reference would be
+        // a cycle — task keeps `Watcher` alive, `Watcher` holds the task's
+        // handle — and the whole point of holding the handle is to be able to
+        // stop the task when the last real handle goes away.
+        let weak = Arc::downgrade(&watcher);
+        let handle = tokio::spawn(async move {
             loop {
                 match listener.recv().await {
                     Ok(note) => match serde_json::from_str::<Change>(note.payload()) {
-                        Ok(change) => w.dispatch(change),
+                        Ok(change) => {
+                            let Some(w) = Weak::upgrade(&weak) else {
+                                // Nobody is watching any more.
+                                break;
+                            };
+                            w.dispatch(change);
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, payload = note.payload(),
                                            "undecodable change notification");
@@ -88,7 +109,31 @@ impl Watcher {
             }
         });
 
+        *watcher.listener.lock().expect("watcher registry poisoned") = Some(handle);
         Ok(watcher)
+    }
+
+    /// Stop listening and hand the connection back, waiting until it is gone.
+    ///
+    /// Call this on graceful shutdown, and at the end of any test that spawns a
+    /// watcher: a `LISTEN` session still attached to a throwaway database stops
+    /// it being dropped. [`Drop`] does the same thing on a best-effort basis,
+    /// but only this version waits for the task to actually finish, which is
+    /// what makes the connection's release observable rather than merely
+    /// scheduled.
+    pub async fn shutdown(&self) {
+        let handle = self
+            .listener
+            .lock()
+            .expect("watcher registry poisoned")
+            .take();
+
+        if let Some(handle) = handle {
+            handle.abort();
+            // `Err(Cancelled)` is the expected outcome and means the task has
+            // been dropped, taking the listener and its connection with it.
+            let _ = handle.await;
+        }
     }
 
     fn dispatch(&self, change: Change) {
@@ -150,6 +195,20 @@ impl Watcher {
                 // changed". Report it rather than silently swallowing.
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => return Outcome::Changed,
                 Ok(Err(broadcast::error::RecvError::Closed)) => return Outcome::Timeout,
+            }
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        // Best effort: aborts the task, but cannot wait for it. Anything that
+        // needs the connection released *before* it continues — graceful
+        // shutdown, a test tearing down its database — must call
+        // [`Watcher::shutdown`] instead.
+        if let Ok(mut guard) = self.listener.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
             }
         }
     }

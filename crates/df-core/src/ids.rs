@@ -51,6 +51,32 @@ macro_rules! uuid_id {
                 Ok(Self(Uuid::parse_str(s)?))
             }
         }
+
+        // Written out rather than derived. A derive on a newtype produces a
+        // schema named after the wrapper with the inner type nested inside;
+        // over the wire these *are* UUID strings, and that is what an MCP
+        // client's schema should say.
+        impl schemars::JsonSchema for $name {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($name).into()
+            }
+
+            fn schema_id() -> std::borrow::Cow<'static, str> {
+                concat!(module_path!(), "::", stringify!($name)).into()
+            }
+
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                schemars::json_schema!({
+                    "type": "string",
+                    "format": "uuid",
+                    "description": $doc,
+                })
+            }
+
+            fn inline_schema() -> bool {
+                true
+            }
+        }
     };
 }
 
@@ -102,6 +128,30 @@ impl From<String> for JobId {
 impl From<&str> for JobId {
     fn from(s: &str) -> Self {
         Self(s.to_string())
+    }
+}
+
+/// `job-N`, not a UUID — so the schema says string with an example rather than
+/// a format an agent would try to satisfy by generating one.
+impl schemars::JsonSchema for JobId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "JobId".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::JobId").into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A job identifier, unique within one organization.",
+            "examples": ["job-42"],
+        })
+    }
+
+    fn inline_schema() -> bool {
+        true
     }
 }
 

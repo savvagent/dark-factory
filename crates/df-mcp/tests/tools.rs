@@ -1,0 +1,1014 @@
+//! The MCP surface, driven the way an agent drives it.
+//!
+//! Handlers are called directly with an injected [`Principal`], which is the
+//! only part of a real request that matters to them — everything else about the
+//! HTTP layer is `rmcp`'s and is not this crate's to re-test. The exceptions are
+//! the last two tests, which drive the assembled router, because the `401` and
+//! its `WWW-Authenticate` header *are* the onboarding path and a test that
+//! skipped them would let the whole zero-install premise break silently.
+
+use df_auth::tokens::{Principal, TokenKind};
+use df_core::ids::{OrgId, UserId};
+use df_core::orgs::Role;
+use df_core::watch::Watcher;
+use df_core::Db;
+use df_mcp::server::Factory;
+use df_mcp::tools;
+use rmcp::handler::server::tool::Extension;
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::model::ErrorData;
+use sqlx::PgPool;
+
+const RESOURCE: &str = "https://mcp.dark-factory.test/mcp";
+const PUBLIC: &str = "https://mcp.dark-factory.test";
+const REMOTE: &str = "git@github.com:acme/api.git";
+
+/// Everything a token can carry, for the tests that are not about scopes.
+fn all_scopes() -> Vec<String> {
+    df_auth::oauth::KNOWN_SCOPES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn principal(user: UserId, org: OrgId, scopes: Vec<String>) -> Principal {
+    Principal {
+        token_id: uuid::Uuid::new_v4(),
+        user_id: user,
+        org_id: org,
+        client_id: Some("df_client_test".into()),
+        scopes,
+        kind: TokenKind::Oauth,
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+    }
+}
+
+/// The one piece of a real request a handler reads.
+fn parts(p: &Principal) -> http::request::Parts {
+    let (mut parts, ()) = http::Request::builder()
+        .uri("/mcp")
+        .body(())
+        .unwrap()
+        .into_parts();
+    parts.extensions.insert(p.clone());
+    parts
+}
+
+/// Parts carrying no principal — what a handler would see if the middleware
+/// were missing.
+fn anonymous_parts() -> http::request::Parts {
+    http::Request::builder()
+        .uri("/mcp")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0
+}
+
+/// Tool results are typed envelopes, one per tool, and none of them is `Debug`
+/// — so `unwrap`/`unwrap_err` will not do. These also re-serialize the result
+/// to JSON, which is what an agent actually receives and therefore what the
+/// assertions below should be written against.
+fn ok<T: serde::Serialize>(r: Result<Json<T>, ErrorData>) -> serde_json::Value {
+    match r {
+        Ok(v) => serde_json::to_value(v.0).expect("result did not serialize"),
+        Err(e) => panic!("expected success, got {}: {}", e.code.0, e.message),
+    }
+}
+
+fn err<T: serde::Serialize>(r: Result<Json<T>, ErrorData>) -> ErrorData {
+    match r {
+        Ok(v) => panic!(
+            "expected a refusal, got {}",
+            serde_json::to_value(v.0).unwrap_or_default()
+        ),
+        Err(e) => e,
+    }
+}
+
+fn code_of(e: &ErrorData) -> String {
+    e.data
+        .as_ref()
+        .and_then(|d| d["code"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+struct Env {
+    factory: Factory,
+    db: Db,
+}
+
+async fn env(pool: PgPool) -> (Env, Principal) {
+    let db = Db::from_pool(pool.clone());
+    let watcher = Watcher::spawn(pool).await.expect("watcher");
+
+    let org = db.create_org("acme", "Acme").await.unwrap();
+    let user = db.upsert_user("rob@acme.test", Some("Rob")).await.unwrap();
+    db.add_member(org.id, user.id, Role::Owner).await.unwrap();
+
+    let caller = principal(user.id, org.id, all_scopes());
+    (
+        Env {
+            factory: Factory::new(db.clone(), watcher),
+            db,
+        },
+        caller,
+    )
+}
+
+impl Env {
+    /// Add a second member to the fixture org.
+    async fn teammate(&self, org: OrgId, email: &str) -> Principal {
+        let user = self.db.upsert_user(email, None).await.unwrap();
+        self.db
+            .add_member(org, user.id, Role::Member)
+            .await
+            .unwrap();
+        principal(user.id, org, all_scopes())
+    }
+
+    /// Register the fixture repo through the tool surface.
+    async fn register(&self, caller: &Principal) -> serde_json::Value {
+        ok(self
+            .factory
+            .register_repo(
+                Extension(parts(caller)),
+                Parameters(tools::repos::RegisterRepoArgs {
+                    slug: "api".into(),
+                    name: Some("Acme API".into()),
+                    remotes: vec![REMOTE.into()],
+                    default_branch: None,
+                    default_agent_type: None,
+                }),
+            )
+            .await)["repo"]
+            .clone()
+    }
+
+    async fn add_job(&self, caller: &Principal, title: &str) -> serde_json::Value {
+        ok(self
+            .factory
+            .add_job(
+                Extension(parts(caller)),
+                Parameters(tools::jobs::AddJobArgs {
+                    title: title.into(),
+                    description: None,
+                    repo: Some("api".into()),
+                    remote: None,
+                    ticket_ref: None,
+                    agent_type: None,
+                    metadata: None,
+                    depends_on: vec![],
+                }),
+            )
+            .await)["job"]
+            .clone()
+    }
+}
+
+// ----------------------------------------------------------------- identity
+
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn whoami_names_the_one_org_this_token_opens(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+
+    let out = ok(env
+        .factory
+        .whoami(Extension(parts(&caller)), Parameters(tools::org::NoArgs {}))
+        .await);
+
+    assert_eq!(out["user"]["email"], "rob@acme.test");
+    assert_eq!(out["org"]["slug"], "acme");
+    assert_eq!(out["org"]["plan"], "free");
+    assert_eq!(out["role"], "owner");
+    assert_eq!(out["token"]["kind"], "oauth");
+    assert!(out["token"]["scopes"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::Value::String("jobs:write".into())));
+}
+
+/// A handler reached without the middleware must say so in terms that stop an
+/// agent debugging its own arguments.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_handler_without_a_principal_blames_the_server(pool: PgPool) {
+    let (env, _caller) = env(pool).await;
+
+    let e = err(env
+        .factory
+        .whoami(
+            Extension(anonymous_parts()),
+            Parameters(tools::org::NoArgs {}),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "unauthenticated");
+    assert!(e.message.contains("misconfiguration"));
+}
+
+// ------------------------------------------------------------------- scopes
+
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_read_only_token_can_look_but_not_touch(pool: PgPool) {
+    let (env, owner) = env(pool).await;
+    env.register(&owner).await;
+
+    let reader = principal(
+        owner.user_id,
+        owner.org_id,
+        vec!["jobs:read".into(), "repos:read".into()],
+    );
+
+    // Reads are fine.
+    ok(env
+        .factory
+        .list_repos(
+            Extension(parts(&reader)),
+            Parameters(tools::repos::ListReposArgs {
+                include_inactive: false,
+            }),
+        )
+        .await);
+
+    // Writes are not, and the error names the scope that is missing — the only
+    // thing that lets an agent re-authorize correctly rather than give up.
+    let e = err(env
+        .factory
+        .add_job(
+            Extension(parts(&reader)),
+            Parameters(tools::jobs::AddJobArgs {
+                title: "should not happen".into(),
+                repo: Some("api".into()),
+                description: None,
+                remote: None,
+                ticket_ref: None,
+                agent_type: None,
+                metadata: None,
+                depends_on: vec![],
+            }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "insufficient_scope");
+    assert!(e.message.contains("jobs:write"), "{}", e.message);
+}
+
+// --------------------------------------------------------------- repo anchor
+
+/// The end-to-end shape of a working session: find the repo, queue work, see
+/// what is claimable, take it, finish it.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn the_full_loop_from_remote_url_to_completed_job(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    // An agent knows its remote, not its slug — and not necessarily in the
+    // spelling the repo was registered with.
+    let repo = ok(env
+        .factory
+        .resolve_repo(
+            Extension(parts(&caller)),
+            Parameters(tools::repos::RepoRefArgs {
+                repo: None,
+                remote: Some("https://github.com/acme/api".into()),
+            }),
+        )
+        .await);
+    assert_eq!(repo["repo"]["slug"], "api");
+
+    let job = env.add_job(&caller, "wire up the health endpoint").await;
+    let id = job["id"].as_str().unwrap().to_string();
+    assert_eq!(job["status"], "pending");
+
+    let ready = ok(env
+        .factory
+        .ready(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::RepoScopeArgs {
+                repo: Some("api".into()),
+                remote: None,
+            }),
+        )
+        .await);
+    assert_eq!(ready["jobs"].as_array().unwrap().len(), 1);
+
+    let claimed = ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: Some("api-agent@ci-7".into()),
+            }),
+        )
+        .await);
+    assert_eq!(claimed["jobs"][0]["status"], "in-progress");
+    assert_eq!(claimed["jobs"][0]["claimedByLabel"], "api-agent@ci-7");
+
+    // Claimed work is no longer on offer.
+    let ready = ok(env
+        .factory
+        .ready(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::RepoScopeArgs::default()),
+        )
+        .await);
+    assert!(ready["jobs"].as_array().unwrap().is_empty());
+
+    let done = ok(env
+        .factory
+        .complete_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::CompleteJobArgs {
+                job: id,
+                result: Some("added /healthz".into()),
+            }),
+        )
+        .await);
+    assert_eq!(done["job"]["status"], "completed");
+    assert_eq!(done["job"]["result"], "added /healthz");
+
+    let stats = ok(env
+        .factory
+        .stats(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::RepoScopeArgs::default()),
+        )
+        .await);
+    assert_eq!(stats["stats"]["completed"], 1);
+    assert_eq!(stats["stats"]["pending"], 0);
+}
+
+/// Dependencies gate claiming, and the surface has to report the gate rather
+/// than letting an agent take work whose prerequisites are unfinished.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_blocked_job_is_not_offered_and_cannot_be_claimed(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    let first = env.add_job(&caller, "run the migration").await;
+    let second = env.add_job(&caller, "deploy the service").await;
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let second_id = second["id"].as_str().unwrap().to_string();
+
+    let deps = ok(env
+        .factory
+        .set_dependencies(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::SetDependenciesArgs {
+                job: second_id.clone(),
+                add: vec![first_id.clone()],
+                remove: vec![],
+            }),
+        )
+        .await);
+    assert_eq!(deps["job"], second_id);
+    assert_eq!(deps["dependencies"][0], first_id);
+
+    let ready = ok(env
+        .factory
+        .ready(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::RepoScopeArgs::default()),
+        )
+        .await);
+    assert_eq!(
+        ready["jobs"].as_array().unwrap().len(),
+        1,
+        "only the first is ready"
+    );
+    assert_eq!(ready["jobs"][0]["id"], first_id);
+
+    let blocked = ok(env
+        .factory
+        .blocked(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::RepoScopeArgs::default()),
+        )
+        .await);
+    assert_eq!(blocked["jobs"][0]["id"], second_id);
+
+    assert!(
+        env.factory
+            .claim_jobs(
+                Extension(parts(&caller)),
+                Parameters(tools::jobs::ClaimJobsArgs {
+                    jobs: vec![second_id.clone()],
+                    agent: None,
+                }),
+            )
+            .await
+            .is_err(),
+        "a blocked job must not be claimable"
+    );
+
+    // Finish the prerequisite and the gate opens.
+    ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![first_id.clone()],
+                agent: None,
+            }),
+        )
+        .await);
+    ok(env
+        .factory
+        .complete_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::CompleteJobArgs {
+                job: first_id,
+                result: None,
+            }),
+        )
+        .await);
+
+    let ready = ok(env
+        .factory
+        .ready(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::RepoScopeArgs::default()),
+        )
+        .await);
+    assert_eq!(ready["jobs"][0]["id"], second_id);
+}
+
+/// The error an agent hits on its first call from an unregistered checkout. It
+/// has to contain the way out, or the agent is stuck.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn an_unresolvable_repo_says_what_is_registered_and_what_to_call(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    let e = err(env
+        .factory
+        .add_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::AddJobArgs {
+                title: "work".into(),
+                repo: None,
+                remote: Some("git@github.com:someone/else.git".into()),
+                description: None,
+                ticket_ref: None,
+                agent_type: None,
+                metadata: None,
+                depends_on: vec![],
+            }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "repo_unresolved");
+    assert!(e.message.contains("api"), "must list the known slugs");
+    assert!(e.message.contains("register_repo"), "must say what next");
+}
+
+// ---------------------------------------------------------- tenant isolation
+
+/// The claim the whole product rests on, exercised through the surface a
+/// customer actually reaches rather than through `df-core` directly.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn one_orgs_token_cannot_see_or_touch_anothers_work(pool: PgPool) {
+    let (env, acme) = env(pool).await;
+    env.register(&acme).await;
+    let job = env.add_job(&acme, "acme secret work").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    // A second tenant, with a token as privileged as one can be.
+    let globex = env.db.create_org("globex", "Globex").await.unwrap();
+    let eve = env.db.upsert_user("eve@globex.test", None).await.unwrap();
+    env.db
+        .add_member(globex.id, eve.id, Role::Owner)
+        .await
+        .unwrap();
+    let intruder = principal(eve.id, globex.id, all_scopes());
+
+    let jobs = ok(env
+        .factory
+        .list_jobs(
+            Extension(parts(&intruder)),
+            Parameters(tools::jobs::ListJobsArgs {
+                status: None,
+                repo: None,
+                remote: None,
+                mine: false,
+                limit: None,
+            }),
+        )
+        .await);
+    assert!(jobs["jobs"].as_array().unwrap().is_empty());
+
+    let repos = ok(env
+        .factory
+        .list_repos(
+            Extension(parts(&intruder)),
+            Parameters(tools::repos::ListReposArgs {
+                include_inactive: true,
+            }),
+        )
+        .await);
+    assert!(repos["repos"].as_array().unwrap().is_empty());
+
+    // Cannot fetch it by id, even knowing the id.
+    assert!(env
+        .factory
+        .get_job(
+            Extension(parts(&intruder)),
+            Parameters(tools::jobs::JobArgs { job: id.clone() }),
+        )
+        .await
+        .is_err());
+
+    // Cannot claim it.
+    assert!(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&intruder)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: None,
+            }),
+        )
+        .await
+        .is_err());
+
+    // Cannot delete it.
+    assert!(env
+        .factory
+        .delete_job(
+            Extension(parts(&intruder)),
+            Parameters(tools::jobs::JobArgs { job: id.clone() }),
+        )
+        .await
+        .is_err());
+
+    // And the original is untouched.
+    let after = ok(env
+        .factory
+        .get_job(
+            Extension(parts(&acme)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+    assert_eq!(after["job"]["status"], "pending");
+}
+
+/// `users` is global — one human, one row, however many orgs — so an email
+/// lookup is the one place a tool could reach across the tenant boundary
+/// without reading another org's rows at all. The refusal must also not
+/// confirm that the address exists.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_message_cannot_be_addressed_to_someone_in_another_org(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+
+    let globex = env.db.create_org("globex", "Globex").await.unwrap();
+    let outsider = env.db.upsert_user("cfo@globex.test", None).await.unwrap();
+    env.db
+        .add_member(globex.id, outsider.id, Role::Member)
+        .await
+        .unwrap();
+
+    let to = |address: &str| tools::coord::SendMessageArgs {
+        body: "hello".into(),
+        to: Some(address.into()),
+        kind: None,
+        repo: None,
+        remote: None,
+        job: None,
+        in_reply_to: None,
+        agent: None,
+    };
+
+    let existing = err(env
+        .factory
+        .send_message(Extension(parts(&caller)), Parameters(to("cfo@globex.test")))
+        .await);
+    let absent = err(env
+        .factory
+        .send_message(
+            Extension(parts(&caller)),
+            Parameters(to("nobody@nowhere.test")),
+        )
+        .await);
+
+    assert_eq!(code_of(&existing), "not_a_member");
+    assert!(existing.message.contains("no member of this organization"));
+    assert_eq!(
+        existing.message.replace("cfo@globex.test", "X"),
+        absent.message.replace("nobody@nowhere.test", "X"),
+        "a real address in another org must be indistinguishable from an unused one"
+    );
+}
+
+// --------------------------------------------------------------- coordination
+
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_held_lease_names_its_holder_to_the_next_agent(pool: PgPool) {
+    let (env, first) = env(pool).await;
+    env.register(&first).await;
+
+    let lease = ok(env
+        .factory
+        .acquire_lease(
+            Extension(parts(&first)),
+            Parameters(tools::coord::AcquireLeaseArgs {
+                branch: "main".into(),
+                repo: Some("api".into()),
+                remote: None,
+                agent: Some("agent-one".into()),
+                job: None,
+                ttl_seconds: Some(300),
+            }),
+        )
+        .await);
+
+    let mate = env.teammate(first.org_id, "sam@acme.test").await;
+    let take = || tools::coord::AcquireLeaseArgs {
+        branch: "main".into(),
+        repo: Some("api".into()),
+        remote: None,
+        agent: Some("agent-two".into()),
+        job: None,
+        ttl_seconds: None,
+    };
+
+    let e = err(env
+        .factory
+        .acquire_lease(Extension(parts(&mate)), Parameters(take()))
+        .await);
+
+    assert_eq!(code_of(&e), "lease_held");
+    assert!(
+        e.message.contains("agent-one"),
+        "the holder must be named so the caller can decide what to do: {}",
+        e.message
+    );
+    assert_eq!(
+        e.data.as_ref().unwrap()["retriable"],
+        true,
+        "a lease expires, so retrying is a sensible thing to do"
+    );
+
+    // A different branch of the same repo is free, so one agent does not block
+    // the repository.
+    ok(env
+        .factory
+        .acquire_lease(
+            Extension(parts(&mate)),
+            Parameters(tools::coord::AcquireLeaseArgs {
+                branch: "feature/x".into(),
+                ..take()
+            }),
+        )
+        .await);
+
+    // Released, the contested branch is free too.
+    ok(env
+        .factory
+        .release_lease(
+            Extension(parts(&first)),
+            Parameters(tools::coord::ReleaseLeaseArgs {
+                lease: lease["lease"]["id"].as_str().unwrap().into(),
+            }),
+        )
+        .await);
+    ok(env
+        .factory
+        .acquire_lease(Extension(parts(&mate)), Parameters(take()))
+        .await);
+
+    let live = ok(env
+        .factory
+        .list_leases(
+            Extension(parts(&first)),
+            Parameters(tools::coord::RepoScopeArgs::default()),
+        )
+        .await);
+    assert_eq!(
+        live["leases"].as_array().unwrap().len(),
+        2,
+        "both of sam's leases"
+    );
+}
+
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn messages_reach_the_inbox_and_the_cursor_clears_them(pool: PgPool) {
+    let (env, sender) = env(pool).await;
+    let mate = env.teammate(sender.org_id, "sam@acme.test").await;
+
+    ok(env
+        .factory
+        .send_message(
+            Extension(parts(&sender)),
+            Parameters(tools::coord::SendMessageArgs {
+                body: "migration is half applied on feature/x".into(),
+                to: Some("sam@acme.test".into()),
+                kind: Some("request".into()),
+                repo: None,
+                remote: None,
+                job: None,
+                in_reply_to: None,
+                agent: Some("agent-one".into()),
+            }),
+        )
+        .await);
+
+    let unread = ok(env
+        .factory
+        .unread_count(Extension(parts(&mate)), Parameters(tools::coord::NoArgs {}))
+        .await);
+    assert_eq!(unread["unread"], 1);
+
+    // The sender does not see their own message as unread.
+    let mine = ok(env
+        .factory
+        .unread_count(
+            Extension(parts(&sender)),
+            Parameters(tools::coord::NoArgs {}),
+        )
+        .await);
+    assert_eq!(mine["unread"], 0);
+
+    let inbox = ok(env
+        .factory
+        .inbox(
+            Extension(parts(&mate)),
+            Parameters(tools::coord::InboxArgs {
+                unread_only: true,
+                limit: None,
+                newest_first: false,
+            }),
+        )
+        .await);
+    let messages = inbox["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["kind"], "request");
+    assert_eq!(messages[0]["senderLabel"], "agent-one");
+
+    let cursor = ok(env
+        .factory
+        .ack_messages(
+            Extension(parts(&mate)),
+            Parameters(tools::coord::AckMessagesArgs {
+                up_to: messages[0]["id"].as_i64().unwrap(),
+            }),
+        )
+        .await);
+    assert_eq!(cursor["cursor"], messages[0]["id"]);
+
+    let unread = ok(env
+        .factory
+        .unread_count(Extension(parts(&mate)), Parameters(tools::coord::NoArgs {}))
+        .await);
+    assert_eq!(unread["unread"], 0);
+}
+
+/// `watch` has to return rather than hang when nothing happens, or an agent's
+/// first use of it looks like the server died.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn watch_returns_timeout_when_the_queue_is_quiet(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+
+    let out = ok(env
+        .factory
+        .watch(
+            Extension(parts(&caller)),
+            Parameters(tools::coord::WatchArgs {
+                timeout_seconds: Some(1),
+            }),
+        )
+        .await);
+
+    assert_eq!(out["outcome"], "timeout");
+    assert_eq!(out["waitedSeconds"], 1);
+}
+
+/// The point of the tool: an agent sitting in `watch` learns about work queued
+/// by someone else without polling for it.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn watch_wakes_when_another_agent_queues_work(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    let waiting = {
+        let factory = env.factory.clone();
+        let caller = caller.clone();
+        tokio::spawn(async move {
+            factory
+                .watch(
+                    Extension(parts(&caller)),
+                    Parameters(tools::coord::WatchArgs {
+                        timeout_seconds: Some(10),
+                    }),
+                )
+                .await
+                .map(|j| serde_json::to_value(j.0).unwrap())
+                .map_err(|e| e.message.to_string())
+        })
+    };
+
+    // Let the waiter subscribe before the change happens. A change published
+    // with nobody listening is dropped — correct behaviour, and a race here
+    // would make this test flaky rather than reveal a bug.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    env.add_job(&caller, "something new").await;
+
+    let out = tokio::time::timeout(std::time::Duration::from_secs(12), waiting)
+        .await
+        .expect("watch never returned")
+        .expect("watch task panicked")
+        .expect("watch failed");
+
+    assert_eq!(out["outcome"], "changed");
+}
+
+// --------------------------------------------------------------- the surface
+
+/// The tool list is the API. A tool silently disappearing — a router not added,
+/// a macro attribute mistyped — breaks every caller and compiles fine.
+#[test]
+fn the_advertised_surface_is_exactly_what_the_design_specifies() {
+    let router = tools::router();
+    let mut names: Vec<String> = router
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+
+    let mut expected = vec![
+        // Repos
+        "register_repo",
+        "list_repos",
+        "resolve_repo",
+        "update_repo",
+        // Jobs
+        "add_job",
+        "get_job",
+        "list_jobs",
+        "update_job",
+        "delete_job",
+        "claim_jobs",
+        "complete_job",
+        "fail_job",
+        "repend_job",
+        "set_dependencies",
+        "ready",
+        "blocked",
+        "stats",
+        // Coordination
+        "acquire_lease",
+        "renew_lease",
+        "release_lease",
+        "list_leases",
+        "send_message",
+        "inbox",
+        "ack_messages",
+        "unread_count",
+        "watch",
+        // Org
+        "whoami",
+    ];
+    expected.sort();
+
+    assert_eq!(names, expected);
+}
+
+/// Descriptions are the only documentation an agent gets, and the input schema
+/// is what it builds arguments from. A tool missing either gets called wrongly.
+#[test]
+fn every_tool_documents_itself() {
+    for tool in tools::router().list_all() {
+        let description = tool
+            .description
+            .as_deref()
+            .unwrap_or_else(|| panic!("{} has no description", tool.name));
+        assert!(
+            description.len() > 40,
+            "{}'s description is too thin to guide a caller: {description:?}",
+            tool.name
+        );
+        assert!(
+            tool.input_schema.contains_key("type") || tool.input_schema.contains_key("properties"),
+            "{} has no usable input schema",
+            tool.name
+        );
+    }
+}
+
+// ------------------------------------------------------------ the front door
+
+/// The `401` that makes zero-install onboarding work. An agent configured with
+/// nothing but the MCP URL finds the authorization server through this header
+/// and nowhere else.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn unauthenticated_requests_are_told_where_to_authenticate(pool: PgPool) {
+    use tower::ServiceExt;
+
+    let db = Db::from_pool(pool.clone());
+    let watcher = Watcher::spawn(pool).await.unwrap();
+    let app = df_mcp::router(db, watcher, df_mcp::Config::new(RESOURCE, PUBLIC));
+
+    let response = app
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "mcp.dark-factory.test")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+    let challenge = response
+        .headers()
+        .get(http::header::WWW_AUTHENTICATE)
+        .expect("no WWW-Authenticate header — clients cannot discover the AS")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        challenge.contains(
+            r#"resource_metadata="https://mcp.dark-factory.test/.well-known/oauth-protected-resource""#
+        ),
+        "{challenge}"
+    );
+
+    // And the document it points at is reachable without a token, or the
+    // pointer is a closed loop.
+    let metadata = app
+        .oneshot(
+            http::Request::builder()
+                .uri("/.well-known/oauth-protected-resource")
+                .header("host", "mcp.dark-factory.test")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(metadata.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(metadata.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["resource"], RESOURCE);
+    assert_eq!(doc["authorization_servers"][0], PUBLIC);
+}
+
+/// A token minted for somebody else's resource must not open this one. The
+/// confused-deputy defense, through the real middleware.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_token_for_another_resource_is_refused(pool: PgPool) {
+    use tower::ServiceExt;
+
+    let db = Db::from_pool(pool.clone());
+    let watcher = Watcher::spawn(pool).await.unwrap();
+
+    let org = db.create_org("acme", "Acme").await.unwrap();
+    let user = db.upsert_user("rob@acme.test", None).await.unwrap();
+    db.add_member(org.id, user.id, Role::Owner).await.unwrap();
+
+    let (foreign_token, _) = df_auth::tokens::mint_pat(
+        &db,
+        user.id,
+        org.id,
+        "elsewhere",
+        &["jobs:read".to_string()],
+        "https://someone-else.test/mcp",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let app = df_mcp::router(db, watcher, df_mcp::Config::new(RESOURCE, PUBLIC));
+    let response = app
+        .oneshot(
+            http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "mcp.dark-factory.test")
+                .header("authorization", format!("Bearer {foreign_token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+    let challenge = response
+        .headers()
+        .get(http::header::WWW_AUTHENTICATE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        challenge.contains("different resource"),
+        "the caller needs to know that re-authenticating will not help: {challenge}"
+    );
+}

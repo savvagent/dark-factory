@@ -26,7 +26,7 @@ pub const DEFAULT_TTL_SECS: i64 = 900;
 /// take an effectively permanent lease and only an admin could clear it.
 pub const MAX_TTL_SECS: i64 = 4 * 3600;
 
-#[derive(Debug, Clone, PartialEq, Serialize, FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Lease {
     pub id: uuid::Uuid,
