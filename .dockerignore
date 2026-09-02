@@ -1,0 +1,18 @@
+# Build outputs and dependencies: several gigabytes that the image rebuilds
+# anyway, and sending them makes every build slower for no benefit.
+target
+web/node_modules
+web/build
+web/.svelte-kit
+
+# Never in an image. `dotenvy` does not override a variable that is already
+# set, so a leaked .env could not hijack a deployment's configuration — but a
+# file holding a database URL and an encryption key does not belong in a layer
+# anyone who can pull the image can read.
+.env
+.env.*
+!.env.example
+
+.git
+.github
+*.log

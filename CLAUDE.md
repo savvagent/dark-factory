@@ -65,7 +65,13 @@ cd web && npm install
 npm run check                 # svelte-check, strict — the console's `cargo test`
 npm run lint                  # prettier --check — the console's `cargo fmt --check`
 npm run build                 # static bundle into web/build
+
+cargo run -p df-server        # everything on one port, reading .env
+podman build -t dark-factory .   # console stage + rust stage + slim runtime
 ```
+
+`DF_PUBLIC_URL` and `DF_ENCRYPTION_KEY` are required with no defaults; `.env.example` says
+why for each. Build `web/` first or every console page answers `404` while the API works.
 
 Integration tests are `#[sqlx::test]` against a real Postgres — one fresh throwaway
 database per test, migrations auto-applied. There are no mocks for the database, on
@@ -184,6 +190,40 @@ Org pages live under `/o/[org]`, not `/[org]`, so no org slug can collide with a
 The paths the *server* names — `/login`, `/verify`, `/recover`, `/invite/{org}`,
 `/settings/billing` — are fixed by what goes in email and in `df-billing`'s upgrade prompt,
 and cannot be renamed here alone.
+
+## `df-server` — assembly, and the two things only it can get wrong
+
+One binary mounts every surface on one port. Nothing here has business logic; what it has is
+the decisions no single crate could make.
+
+- **Route collisions are a startup panic, so a test builds the router.** `df-web` and
+  `df-mcp` both serve `/.well-known/oauth-protected-resource`, each for a good reason, and
+  `Router::merge` panics rather than choosing. `df-server` mounts `df_mcp::mcp_endpoint`
+  (the MCP route alone) beside `df-web`'s catalog, and `the_whole_router_assembles` reaches
+  that panic before a deployment does.
+- **The console SPA is the fallback, but not under `/api`, `/oauth`, `/mcp`, or
+  `/.well-known`.** `index.html` answering an unknown path is what makes a hard refresh of a
+  deep link work; `index.html` answering `/api/no/such/thing` with `200 text/html` is what
+  makes an agent retry forever against a route that will never exist.
+- **`/healthz` never touches the database and `/readyz` always does.** They answer different
+  questions — "should this process be killed?" and "should traffic come here?" — and wiring
+  liveness to the database turns a brief database blip into a simultaneous cold start of
+  every replica.
+- **`into_make_service_with_connect_info` is load-bearing.** `df_web::state::client_ip`
+  reads the peer address out of `ConnectInfo`, and that address keys every per-IP throttle
+  and every audit entry. Serve without it and `client_ip` returns `None` for every request,
+  silently disabling rate limiting on login and client registration.
+- **`Config::from_env` never falls back quietly.** A variable that is *set* but unparseable
+  is a startup error naming it, not a default — `DF_ENFORCE_QUOTAS=yes-please` reading as
+  "off" is how a billing control gets deployed switched off for a year. `DF_PUBLIC_URL` and
+  `DF_ENCRYPTION_KEY` have no defaults at all, because a wrong value for either fails
+  silently: bad links in somebody's inbox, or tokens minted for an audience nothing accepts.
+- **`DF_CLIENT_IP_HEADER` names the header, and which header is not a matter of taste.**
+  Only a header the proxy *overwrites* can be trusted. On Fly.io that is `fly-client-ip`,
+  never `x-forwarded-for` — fly-proxy appends, so a caller's own value arrives left-most and
+  every throttle keys on something the attacker chose.
+- **Graceful shutdown outlives the server.** `axum::serve(...).with_graceful_shutdown(...)`
+  returns, and only then does `watcher.shutdown().await` run — see the trap below.
 
 ## A trap in tests: the change listener holds a connection
 

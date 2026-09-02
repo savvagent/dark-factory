@@ -37,9 +37,8 @@ Build order: [`docs/plans/2026-09-01-milestone-1.md`](docs/plans/2026-09-01-mile
 
 ## Status
 
-Milestone 1, tasks 2–11 of 13 complete. Every surface a customer touches exists and is
-tested; what is missing is a process — `df-server`'s `main.rs` is still four lines, so
-nothing binds a port yet.
+Milestone 1, tasks 2–11 and 13 of 13 complete. `df-server` binds a port and serves every
+surface on it; what remains is task 12, the client conformance run.
 
 | Crate | State |
 |---|---|
@@ -49,7 +48,7 @@ nothing binds a port yet.
 | `df-billing` | ✅ usage metering, free/billable split, tier buckets |
 | `df-trackers` | ⬜ GitHub App + JIRA two-way sync (milestone 2) |
 | `df-web` | ✅ console API, session cookies, the AS's browser endpoints |
-| `df-server` | ⬜ config, migrations at startup, router assembly (task 13) |
+| `df-server` | ✅ config, startup migrations, router assembly, health, deploy |
 | `web/` | ✅ SvelteKit 2 / Svelte 5 console |
 
 ## Tenant isolation
@@ -101,8 +100,65 @@ npm run build     # static bundle into web/build
 
 `npm run dev` proxies `/api`, `/oauth`, and `/.well-known` to `DF_API_ORIGIN` (default
 `http://127.0.0.1:8080`) so every request stays on one origin — the session cookie carries
-the `__Host-` prefix and cannot cross ports. Until task 13 binds that port there is nothing
-behind the proxy. See [`web/README.md`](web/README.md).
+the `__Host-` prefix and cannot cross ports. See [`web/README.md`](web/README.md).
+
+### Running the server
+
+```bash
+cargo run -p df-server
+```
+
+It reads `.env`, applies migrations, and serves everything on one port:
+
+| Path | Surface |
+|---|---|
+| `/healthz` | Liveness. Never touches the database. |
+| `/readyz` | Readiness. Probes the database; `503` when it cannot. |
+| `/api/…` | Console REST API (`/api/openapi.json` describes it). |
+| `/oauth/…`, `/.well-known/…` | Authorization server and discovery. |
+| `/mcp` | The MCP endpoint. Bearer tokens only. |
+| everything else | The console SPA, with an `index.html` fallback. |
+
+`DF_PUBLIC_URL` and `DF_ENCRYPTION_KEY` are required and have no defaults, because a wrong
+value for either fails silently rather than loudly — see the comments in `.env.example`.
+Run `npm run build` in `web/` first, or every console page answers `404` while the API
+works perfectly.
+
+## Deployment
+
+```bash
+podman build -t dark-factory .
+```
+
+One image: the console bundle is built by a `node` stage, the binary by a `rust` stage, and
+both land in a `debian-slim` runtime that runs as a non-root user. No database is needed to
+build it — every statement in `df-core` is a runtime `sqlx::query` rather than a `query!`
+macro, so there is no compile-time schema check and no `.sqlx` offline data to keep current.
+
+On Fly.io, [`fly.toml`](fly.toml) carries the non-secret configuration and the health check.
+The rest are secrets:
+
+```bash
+fly secrets set \
+  DATABASE_URL="postgres://…" \
+  DF_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
+  DF_PUBLIC_URL="https://factory.example.com"
+fly deploy
+```
+
+Migrations run at startup under a Postgres advisory lock, so several machines booting
+together is safe: the losers wait rather than racing through the same DDL.
+
+Two settings are deployment-specific and easy to get subtly wrong:
+
+- **`DF_CLIENT_IP_HEADER`** decides what every per-IP throttle and audit entry is keyed on.
+  Leave it unset with no proxy in front. Behind Fly's proxy it must be `fly-client-ip` and
+  **not** `x-forwarded-for`: fly-proxy *appends* to `X-Forwarded-For`, so a caller sending
+  its own value arrives left-most, and a rate limiter keyed on that is worse than none
+  because it looks like it is working. `fly.toml` sets it.
+- **`DF_PUBLIC_URL`** is the audience every token is bound to and the origin every emailed
+  link points at. It is not derived from the `Host` header on purpose — that header is
+  attacker-controlled, and an audience derived from one is not an audience check.
 
 ## Repository layout
 
@@ -115,7 +171,8 @@ behind the proxy. See [`web/README.md`](web/README.md).
 | `crates/df-billing` | Usage metering and tier enforcement. |
 | `crates/df-trackers` | GitHub App + JIRA sync. |
 | `crates/df-web` | Console REST API. |
-| `crates/df-server` | The binary: config, migrations, router assembly. |
+| `crates/df-server` | The binary: config, migrations, router assembly, health. |
+| `Dockerfile`, `fly.toml` | The image and its Fly.io deployment. |
 | `web/` | SvelteKit 2 + Svelte 5 console. |
 
 ## Metering

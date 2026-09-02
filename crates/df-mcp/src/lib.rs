@@ -122,6 +122,36 @@ pub fn router(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
         config.public_url.clone(),
     ));
 
+    Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(auth::protected_resource_metadata),
+        )
+        .with_state(rs)
+        .merge(mcp_endpoint(db, watcher, config))
+}
+
+/// Just `POST /mcp` — [`router`] without the discovery document.
+///
+/// `df-server` mounts this rather than [`router`] because `df-web`'s catalog
+/// serves `/.well-known/oauth-protected-resource` too, and when both crates are
+/// merged onto one origin `axum::Router::merge` panics on the collision rather
+/// than picking a winner. Which one wins does not matter — both call
+/// `df_auth::oauth::protected_resource_metadata` with the same configured
+/// resource URI and public URL, so the two documents are byte-identical — and
+/// `df-web`'s is the one the OpenAPI document describes, so that is the one
+/// `df-server` keeps.
+///
+/// The `401` challenge's pointer stays valid either way: it names an absolute
+/// URL under [`Config::public_url`], which is the origin serving both crates.
+/// Keep [`router`] whole for anything mounting the MCP surface on its own.
+pub fn mcp_endpoint(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
+    let rs = Arc::new(ResourceServer::new(
+        db.clone(),
+        config.resource_uri.clone(),
+        config.public_url.clone(),
+    ));
+
     // #[non_exhaustive], so built by mutation rather than a struct literal.
     let mut transport = StreamableHttpServerConfig::default();
     transport.stateful_mode = false;
@@ -143,17 +173,11 @@ pub fn router(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
         transport,
     );
 
-    Router::new()
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(auth::protected_resource_metadata),
-        )
-        .route_service(
-            "/mcp",
-            any_service(service).layer(axum::middleware::from_fn_with_state(
-                rs.clone(),
-                auth::require_bearer,
-            )),
-        )
-        .with_state(rs)
+    Router::new().route_service(
+        "/mcp",
+        any_service(service).layer(axum::middleware::from_fn_with_state(
+            rs,
+            auth::require_bearer,
+        )),
+    )
 }

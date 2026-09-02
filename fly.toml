@@ -1,0 +1,54 @@
+# dark-factory on Fly.io.
+#
+# Secrets are NOT here — `fly secrets set` puts DATABASE_URL, DF_ENCRYPTION_KEY,
+# and DF_PUBLIC_URL in the machine's environment. See README.md.
+
+app = "dark-factory"
+primary_region = "iad"
+
+[build]
+
+[env]
+  # Fly's proxy terminates TLS and forwards over the internal network, so the
+  # process serves plain HTTP and the public origin is https.
+  DF_BIND = "0.0.0.0:8080"
+  DF_STATIC_DIR = "/srv/console"
+  DF_LOG_FORMAT = "json"
+  RUST_LOG = "info,df_server=info,df_mcp=info,df_web=info"
+
+  # `fly-client-ip`, deliberately not `x-forwarded-for`. fly-proxy *appends*
+  # to X-Forwarded-For, so a caller sending its own value arrives as
+  # "<theirs>, <real>" and the left-most entry — the one every convention
+  # calls the client — is attacker-chosen. Keying a rate limiter on that is
+  # worse than not having one, because it looks like it is working.
+  # Fly-Client-IP is written by the proxy and holds exactly one address.
+  DF_CLIENT_IP_HEADER = "fly-client-ip"
+
+[http_service]
+  internal_port = 8080
+  # The session cookie carries the __Host- prefix, which browsers refuse to
+  # store without Secure. A plain-http console cannot log anyone in.
+  force_https = true
+  auto_start_machines = true
+  # Suspend rather than stop: `watch` is a long poll and an agent waiting on a
+  # queue is the normal state, so a cold start on every wake would be a
+  # thirty-second stall in the middle of somebody's work.
+  auto_stop_machines = "suspend"
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    # /readyz, not /healthz. This check decides whether traffic is routed
+    # here, which is the question readiness answers; liveness is a different
+    # question and is deliberately not wired to anything that restarts a
+    # machine over a database blip.
+    path = "/readyz"
+    method = "GET"
+    interval = "15s"
+    timeout = "5s"
+    # Migrations run at startup under an advisory lock, so a first boot against
+    # a fresh database has DDL to get through before it can answer.
+    grace_period = "30s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
