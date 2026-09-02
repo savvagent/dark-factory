@@ -464,6 +464,39 @@ pub async fn list_tokens(db: &Db, user: UserId, org: OrgId) -> Result<Vec<TokenS
     Ok(rows)
 }
 
+/// Revoke every token a user holds **in one org**.
+///
+/// What removing someone from an org has to do, and the reason it is scoped
+/// rather than global: a token's org is fixed at issuance, so a person who is
+/// still a member of two other orgs keeps working there. Leaving these behind
+/// is the failure worth naming — a removed member's agent would keep claiming
+/// jobs on a token that outlives their membership by up to its full lifetime,
+/// and nothing in the console would explain why.
+pub async fn revoke_all_in_org(db: &Db, user: UserId, org: OrgId) -> Result<u64> {
+    let access = sqlx::query(
+        "UPDATE access_tokens SET revoked_at = now() \
+         WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+
+    // Refresh tokens too, or the next refresh quietly mints a working access
+    // token for someone who was just removed.
+    sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = now() \
+         WHERE user_id = $1 AND org_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(user)
+    .bind(org)
+    .execute(db.pool())
+    .await?;
+
+    Ok(access)
+}
+
 /// Revoke one token by id, scoped to its owner so a user cannot revoke another's.
 pub async fn revoke_by_id(db: &Db, user: UserId, org: OrgId, id: Uuid) -> Result<bool> {
     let n = sqlx::query(

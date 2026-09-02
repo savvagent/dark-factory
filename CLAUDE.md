@@ -104,6 +104,33 @@ every tool in it:
   failure means. `tests/tools.rs` asserts the tool list and that every tool describes
   itself, so a tool that silently disappears fails a test rather than a customer.
 
+## The console surface
+
+`df-web` serves everything a human touches, plus the authorization server's HTTP endpoints
+— `/oauth/authorize` is a browser surface that needs the console's session cookie, which is
+why it lives here and not in `df-mcp`. Four conventions:
+
+- **Authorization is an extractor, not a handler's first line.** `OrgCtx` resolves the
+  caller, the `{org}` path segment, and their role before any handler body runs;
+  `require_admin()` / `require_owner()` narrow it. A handler that forgets is a handler that
+  serves another tenant's data, and a type catches that where a review checklist does not.
+- **An org you are not in is `404`, never `403`.** A `403` on a real slug and a `404` on a
+  fake one turns any signed-in account into a directory of who uses the product.
+- **The router and the OpenAPI document are built from one list.** Adding a route means
+  adding it to `catalog.rs` with its summary and description; `router()` mounts the list and
+  `openapi::document` renders it. A route not in the catalog is not reachable, on purpose.
+- **No credential is ever spent on a `GET`.** Mail scanners and link-preview fetchers follow
+  every URL in every message, so an emailed link points at a console *page* that renders a
+  button, and the button `POST`s the token. `every_single_use_redemption_is_a_post` asserts
+  it. The session cookie's attributes — `HttpOnly`, `Secure`, `Path=/`, `SameSite=Lax`, and
+  the `__Host-` prefix — are asserted for the same reason: losing one is a silent
+  regression that no other test would notice. `Lax` specifically, because `Strict` would
+  drop the cookie on the top-level navigation into `/oauth/authorize`.
+
+Mail delivery is the `Mailer` trait. `LogMailer` is the development implementation and is
+loud on purpose — a quiet no-op mailer looks identical to a working one until someone asks
+why nobody has joined.
+
 ## A trap in tests: the change listener holds a connection
 
 `Watcher::spawn` takes a connection out of the pool for `LISTEN` and **detaches** it, so

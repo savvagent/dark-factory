@@ -103,7 +103,15 @@ pub struct RepoRef {
 pub struct RepoPatch {
     pub name: Option<String>,
     pub default_branch: Option<String>,
-    pub team_id: Option<TeamId>,
+    /// Three states, not two: `None` leaves the team alone, `Some(Some(id))`
+    /// moves the repo to that team, and `Some(None)` makes it org-wide.
+    ///
+    /// A plain `Option<TeamId>` cannot express the last one — "absent" and
+    /// "clear it" collapse into the same value — so a repo could be scoped to a
+    /// team and never unscoped. That is not a cosmetic gap: `delete_team`
+    /// refuses while repos are still scoped to it, so without a way to unassign
+    /// them a team becomes undeletable.
+    pub team_id: Option<Option<TeamId>>,
     pub default_agent_type: Option<String>,
     pub tracker_binding: Option<serde_json::Value>,
     pub active: Option<bool>,
@@ -422,17 +430,20 @@ impl Tx<'_> {
         let repo: Repo = sqlx::query_as(&format!(
             "UPDATE repos SET name = COALESCE($3, name), \
                     default_branch = COALESCE($4, default_branch), \
-                    team_id = COALESCE($5, team_id), \
-                    default_agent_type = COALESCE($6, default_agent_type), \
-                    tracker_binding = COALESCE($7, tracker_binding), \
-                    active = COALESCE($8, active) \
+                    team_id = CASE WHEN $5 THEN $6 ELSE team_id END, \
+                    default_agent_type = COALESCE($7, default_agent_type), \
+                    tracker_binding = COALESCE($8, tracker_binding), \
+                    active = COALESCE($9, active) \
              WHERE org_id = $1 AND id = $2 RETURNING {REPO_COLS}"
         ))
         .bind(org)
         .bind(id)
         .bind(patch.name.as_deref())
         .bind(patch.default_branch.as_deref())
-        .bind(patch.team_id)
+        // COALESCE cannot express "set this to NULL", so the team is written
+        // through an explicit "was it named?" flag instead.
+        .bind(patch.team_id.is_some())
+        .bind(patch.team_id.flatten())
         .bind(patch.default_agent_type.as_deref())
         .bind(patch.tracker_binding.as_ref())
         .bind(patch.active)

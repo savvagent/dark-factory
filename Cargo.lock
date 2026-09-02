@@ -527,7 +527,9 @@ dependencies = [
 name = "df-web"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "base64",
  "chrono",
  "df-auth",
  "df-billing",
@@ -535,11 +537,15 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
+ "totp-rs",
+ "tower",
  "tower-http",
  "tracing",
+ "url",
  "uuid",
 ]
 

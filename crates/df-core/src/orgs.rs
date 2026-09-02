@@ -245,6 +245,22 @@ impl Db {
         Ok(role)
     }
 
+    /// How many owners this org has.
+    ///
+    /// The console checks this before removing or demoting one. An org with no
+    /// owner has nobody who can change its billing, bind an IdP, or delete it —
+    /// a state only a human with database access can undo, so it is refused at
+    /// the last one rather than repaired later.
+    pub async fn count_owners(&self, org: OrgId) -> Result<i64> {
+        let n = sqlx::query_scalar(
+            "SELECT count(*) FROM org_members WHERE org_id = $1 AND role = 'owner'",
+        )
+        .bind(org)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(n)
+    }
+
     pub async fn list_user_orgs(&self, user: UserId) -> Result<Vec<Membership>> {
         let rows = sqlx::query_as(
             "SELECT m.org_id, m.user_id, m.role, o.slug AS org_slug, o.name AS org_name, o.plan \

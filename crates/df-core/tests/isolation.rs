@@ -18,6 +18,7 @@ use common::{db, job, tenant};
 use df_core::ids::{JobId, OrgId};
 use df_core::jobs::JobFilter;
 use df_core::messages::{InboxQuery, NewMessage};
+use df_core::orgs::Role;
 use df_core::repos::{RepoPatch, RepoRef};
 use sqlx::PgPool;
 
@@ -215,6 +216,121 @@ async fn leases_are_invisible_across_orgs(pool: PgPool) {
     let seen = tx.list_leases(None).await.unwrap();
     tx.commit().await.unwrap();
     assert!(seen.is_empty(), "org B saw org A's leases: {seen:?}");
+}
+
+#[sqlx::test]
+async fn teams_are_invisible_across_orgs(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let team = tx.create_team("platform", "Platform").await.unwrap();
+    tx.add_team_member(team.id, a.user).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin(b.org).await.unwrap();
+    assert!(
+        tx.list_teams().await.unwrap().is_empty(),
+        "org B saw org A's teams"
+    );
+    assert!(tx.get_team(team.id).await.unwrap().is_none());
+    assert!(tx.get_team_by_slug("platform").await.unwrap().is_none());
+    assert!(
+        tx.list_team_members(team.id).await.unwrap().is_empty(),
+        "org B read the roster of org A's team"
+    );
+    assert!(tx.list_user_teams(a.user).await.unwrap().is_empty());
+    tx.commit().await.unwrap();
+}
+
+/// Every mutating team operation, driven from the wrong org with a real id from
+/// the right one — the shape of an attack that has guessed or leaked an id.
+#[sqlx::test]
+async fn cross_org_team_mutation_is_refused(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let team = tx.create_team("platform", "Platform").await.unwrap();
+    tx.add_team_member(team.id, a.user).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin(b.org).await.unwrap();
+    assert!(tx
+        .update_team(
+            team.id,
+            df_core::teams::TeamPatch {
+                name: Some("hijacked".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err());
+    assert!(tx.delete_team(team.id).await.is_err());
+    assert!(
+        tx.add_team_member(team.id, b.user).await.is_err(),
+        "org B put its own user on org A's team"
+    );
+    // A no-op rather than an error, like every other delete-shaped call — what
+    // matters is that org A's roster is untouched.
+    tx.remove_team_member(team.id, a.user).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let team = tx.get_team(team.id).await.unwrap().expect("team survived");
+    assert_eq!(team.name, "Platform", "org B renamed org A's team");
+    assert_eq!(
+        tx.list_team_members(team.id).await.unwrap().len(),
+        1,
+        "org B emptied org A's team"
+    );
+    tx.commit().await.unwrap();
+}
+
+/// An invitation is a credential that grants membership of one org. A token
+/// leaking across the tenant boundary would grant membership of the wrong one.
+#[sqlx::test]
+async fn invitations_are_invisible_and_unusable_across_orgs(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+    let bob = db.upsert_user("bob@acme.test", None).await.unwrap();
+    let hash = vec![7u8; 32];
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let invite = tx
+        .create_invite("bob@acme.test", Role::Admin, Some(a.user), &hash)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin(b.org).await.unwrap();
+    assert!(
+        tx.list_invites().await.unwrap().is_empty(),
+        "org B saw org A's pending invitations"
+    );
+    assert!(tx.peek_invite(&hash).await.is_err());
+    assert!(tx.revoke_invite(invite.id).await.is_err());
+    assert!(
+        tx.accept_invite(&hash, bob.id, "bob@acme.test")
+            .await
+            .is_err(),
+        "an invitation to org A admitted its holder to org B"
+    );
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        db.member_role(b.org, bob.id).await.unwrap(),
+        None,
+        "bob joined the wrong org"
+    );
+
+    // And org A's invitation is still there, unspent.
+    let mut tx = db.begin(a.org).await.unwrap();
+    assert_eq!(tx.list_invites().await.unwrap().len(), 1);
+    tx.commit().await.unwrap();
 }
 
 /// A transaction pinned to an org that owns nothing sees nothing — rather than,
