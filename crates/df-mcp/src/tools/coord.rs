@@ -428,6 +428,10 @@ impl Factory {
         self.charge(&mut tx, &caller, "watch").await?;
         tx.commit().await.mcp()?;
 
+        // Timed, not assumed: on a wake-up the caller waited less than the
+        // budget, and reporting the budget back tells an agent pacing itself
+        // that a queue which answered in two seconds took thirty.
+        let started = std::time::Instant::now();
         let outcome = self
             .watcher()
             .wait(
@@ -442,7 +446,7 @@ impl Factory {
                 Outcome::Changed => out::WatchOutcome::Changed,
                 Outcome::Timeout => out::WatchOutcome::Timeout,
             },
-            waited_seconds: secs,
+            waited_seconds: started.elapsed().as_secs(),
         }))
     }
 }

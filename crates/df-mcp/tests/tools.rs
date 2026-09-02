@@ -838,6 +838,12 @@ async fn watch_wakes_when_another_agent_queues_work(pool: PgPool) {
         .expect("watch failed");
 
     assert_eq!(out["outcome"], "changed");
+    // The field says how long the call blocked, not what it was allowed to. An
+    // agent pacing itself off a wake-up must not be told it waited ten seconds.
+    assert!(
+        out["waitedSeconds"].as_u64().expect("waitedSeconds") < 10,
+        "waitedSeconds reported the timeout budget instead of the real wait: {out}"
+    );
 }
 
 // --------------------------------------------------------------- the surface

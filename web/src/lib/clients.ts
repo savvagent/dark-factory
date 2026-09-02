@@ -46,7 +46,9 @@ export const CLIENTS: ClientRecipe[] = [
     oauth: (url) => `claude mcp add --transport http dark-factory ${url}`,
     token: (url, token) =>
       `claude mcp add --transport http dark-factory ${url} \\\n  --header "Authorization: Bearer ${token || PLACEHOLDER}"`,
-    note: 'Run it in any project. The first tool call opens a browser for consent.'
+    note:
+      'Then run `claude mcp login dark-factory` in an interactive terminal to consent — ' +
+      'a `-p` session cannot open a browser and will report the server as unauthenticated.'
   },
   {
     id: 'copilot-cli',
@@ -68,7 +70,10 @@ export const CLIENTS: ClientRecipe[] = [
         },
         null,
         2
-      )
+      ),
+    note:
+      'Copilot only offers the browser consent from its interactive session; a `-p` run ' +
+      'with no credential reports no such tool rather than asking. Script it with a token.'
   },
   {
     id: 'cursor',

@@ -124,6 +124,9 @@ pub enum WatchOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct WatchOut {
     pub outcome: WatchOutcome,
+    /// How long the call actually blocked — not the timeout it asked for. On a
+    /// wake-up these differ, and an agent pacing itself off this field needs the
+    /// real number.
     pub waited_seconds: u64,
 }
 

@@ -251,6 +251,13 @@ Two layers that must not be conflated:
 - **Layer 2 — who the human is**: passwordless TOTP for individuals, enterprise OIDC
   federation for orgs that bind an IdP. No password is ever accepted or stored.
 
+Redirect URI matching is exact, with one carve-out: `http://127.0.0.1`, `http://[::1]` and
+`http://localhost` ignore the port (RFC 8252 §7.3) and match on everything else. Do not
+tighten that without registering the change against a real client first — `localhost` was
+once excluded on sound-sounding reasoning, and it silently removed the OAuth path for Claude
+Code, which registers `http://localhost:<port>/callback`. `docs/clients/matrix.md` records
+what each client actually sends.
+
 TOTP without recovery is not shippable — recovery codes and the email magic link are part
 of the feature, not a follow-up.
 
