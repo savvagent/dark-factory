@@ -812,6 +812,282 @@ async fn an_unknown_team_slug_names_the_alternatives(pool: PgPool) {
     );
 }
 
+// ------------------------------------------------------------------ queue
+
+/// Enqueue through `df-core`, because the console cannot.
+///
+/// That asymmetry is the point of the queue routes: a job is created and
+/// completed by the agent doing the work, over MCP. Reaching past the API to
+/// set up this fixture is not a shortcut around a route that exists — it is the
+/// only way to reach the state, and a test that could enqueue over HTTP would
+/// be evidence of a route that should not be there.
+async fn enqueue(
+    h: &common::Harness,
+    org: df_core::ids::OrgId,
+    repo: df_core::ids::RepoId,
+    title: &str,
+    created_by: df_core::ids::UserId,
+) -> df_core::jobs::Job {
+    let mut tx = h.db.begin(org).await.unwrap();
+    let job = tx
+        .add_job(df_core::jobs::NewJob {
+            repo_id: repo,
+            title: title.into(),
+            created_by: Some(created_by),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    job
+}
+
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn the_queue_view_lists_filters_and_counts(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let sam = onboard(&h, "sam@acme.test").await;
+    let acme = org_with_owner(&h, "acme", &rob).await;
+    add_member(&h, acme, sam.user, Role::Member).await;
+
+    let api: df_core::ids::RepoId = {
+        let created = Call::post("/api/orgs/acme/repos")
+            .with_session(&rob.session)
+            .json(serde_json::json!({ "slug": "api" }))
+            .send(&h.router)
+            .await;
+        created.expect(StatusCode::CREATED);
+        created.body["id"].as_str().unwrap().parse().unwrap()
+    };
+    let web: df_core::ids::RepoId = {
+        let created = Call::post("/api/orgs/acme/repos")
+            .with_session(&rob.session)
+            .json(serde_json::json!({ "slug": "web" }))
+            .send(&h.router)
+            .await;
+        created.expect(StatusCode::CREATED);
+        created.body["id"].as_str().unwrap().parse().unwrap()
+    };
+
+    let first = enqueue(&h, acme, api, "rewrite the resolver", rob.user).await;
+    enqueue(&h, acme, api, "add a lease test", rob.user).await;
+    enqueue(&h, acme, web, "fix the meter", sam.user).await;
+
+    // Claiming one moves it off `pending`, which is what makes the status
+    // filter and the counters worth asserting separately.
+    {
+        let mut tx = h.db.begin(acme).await.unwrap();
+        tx.claim_jobs(
+            std::slice::from_ref(&first.id),
+            rob.user,
+            Some("claude-code"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let all = Call::get("/api/orgs/acme/jobs")
+        .with_session(&sam.session)
+        .send(&h.router)
+        .await;
+    all.expect(StatusCode::OK);
+    assert_eq!(
+        all.body.as_array().unwrap().len(),
+        3,
+        "any member sees the whole org's queue"
+    );
+
+    let pending = Call::get("/api/orgs/acme/jobs?status=pending")
+        .with_session(&sam.session)
+        .send(&h.router)
+        .await;
+    pending.expect(StatusCode::OK);
+    assert_eq!(pending.body.as_array().unwrap().len(), 2);
+
+    let in_repo = Call::get("/api/orgs/acme/jobs?repo=web")
+        .with_session(&sam.session)
+        .send(&h.router)
+        .await;
+    in_repo.expect(StatusCode::OK);
+    assert_eq!(in_repo.body.as_array().unwrap().len(), 1);
+    assert_eq!(in_repo.body[0]["title"], "fix the meter");
+
+    let mine = Call::get("/api/orgs/acme/jobs?mine=true")
+        .with_session(&sam.session)
+        .send(&h.router)
+        .await;
+    mine.expect(StatusCode::OK);
+    assert_eq!(
+        mine.body.as_array().unwrap().len(),
+        1,
+        "`mine` is the caller, not the org"
+    );
+
+    let stats = Call::get("/api/orgs/acme/jobs/stats")
+        .with_session(&sam.session)
+        .send(&h.router)
+        .await;
+    stats.expect(StatusCode::OK);
+    assert_eq!(stats.body["total"], 3);
+    assert_eq!(stats.body["pending"], 2);
+    assert_eq!(stats.body["inProgress"], 1);
+    assert_eq!(stats.body["blocked"], 0);
+
+    // `/jobs/stats` and `/jobs/{job}` share a prefix; a router that resolved
+    // the literal to the parameter would answer this with a 404 for a job
+    // called "stats".
+    let one = Call::get(format!("/api/orgs/acme/jobs/{}", first.id))
+        .with_session(&sam.session)
+        .send(&h.router)
+        .await;
+    one.expect(StatusCode::OK);
+    assert_eq!(one.body["title"], "rewrite the resolver");
+    assert_eq!(one.body["status"], "in-progress");
+    assert_eq!(one.body["claimedByLabel"], "claude-code");
+    assert_eq!(one.body["dependsOn"].as_array().unwrap().len(), 0);
+
+    let repo_stats = Call::get("/api/orgs/acme/jobs/stats?repo=api")
+        .with_session(&sam.session)
+        .send(&h.router)
+        .await;
+    repo_stats.expect(StatusCode::OK);
+    assert_eq!(repo_stats.body["total"], 2);
+}
+
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_job_detail_names_what_it_is_waiting_for(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let acme = org_with_owner(&h, "acme", &rob).await;
+
+    let created = Call::post("/api/orgs/acme/repos")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "slug": "api" }))
+        .send(&h.router)
+        .await;
+    created.expect(StatusCode::CREATED);
+    let api: df_core::ids::RepoId = created.body["id"].as_str().unwrap().parse().unwrap();
+
+    let blocker = enqueue(&h, acme, api, "land the migration", rob.user).await;
+    let blocked = {
+        let mut tx = h.db.begin(acme).await.unwrap();
+        let job = tx
+            .add_job(df_core::jobs::NewJob {
+                repo_id: api,
+                title: "use the new column".into(),
+                depends_on: vec![blocker.id.clone()],
+                created_by: Some(rob.user),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        job
+    };
+
+    let detail = Call::get(format!("/api/orgs/acme/jobs/{}", blocked.id))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    detail.expect(StatusCode::OK);
+    assert_eq!(detail.body["dependsOn"][0], blocker.id.as_str());
+
+    // A blocked job is still pending. The overview counts it in both, and the
+    // difference is the whole reason `blocked` is reported at all: two pending
+    // jobs where one cannot start is not the same queue as two that can.
+    let stats = Call::get("/api/orgs/acme/jobs/stats")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    stats.expect(StatusCode::OK);
+    assert_eq!(stats.body["pending"], 2);
+    assert_eq!(stats.body["blocked"], 1);
+}
+
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn an_unknown_repo_filter_names_the_registered_slugs(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    Call::post("/api/orgs/acme/repos")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "slug": "api" }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::CREATED);
+
+    // Not an empty list. A filter that silently matched nothing would render a
+    // queue that looks quiet rather than one that was never asked about.
+    let missed = Call::get("/api/orgs/acme/jobs?repo=apo")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    missed.expect(StatusCode::NOT_FOUND);
+    assert!(
+        missed.text.contains("api"),
+        "the error should name what is registered: {}",
+        missed.text
+    );
+
+    let bad_status = Call::get("/api/orgs/acme/jobs?status=done")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    bad_status.expect(StatusCode::BAD_REQUEST);
+    assert!(
+        bad_status.text.contains("completed"),
+        "an unknown status should list the valid ones: {}",
+        bad_status.text
+    );
+}
+
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn one_orgs_queue_is_invisible_to_another(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let mal = onboard(&h, "mal@other.test").await;
+    let acme = org_with_owner(&h, "acme", &rob).await;
+    org_with_owner(&h, "other", &mal).await;
+
+    let created = Call::post("/api/orgs/acme/repos")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "slug": "api" }))
+        .send(&h.router)
+        .await;
+    created.expect(StatusCode::CREATED);
+    let api: df_core::ids::RepoId = created.body["id"].as_str().unwrap().parse().unwrap();
+    let job = enqueue(&h, acme, api, "acme's secret roadmap", rob.user).await;
+
+    // 404, not 403: a 403 on a real slug and a 404 on a fake one turns any
+    // signed-in account into a directory of who uses the product.
+    for uri in [
+        "/api/orgs/acme/jobs".to_string(),
+        "/api/orgs/acme/jobs/stats".to_string(),
+        format!("/api/orgs/acme/jobs/{}", job.id),
+    ] {
+        let refused = Call::get(&uri)
+            .with_session(&mal.session)
+            .send(&h.router)
+            .await;
+        refused.expect(StatusCode::NOT_FOUND);
+        assert!(
+            !refused.text.contains("secret roadmap"),
+            "{uri} leaked another org's job"
+        );
+    }
+
+    // And the same job id, asked for from an org that has one of its own, is
+    // that org's job or nothing — ids are per-org counters, so `job-1` exists
+    // in both and must not cross.
+    let elsewhere = Call::get("/api/orgs/other/jobs/job-1")
+        .with_session(&mal.session)
+        .send(&h.router)
+        .await;
+    elsewhere.expect(StatusCode::NOT_FOUND);
+}
+
 // --------------------------------------------------------- tokens & usage
 
 #[sqlx::test(migrations = "../df-core/migrations")]

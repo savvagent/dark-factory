@@ -60,6 +60,11 @@ cargo test -p df-core --test isolation   # tenant isolation
 cargo test -p df-core --test queue       # queue behaviour
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
+
+cd web && npm install
+npm run check                 # svelte-check, strict — the console's `cargo test`
+npm run lint                  # prettier --check — the console's `cargo fmt --check`
+npm run build                 # static bundle into web/build
 ```
 
 Integration tests are `#[sqlx::test]` against a real Postgres — one fresh throwaway
@@ -81,6 +86,9 @@ compile-time layering discipline, not separate services.
 | `df-trackers` | GitHub App + JIRA clients, webhook ingest, two-way sync. |
 | `df-web` | Console REST API, session cookies, the AS's HTML endpoints. |
 | `df-server` | Config, migrations, router assembly, graceful shutdown. |
+
+`web/` is the console UI — SvelteKit 2 / Svelte 5 runes / Tailwind v4, TypeScript strict —
+built to static files that `df-server` serves beside `/api`. See `web/README.md`.
 
 **Every SQL statement lives in `df-core`.** A query in `df-mcp` or `df-web` is a bug — it
 bypasses the `Tx` pinning that guard 2 depends on.
@@ -130,6 +138,52 @@ why it lives here and not in `df-mcp`. Four conventions:
 Mail delivery is the `Mailer` trait. `LogMailer` is the development implementation and is
 loud on purpose — a quiet no-op mailer looks identical to a working one until someone asks
 why nobody has joined.
+
+The console API is read-only over the queue, and a unit test
+(`the_queue_is_read_only_over_the_console`) fails if a write ever appears under `/jobs`.
+Every job write belongs to `df-mcp`: the agent doing the work is the only party that can
+say when it is done, and a "mark complete" button would let a human put something into the
+audit trail that they did not observe.
+
+## `web/` — the console UI
+
+Four things hold, and the first explains the other three.
+
+- **It is a single-page app for a security reason, not a performance one.** The session is
+  an `HttpOnly`, `__Host-`-prefixed cookie, which browsers refuse to store unless it is
+  `Secure`, has `Path=/`, and carries no `Domain` — so it is bound to one origin. A
+  SvelteKit *server* rendering these pages would have to hold that credential to fetch on
+  the user's behalf: a second process with the keys to every console session, for pages
+  behind a login that cannot be cached anyway. `adapter-static` with an `index.html`
+  fallback keeps the cookie in the browser and makes CORS a non-question. The same fact is
+  why `vite.config.ts` *proxies* `/api`, `/oauth`, and `/.well-known` in development — a
+  cross-port `fetch` would not carry the cookie, and no CORS header could rescue it.
+
+- **The server's rules are mirrored, never re-implemented.** A `404` on an org renders as
+  "no such organization" and never "you don't have access", because the API answers `404`
+  for both cases on purpose. `OrgContext.isAdmin` hides buttons; `OrgCtx` is what refuses
+  them. Emailed links open *pages* that `POST` — `/verify`, `/recover`, `/invite/{org}` —
+  so a mail scanner following the URL burns nothing.
+
+- **Nothing about the deployment is baked into the bundle.** The MCP endpoint and the
+  grantable scopes are read from `/.well-known/oauth-protected-resource` at runtime. A
+  hard-coded MCP URL is how a staging build ends up printing a connect command pointing at
+  production.
+
+- **Every coding agent gets the same shape.** `src/lib/clients.ts` is one table with one
+  entry per client and two forms each (OAuth, access token). A bespoke wizard for one agent
+  and a footnote for the rest is the first place constraint 3 would quietly break.
+
+Runes throughout — `$state` / `$derived` / `$props` / `$effect`, no Svelte 4 stores, no
+`export let`. Shared state lives in `.svelte.ts` modules (`session.svelte.ts`) or in
+context (`org.svelte.ts`); the org is read from the route on every access rather than
+copied into state, because a copy and the URL disagree for one frame after a navigation
+and that frame is where one org's data renders under another's heading.
+
+Org pages live under `/o/[org]`, not `/[org]`, so no org slug can collide with a page name.
+The paths the *server* names — `/login`, `/verify`, `/recover`, `/invite/{org}`,
+`/settings/billing` — are fixed by what goes in email and in `df-billing`'s upgrade prompt,
+and cannot be renamed here alone.
 
 ## A trap in tests: the change listener holds a connection
 

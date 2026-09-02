@@ -37,18 +37,20 @@ Build order: [`docs/plans/2026-09-01-milestone-1.md`](docs/plans/2026-09-01-mile
 
 ## Status
 
-Milestone 1, task 4 of 13. `df-core` — the domain and every SQL statement — is complete and
-tested. The remaining crates are scaffolded stubs.
+Milestone 1, tasks 2–11 of 13 complete. Every surface a customer touches exists and is
+tested; what is missing is a process — `df-server`'s `main.rs` is still four lines, so
+nothing binds a port yet.
 
 | Crate | State |
 |---|---|
-| `df-core` | ✅ orgs, repos, jobs, leases, messages, change-watch. 35 tests. |
-| `df-auth` | ⬜ OAuth 2.1 AS, TOTP, OIDC federation, PATs |
-| `df-mcp` | ⬜ Streamable HTTP MCP + tool surface |
-| `df-billing` | ⬜ usage metering, tier buckets |
-| `df-trackers` | ⬜ GitHub App + JIRA two-way sync |
-| `df-web` | ⬜ console API |
-| `web/` | ⬜ SvelteKit 2 / Svelte 5 console |
+| `df-core` | ✅ orgs, repos, jobs, leases, messages, change-watch |
+| `df-auth` | ✅ OAuth 2.1 AS, TOTP + recovery, PATs |
+| `df-mcp` | ✅ Streamable HTTP MCP, 27 tools, resource-server middleware |
+| `df-billing` | ✅ usage metering, free/billable split, tier buckets |
+| `df-trackers` | ⬜ GitHub App + JIRA two-way sync (milestone 2) |
+| `df-web` | ✅ console API, session cookies, the AS's browser endpoints |
+| `df-server` | ⬜ config, migrations at startup, router assembly (task 13) |
+| `web/` | ✅ SvelteKit 2 / Svelte 5 console |
 
 ## Tenant isolation
 
@@ -86,6 +88,21 @@ or with dark-agent's container on 15432.
 cargo test -p df-core --test isolation   # tenant isolation only
 cargo test -p df-core --test queue       # queue behaviour only
 ```
+
+The console has its own gate, which is the same two checks in the other language:
+
+```bash
+cd web
+npm install
+npm run check     # svelte-check, strict
+npm run lint      # prettier --check
+npm run build     # static bundle into web/build
+```
+
+`npm run dev` proxies `/api`, `/oauth`, and `/.well-known` to `DF_API_ORIGIN` (default
+`http://127.0.0.1:8080`) so every request stays on one origin — the session cookie carries
+the `__Host-` prefix and cannot cross ports. Until task 13 binds that port there is nothing
+behind the proxy. See [`web/README.md`](web/README.md).
 
 ## Repository layout
 

@@ -363,15 +363,26 @@ impl Tx<'_> {
     ///
     /// Order: explicit slug → normalized remote match. There is deliberately no
     /// "org default" fallback — an unresolvable repo raises
-    /// [`Error::RepoUnresolved`] listing the registered slugs. Queueing work
-    /// against a repo the agent did not mean is a silent, expensive failure;
-    /// an error the agent can read and act on is a cheap one.
+    /// [`Error::RepoUnresolved`] listing the registered slugs, whichever way it
+    /// was named. Queueing work against a repo the agent did not mean is a
+    /// silent, expensive failure; an error the agent can read and act on is a
+    /// cheap one.
     pub async fn resolve_repo(&mut self, r: &RepoRef) -> Result<Repo> {
         if let Some(slug) = r.slug.as_deref().filter(|s| !s.trim().is_empty()) {
-            return self
-                .get_repo_by_slug(slug)
-                .await?
-                .ok_or_else(|| Error::RepoNotFound(slug.to_string()));
+            if let Some(repo) = self.get_repo_by_slug(slug).await? {
+                return Ok(repo);
+            }
+            // An explicit slug that misses stops here — it does **not** fall
+            // through to the remote. A caller that named a repo and also
+            // supplied its working directory's remote would otherwise get the
+            // checkout it happens to be in whenever it typos the name, which is
+            // the silent guess this function exists to refuse.
+            //
+            // The error still lists what is registered. A typo'd slug is the
+            // commonest way to reach it and the one the caller can actually fix
+            // from the answer, so answering "repo not found: apo" and stopping
+            // there makes them go and look the name up somewhere else.
+            return Err(self.unresolved(slug).await?);
         }
 
         if let Some(remote) = r.remote.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -396,6 +407,22 @@ impl Tx<'_> {
             }
         }
 
+        let attempted = r
+            .slug
+            .clone()
+            .or_else(|| r.remote.clone())
+            .unwrap_or_else(|| "(nothing supplied)".into());
+
+        Err(self.unresolved(&attempted).await?)
+    }
+
+    /// The "could not resolve" error, with the registered slugs in it.
+    ///
+    /// Returns `Result<Error>` rather than `Error` because listing the repos is
+    /// itself a query: a database failure while composing an error message is a
+    /// database failure, and reporting it as "no such repo" would send someone
+    /// looking for a typo that is not there.
+    async fn unresolved(&mut self, attempted: &str) -> Result<Error> {
         let known = self
             .list_repos(false)
             .await?
@@ -403,12 +430,8 @@ impl Tx<'_> {
             .map(|r| r.slug)
             .collect::<Vec<_>>();
 
-        Err(Error::RepoUnresolved {
-            attempted: r
-                .slug
-                .clone()
-                .or_else(|| r.remote.clone())
-                .unwrap_or_else(|| "(nothing supplied)".into()),
+        Ok(Error::RepoUnresolved {
+            attempted: attempted.to_string(),
             known: if known.is_empty() {
                 "none registered yet".into()
             } else {
