@@ -46,6 +46,12 @@ use crate::mail;
 use crate::session::{self, CurrentUser};
 use crate::state::{client_ip, AppState};
 
+/// Floor `request_link`'s total handling time is padded up to. See that
+/// handler's comment: this absorbs the latency difference between minting
+/// and mailing a link (known address) and doing neither (unknown address)
+/// for any mail provider fast enough to fit inside it.
+const LINK_RESPONSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(150);
+
 // --------------------------------------------------------------- payloads
 
 #[derive(Debug, Deserialize)]
@@ -186,10 +192,22 @@ pub async fn request_link(
 
     throttle_by_source(&state, &parts).await?;
 
-    // Unknown addresses get the same answer and the same latency shape: the
-    // link is simply not minted. Note the order — the throttle inside
-    // `magic::issue` still runs for known addresses, so this cannot be used to
-    // distinguish them by timing a lockout either.
+    // Unknown addresses must get the same answer *and the same latency
+    // shape* as known ones, or a timing measurement answers the question the
+    // identical response body is written to refuse. Minting a link and
+    // mailing it (a real provider, not `LogMailer`, has its own network
+    // latency) only happens for a known address; padding this handler's
+    // total time up to a fixed floor absorbs that difference for any
+    // provider fast enough to fit inside it. It is not a complete fix for a
+    // provider slow enough to exceed the floor on its own — a background
+    // delivery queue would be — but it closes the gap for the common case
+    // without deferring the "was the mailer even called" observation tests
+    // rely on into a race against a spawned task.
+    let started = std::time::Instant::now();
+
+    // Note the order — the throttle inside `magic::issue` still runs for
+    // known addresses, so this cannot be used to distinguish them by timing
+    // a lockout either.
     if state
         .db
         .get_user_by_email(&email)
@@ -198,6 +216,10 @@ pub async fn request_link(
         .is_some()
     {
         send_link(&state, &email, purpose).await?;
+    }
+
+    if let Some(remaining) = LINK_RESPONSE_FLOOR.checked_sub(started.elapsed()) {
+        tokio::time::sleep(remaining).await;
     }
 
     Ok((http::StatusCode::ACCEPTED, Json(Accepted::new())).into_response())

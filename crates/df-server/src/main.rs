@@ -78,6 +78,17 @@ async fn main() -> anyhow::Result<()> {
     let resource_uri = require_env("DF_RESOURCE_URI")?;
     let encryption_key = require_env("DF_ENCRYPTION_KEY")?;
     let enforce_quotas = env_flag("DF_ENFORCE_QUOTAS");
+    // Off unless a trusted proxy that overwrites `X-Forwarded-For` sits in
+    // front — see `df_web::state::Config::trust_forwarded_for`'s doc comment
+    // for what goes wrong otherwise. Fly's edge (`fly-proxy`) is such a proxy:
+    // every request reaching this process has already passed through it, so
+    // `fly.toml` sets `DF_TRUST_FORWARDED_FOR=1`. Without this wired up, every
+    // request behind Fly carries the same `ConnectInfo` address, and the
+    // per-source throttles in df-auth (signup, magic links, client
+    // registration) key every caller in the world into one bucket — the sixth
+    // request from *anyone* in a 15-minute window locks the endpoint out for
+    // everyone.
+    let trust_forwarded_for = env_flag("DF_TRUST_FORWARDED_FOR");
     let upgrade_url = env_or(
         "DF_UPGRADE_URL",
         format!("{}/settings/billing", public_url.trim_end_matches('/')),
@@ -89,9 +100,33 @@ async fn main() -> anyhow::Result<()> {
     // machines starting concurrently on a fresh database wait rather than
     // racing each other through the same DDL.
     tracing::info!("running migrations");
-    db.migrate().await?;
+    db.migrate().await.map_err(|e| {
+        let msg = e.to_string();
+        // `0007_rls.sql` runs `CREATE ROLE df_app` and `GRANT df_app TO
+        // CURRENT_USER` — both cluster-level operations. A managed-Postgres
+        // role scoped to its own schema (Fly's `schema_admin`, for example)
+        // lacks `CREATEROLE` and fails here with a bare permission error that
+        // gives no hint what to do about it. Recognize that shape and point
+        // at the fix instead of forwarding the raw Postgres message.
+        if msg.contains("permission denied") || msg.contains("must be superuser") {
+            anyhow::anyhow!(
+                "migrations failed: {msg}\n\n\
+                 This looks like the connecting role cannot create roles \
+                 (Fly's schema-scoped Postgres role, for example). Ask the \
+                 managed-Postgres administrator to run, once, as a role with \
+                 CREATEROLE:\n  \
+                 CREATE ROLE df_app NOLOGIN;\n  \
+                 GRANT df_app TO \"<the role in DATABASE_URL>\";\n\
+                 then restart this process — migrations are safe to re-run \
+                 and will pick up from here. See docs/deploy/fly.md."
+            )
+        } else {
+            anyhow::anyhow!("migrations failed: {msg}")
+        }
+    })?;
 
     let watcher = Watcher::spawn(db.pool().clone()).await?;
+    spawn_sweeper(db.clone());
 
     let mut mcp_config = df_mcp::Config::new(resource_uri.clone(), public_url.clone());
     mcp_config.enforce_quotas = enforce_quotas;
@@ -103,12 +138,30 @@ async fn main() -> anyhow::Result<()> {
 
     let cipher = df_auth::crypto::Cipher::from_base64_key(&encryption_key)?;
     // No SMTP integration exists yet (milestone 1 scope). `LogMailer` writes
-    // every email to the log instead of silently dropping it — a loud no-op
-    // beats a quiet one, which looks identical to a working mailer until
-    // someone asks why nobody has joined. Wiring a real transport is tracked
-    // separately from this task.
+    // every email to the log instead of silently delivering nothing — a loud
+    // no-op beats a quiet one, which looks identical to a working mailer
+    // until someone asks why nobody has joined. But "loud" only helps if an
+    // operator chose it: starting with it silently would mean verification,
+    // recovery, and invitation links are never delivered on a real
+    // deployment, with nobody told until a user reports they never arrived.
+    // Require an explicit opt-in until a real transport exists.
+    if !env_flag("DF_ALLOW_LOG_MAILER") {
+        anyhow::bail!(
+            "no production mailer is configured (milestone 1 has not wired one \
+             up yet) and DF_ALLOW_LOG_MAILER is not set. Starting anyway would \
+             silently fail to deliver verification, recovery, and invitation \
+             emails. Set DF_ALLOW_LOG_MAILER=1 to run with `LogMailer`, which \
+             writes those emails to this process's logs instead of sending \
+             them — understand that this is not a substitute for real \
+             delivery before doing so. See docs/deploy/fly.md."
+        );
+    }
     let mailer: Arc<dyn df_web::Mailer> = Arc::new(df_web::LogMailer);
-    let web_config = df_web::Config::new(public_url.clone(), resource_uri.clone());
+    let web_config = df_web::Config {
+        trust_forwarded_for,
+        enforce_quotas,
+        ..df_web::Config::new(public_url.clone(), resource_uri.clone())
+    };
     let web_state = df_web::AppState::new(db.clone(), cipher, mailer, web_config);
     let web_router = df_web::router(web_state);
 
@@ -142,6 +195,54 @@ async fn main() -> anyhow::Result<()> {
     watcher.shutdown().await;
 
     Ok(())
+}
+
+/// Every append-only auth table that needs periodic cleanup, run forever in
+/// the background.
+///
+/// `magic::sweep`, `sessions::sweep`, `tokens::sweep`,
+/// `totp::sweep_used_steps`, `oauth::sweep_codes`, and `ratelimit::sweep` all
+/// existed with nothing calling them until this bound a port — this is the
+/// long-running process their doc comments assumed. `ratelimit::sweep` is the
+/// acute one: `auth_attempts` gets a row on every login, signup, and magic
+/// link attempt, and `recent_failures` runs a `COUNT(*)` over it on the same
+/// hot path, so an unswept table makes every throttle check slower forever.
+///
+/// Not included: `Tx::sweep_invites` is org-scoped and there is no
+/// all-orgs listing to drive it from here yet, so stale invitations still
+/// need a manual sweep until one exists — a smaller, separate gap than the
+/// six global tables this loop does cover.
+fn spawn_sweeper(db: Db) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(INTERVAL);
+        // The first tick fires immediately; skip it so a fresh deployment
+        // does not spend its first moments sweeping empty tables instead of
+        // serving traffic.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            sweep_once(&db).await;
+        }
+    });
+}
+
+async fn sweep_once(db: &Db) {
+    async fn log<E: std::fmt::Display>(table: &str, result: Result<u64, E>) {
+        match result {
+            Ok(0) => {}
+            Ok(deleted) => tracing::info!(table, deleted, "swept"),
+            Err(error) => tracing::warn!(table, %error, "sweep failed"),
+        }
+    }
+
+    log("magic_links", df_auth::magic::sweep(db).await).await;
+    log("sessions", df_auth::sessions::sweep(db).await).await;
+    log("tokens", df_auth::tokens::sweep(db).await).await;
+    log("totp_used_steps", df_auth::totp::sweep_used_steps(db).await).await;
+    log("authorization_codes", df_auth::oauth::sweep_codes(db).await).await;
+    log("auth_attempts", df_auth::ratelimit::sweep(db).await).await;
 }
 
 async fn shutdown_signal() {

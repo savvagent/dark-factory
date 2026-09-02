@@ -66,10 +66,20 @@ impl From<MailError> for ApiError {
 
 /// Development delivery: write the message to the log.
 ///
-/// **Loud on purpose.** Every send emits a `warn` naming the recipient and the
-/// link, because the failure mode this guards against is a staging deployment
-/// that silently discards every invitation for a week. A quiet no-op mailer
-/// looks identical to a working one until somebody asks why nobody has joined.
+/// **Loud on purpose.** Every send emits a `warn` naming the recipient and
+/// subject, because the failure mode this guards against is a staging
+/// deployment that silently discards every invitation for a week. A quiet
+/// no-op mailer looks identical to a working one until somebody asks why
+/// nobody has joined.
+///
+/// **The body is `debug`, never `warn`.** It carries a plaintext, single-use
+/// credential — a verification link, a recovery link, an invitation token —
+/// and `warn` is inside every deployment's default log level. A body at
+/// `warn` lands in a hosting provider's retained log stream, where anyone
+/// with log access can spend it (a recovery link, for instance, destroys the
+/// account's TOTP credential and opens a session). Enable `df_web=debug` to
+/// see it, which is exactly what local development already wants and a
+/// production `RUST_LOG` should not carry.
 pub struct LogMailer;
 
 #[async_trait::async_trait]
@@ -78,9 +88,9 @@ impl Mailer for LogMailer {
         tracing::warn!(
             to = %mail.to,
             subject = %mail.subject,
-            "MAIL NOT SENT — no mail provider is configured. Message body follows:\n{}",
-            mail.text
+            "MAIL NOT SENT — no mail provider is configured; enable df_web=debug logging to read the message body"
         );
+        tracing::debug!(to = %mail.to, subject = %mail.subject, body = %mail.text, "mail body");
         Ok(())
     }
 

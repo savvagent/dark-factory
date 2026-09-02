@@ -59,13 +59,20 @@ pub const COOKIE_NAME: &str = "__Host-df_session";
 
 /// Build the `Set-Cookie` value for a freshly opened session.
 ///
-/// `Max-Age` matches the session's idle window rather than its absolute cap, so
-/// a browser stops sending a cookie the server would refuse anyway. The server
-/// remains the authority — [`sessions::resolve`] re-checks both clocks — but a
-/// cookie the browser has already dropped is one fewer credential sitting in a
-/// profile directory.
+/// `Max-Age` matches the session's **absolute** cap, not its idle window.
+/// [`sessions::resolve`] slides the idle deadline forward on every use, up to
+/// that same absolute cap — an actively-used session is meant to survive far
+/// longer than one idle day's worth of `Max-Age` would let the browser keep
+/// the cookie for. Setting `Max-Age` to the idle window instead (a prior
+/// version of this function did) meant the browser silently discarded an
+/// actively-used session's cookie after `IDLE_TTL_DAYS`, logging out a user
+/// the server had just extended. The server remains the authority either way
+/// — [`sessions::resolve`] re-checks both clocks on every request — but the
+/// cookie now outlives the browser's own copy of it for as long as the
+/// session could possibly still be valid, rather than for a fixed slice of
+/// that window regardless of use.
 pub fn set_cookie(token: &str) -> HeaderValue {
-    let max_age = sessions::IDLE_TTL_DAYS * 24 * 3600;
+    let max_age = sessions::ABSOLUTE_TTL_DAYS * 24 * 3600;
     HeaderValue::from_str(&format!(
         "{COOKIE_NAME}={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age}"
     ))

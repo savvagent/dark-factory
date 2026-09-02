@@ -37,6 +37,17 @@ pub struct Config {
     /// per-IP throttle — a rate limiter keyed on a spoofable value is worse than
     /// no rate limiter, because it looks like one.
     pub trust_forwarded_for: bool,
+
+    /// Whether hard-stop plans are currently being enforced against.
+    ///
+    /// Must match the flag `df-mcp` was built with (`DF_ENFORCE_QUOTAS`) — this
+    /// never gates anything here (the console's `Meter` never calls `charge`,
+    /// see `routes::usage`'s module doc), but `/api/orgs/{org}/usage` reports
+    /// this value as `enforced`, and a console reporting `false` while MCP
+    /// calls are actually being refused is a caller reading its own dashboard
+    /// and drawing the wrong conclusion about why its agent just got a
+    /// `quota_exceeded` error.
+    pub enforce_quotas: bool,
 }
 
 impl Config {
@@ -46,6 +57,7 @@ impl Config {
             resource_uri: resource_uri.into(),
             totp_issuer: "dark-factory".into(),
             trust_forwarded_for: false,
+            enforce_quotas: false,
         }
     }
 
@@ -72,8 +84,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: Db, cipher: Cipher, mailer: Arc<dyn Mailer>, config: Config) -> Self {
-        let meter =
-            df_billing::Meter::new(false, format!("{}/settings/billing", config.public_url));
+        let meter = df_billing::Meter::new(
+            config.enforce_quotas,
+            format!("{}/settings/billing", config.public_url),
+        );
         Self {
             db,
             cipher: Arc::new(cipher),

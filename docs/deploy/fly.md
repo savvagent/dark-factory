@@ -28,6 +28,31 @@ serverless model would fight. See `CLAUDE.md` for why the process must stay warm
   `DATABASE_URL`, `DF_ENCRYPTION_KEY`, `DF_SIGNING_KEY` (both generated with
   `openssl rand -base64 32`, per `.env.example`).
 
+## Before the first deploy: pre-provision the `df_app` role
+
+`0007_rls.sql` — the last migration, run by every `df-server` startup —
+issues `CREATE ROLE df_app NOLOGIN` and `GRANT df_app TO CURRENT_USER`. Both
+are cluster-level operations that need `CREATEROLE`, and the `dark-factory`
+role attached above is a `schema_admin`: it owns its own schema and nothing
+else, specifically so it *cannot* touch the cluster or other apps' databases.
+That means it cannot create `df_app` either, and the very first startup would
+fail before binding a port.
+
+This has to be provisioned once, out-of-band, by whoever administers the
+`savvagent-pg` cluster (a role with `CREATEROLE`, connected to the
+`dark_factory` database):
+
+```sql
+CREATE ROLE df_app NOLOGIN;
+GRANT df_app TO "dark-factory";
+```
+
+`df-server` recognizes a permission-denied failure at this step and fails
+startup with this same remediation rather than a bare Postgres error;
+migrations are safe to re-run once the grant exists. This is a one-time step
+per cluster — a role, once created, is not migration state and is not undone
+by anything in this repo.
+
 ## What's scaffolded
 
 - `Dockerfile` — multi-stage build of the `df-server` binary, copies
@@ -55,6 +80,37 @@ serverless model would fight. See `CLAUDE.md` for why the process must stay warm
 5. Graceful shutdown on `SIGTERM`/Ctrl+C: stops accepting new connections,
    waits for in-flight requests, then calls `Watcher::shutdown()` to release
    its detached `LISTEN` connection before the process exits.
+6. A background sweep loop for the auth tables that would otherwise grow
+   without bound (`auth_attempts` is the hot-path one — see
+   `df_server::spawn_sweeper`'s doc comment).
+
+## What a deploy today would and would not be able to do
+
+`/readyz` will pass and the API will work end to end for an MCP client — sign
+up via the API, register a client, complete the OAuth code flow, call tools —
+but **no browser page exists yet to reach any of it through**. `df-server`
+mounts only `/mcp`, the console's JSON API, `/oauth/*`, and the health routes;
+nothing serves HTML or static assets, because `web/` (task 11, the SvelteKit
+console) is still an empty directory. Concretely:
+
+- `authorize_page`'s redirect for a signed-out visitor goes to
+  `/login?next=…`, which 404s.
+- Every verification, recovery, and invitation email links to `/verify`,
+  `/recover`, or `/invite/{org}`, which all 404.
+- There is nothing for a human to click "sign up" on at all.
+- Every email — verification, recovery, invitation — is only logged
+  (recipient + subject; see `crates/df-web/src/mail.rs`), not delivered, since
+  no real mail-provider integration exists yet. A human still cannot get
+  through onboarding even by API, because the link they need to click is
+  never sent anywhere real. `df-server` requires `DF_ALLOW_LOG_MAILER=1` to
+  start at all with this in place, precisely to keep the gap from being
+  silent.
+
+None of that blocks getting the server itself live and reachable — which is
+what makes it worth doing before task 11 rather than after — but it does mean
+a deploy today is only usable by something that speaks the API directly (a
+coding agent completing OAuth, or a script hitting the console's REST
+endpoints), not by a person in a browser, until task 11 lands.
 
 Confirming `DF_PUBLIC_URL` / `DF_RESOURCE_URI` in `fly.toml` against the final
 hostname (Fly default `https://dark-factory-mcp.fly.dev` or a custom domain) and

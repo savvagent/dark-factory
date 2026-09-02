@@ -466,6 +466,34 @@ async fn only_an_owner_may_create_another_owner(pool: PgPool) {
     demote_the_owner.expect(StatusCode::FORBIDDEN);
 }
 
+/// Deletion is strictly stronger than demotion: an admin blocked from
+/// demoting an owner (above) must not reach the same outcome by removing
+/// them outright. A second owner keeps the last-owner guard from being the
+/// thing that blocks the request, isolating the privilege check.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn an_admin_cannot_remove_an_owner(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    let carol = onboard(&h, "carol@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    add_member(&h, org, bob.user, Role::Owner).await;
+    add_member(&h, org, carol.user, Role::Admin).await;
+
+    let remove_owner = Call::delete(format!("/api/orgs/acme/members/{}", bob.user))
+        .with_session(&carol.session)
+        .send(&h.router)
+        .await;
+    remove_owner.expect(StatusCode::FORBIDDEN);
+
+    // An owner may still remove another owner.
+    Call::delete(format!("/api/orgs/acme/members/{}", bob.user))
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await
+        .expect(StatusCode::NO_CONTENT);
+}
+
 /// Removing someone has to disconnect their agents too. A token that outlives
 /// the membership it was granted under is the interesting failure here — the
 /// console would show them gone while their agent kept working the queue.

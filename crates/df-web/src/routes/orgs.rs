@@ -94,11 +94,7 @@ pub async fn create_org(
 
     let org = state
         .db
-        .create_org(req.slug.trim(), req.name.trim())
-        .await?;
-    state
-        .db
-        .add_member(org.id, caller.user.id, Role::Owner)
+        .create_org_with_owner(req.slug.trim(), req.name.trim(), caller.user.id)
         .await?;
 
     let _ = state
@@ -158,11 +154,15 @@ pub async fn set_member_role(
         ctx.require_owner()?;
     }
 
+    // The guard and the write share one transaction: see
+    // `Tx::count_owners_for_update`'s doc comment for why a separate
+    // read-then-write across two connections is not enough.
+    let mut tx = state.db.begin(ctx.org.id).await?;
     if current == Role::Owner && req.role != Role::Owner {
-        guard_last_owner(&state, &ctx, target).await?;
+        guard_last_owner_locked(&mut tx, &ctx).await?;
     }
-
-    state.db.add_member(ctx.org.id, target, req.role).await?;
+    tx.add_member(target, req.role).await?;
+    tx.commit().await?;
 
     let _ = state
         .db
@@ -211,12 +211,30 @@ pub async fn remove_member(
         .await?
         .ok_or_else(|| ApiError::not_found("that user is not a member of this org"))?;
 
-    if current == Role::Owner {
-        guard_last_owner(&state, &ctx, target).await?;
+    // Deletion is strictly stronger than demotion: an admin who cannot demote
+    // an owner (`set_member_role` requires `require_owner()` for that) must
+    // not be able to reach the same outcome by removing them outright. Not
+    // gated on self-removal — an owner may always leave on their own account,
+    // subject to the last-owner guard below.
+    if current == Role::Owner && target != ctx.user.id {
+        ctx.require_owner()?;
     }
 
+    // The guard, the team cleanup, the membership removal, the token
+    // revocation, and the audit entry all share one transaction. Revoking
+    // tokens on a second connection (as a prior version of this handler did)
+    // left a window where a failure after the membership row was already
+    // gone left the removed member's bearer token still live — introspection
+    // does not re-check membership, so it would keep working until it
+    // expired on its own. Sharing this transaction with the last-owner guard
+    // also closes the TOCTOU race two concurrent removals could otherwise hit.
     let mut tx = state.db.begin(ctx.org.id).await?;
+    if current == Role::Owner {
+        guard_last_owner_locked(&mut tx, &ctx).await?;
+    }
     tx.remove_from_all_teams(target).await?;
+    tx.remove_member(target).await?;
+    let revoked = df_auth::tokens::revoke_all_in_org_tx(tx.conn(), target, ctx.org.id).await?;
     tx.audit(
         Entry::new(action::MEMBER_REMOVED)
             .actor(ctx.user.id)
@@ -226,9 +244,6 @@ pub async fn remove_member(
     .await?;
     tx.commit().await?;
 
-    state.db.remove_member(ctx.org.id, target).await?;
-
-    let revoked = df_auth::tokens::revoke_all_in_org(&state.db, target, ctx.org.id).await?;
     tracing::info!(
         org = %ctx.org.slug,
         %target,
@@ -240,8 +255,12 @@ pub async fn remove_member(
 }
 
 /// Refuse to leave an org ownerless.
-async fn guard_last_owner(state: &AppState, ctx: &OrgCtx, _target: UserId) -> ApiResult<()> {
-    if state.db.count_owners(ctx.org.id).await? <= 1 {
+///
+/// Locks the owner rows for the rest of `tx` (see
+/// `Tx::count_owners_for_update`), so the caller's own write further down the
+/// same transaction is guaranteed consistent with what this just counted.
+async fn guard_last_owner_locked(tx: &mut df_core::Tx<'_>, ctx: &OrgCtx) -> ApiResult<()> {
+    if tx.count_owners_for_update().await? <= 1 {
         return Err(ApiError::conflict(
             "last_owner",
             format!(
@@ -261,12 +280,20 @@ async fn guard_last_owner(state: &AppState, ctx: &OrgCtx, _target: UserId) -> Ap
 /// *not* the same action as removing them: this ends browser sessions and
 /// leaves membership alone, so they can sign back in on a device that is still
 /// theirs.
+///
+/// Sessions are deliberately not org-scoped (see `df_auth::sessions`'s module
+/// doc — one login reaches every org a person belongs to, so they are not
+/// asked to sign in twice), which means this org-scoped action's effect is
+/// not: an admin here also ends that member's sessions for orgs unrelated to
+/// this one. Org-scoped sessions would be the complete fix and do not exist
+/// yet, so in the meantime this is restricted to owners rather than any
+/// admin, narrowing who can trigger a cross-org effect from inside one org.
 pub async fn force_logout(
     State(state): State<AppState>,
     ctx: OrgCtx,
     Path((_org, user)): Path<(String, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ctx.require_admin()?;
+    ctx.require_owner()?;
     let target = UserId::from(user);
 
     state

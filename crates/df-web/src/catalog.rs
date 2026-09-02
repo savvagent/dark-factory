@@ -89,6 +89,11 @@ pub struct Endpoint {
     pub request: Option<&'static str>,
     /// Component schema name for the response body, if any.
     pub response: Option<&'static str>,
+    /// The success status this endpoint actually answers with. Defaults to
+    /// `200`; call [`Endpoint::status`] for anything else. Getting this wrong
+    /// is not cosmetic — a generated client that expects `200` treats a real
+    /// `201`/`204`/`303` success as an error.
+    pub success: u16,
     pub route: MethodRouter<AppState>,
 }
 
@@ -102,6 +107,7 @@ impl Endpoint {
             auth: Auth::Session,
             request: None,
             response: None,
+            success: 200,
             route,
         }
     }
@@ -171,6 +177,14 @@ impl Endpoint {
         self
     }
 
+    /// Declare a success status other than the `200` default —
+    /// `201 Created`, `204 No Content`, `303 See Other`, and so on, matching
+    /// exactly what the handler actually sends.
+    pub fn status(mut self, code: u16) -> Self {
+        self.success = code;
+        self
+    }
+
     /// `GET /api/orgs/{org}/repos` → `getApiOrgsOrgRepos`. Stable across
     /// renames of the Rust function, which is what an OpenAPI operation id has
     /// to be — client generators turn it into a method name.
@@ -178,10 +192,16 @@ impl Endpoint {
         let mut id = String::from(self.verb.as_str());
         for segment in self.path.split('/').filter(|s| !s.is_empty()) {
             let segment = segment.trim_matches(|c| c == '{' || c == '}');
-            let mut chars = segment.chars();
+            // Filtered before the first character is singled out, not after:
+            // a segment like `.well-known` would otherwise capitalize the
+            // leading `.` and leave it in place, producing an identifier that
+            // starts with a dot. `operationId` becomes a method name in most
+            // generators, and a leading `.` is not a legal identifier start
+            // anywhere that matters.
+            let mut chars = segment.chars().filter(|c| c.is_ascii_alphanumeric());
             if let Some(first) = chars.next() {
                 id.push(first.to_ascii_uppercase());
-                id.extend(chars.filter(|c| c.is_ascii_alphanumeric()));
+                id.extend(chars);
             }
         }
         id
@@ -230,6 +250,7 @@ pub fn catalog() -> Vec<Endpoint> {
         // ----------------------------------------------------------- oauth
         Endpoint::post("/oauth/register", oauth::register_client)
             .auth(Auth::Public)
+            .status(201)
             .summary("Register a client")
             .describe(
                 "RFC 7591 dynamic client registration. Open by design — MCP clients \
@@ -247,6 +268,7 @@ pub fn catalog() -> Vec<Endpoint> {
             ),
         Endpoint::post("/oauth/authorize", oauth::authorize_decision)
             .auth(Auth::Session)
+            .status(303)
             .summary("Record the consent decision")
             .describe(
                 "On approval, issues an authorization code and redirects to the \
@@ -271,6 +293,7 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::Public)
             .takes("SignupRequest")
             .returns("Accepted")
+            .status(202)
             .summary("Create an account")
             .describe(
                 "Creates the user and mails a verification link. Answers identically \
@@ -280,6 +303,7 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::Public)
             .takes("LinkRequest")
             .returns("Accepted")
+            .status(202)
             .summary("Mail a verification or recovery link")
             .describe(
                 "For someone whose verification mail never arrived, or whose \
@@ -327,6 +351,7 @@ pub fn catalog() -> Vec<Endpoint> {
             ),
         Endpoint::post("/api/auth/logout", auth::logout)
             .auth(Auth::Public)
+            .status(204)
             .summary("End this session")
             .describe("Succeeds even for a caller holding a cookie that resolves to nothing."),
         // -------------------------------------------------------------- me
@@ -353,6 +378,7 @@ pub fn catalog() -> Vec<Endpoint> {
             ),
         Endpoint::post("/api/me/totp/confirm", auth::confirm_totp)
             .takes("ConfirmTotpRequest")
+            .status(204)
             .summary("Finish enrollment")
             .describe("Proves possession. Until this succeeds the credential cannot sign in."),
         Endpoint::post("/api/me/recovery-codes", auth::reissue_recovery_codes)
@@ -366,6 +392,7 @@ pub fn catalog() -> Vec<Endpoint> {
         Endpoint::post("/api/orgs", orgs::create_org)
             .takes("CreateOrgRequest")
             .returns("Org")
+            .status(201)
             .summary("Create an org")
             .describe("The creator becomes its owner. Requires a verified email address."),
         Endpoint::get("/api/orgs/{org}", orgs::get_org)
@@ -380,6 +407,7 @@ pub fn catalog() -> Vec<Endpoint> {
         Endpoint::patch("/api/orgs/{org}/members/{user}", orgs::set_member_role)
             .auth(Auth::OrgAdmin)
             .takes("RoleRequest")
+            .status(204)
             .summary("Change someone's role")
             .describe(
                 "Only an owner may create or demote another owner, and the last owner \
@@ -387,6 +415,7 @@ pub fn catalog() -> Vec<Endpoint> {
             ),
         Endpoint::delete("/api/orgs/{org}/members/{user}", orgs::remove_member)
             .auth(Auth::OrgAdmin)
+            .status(204)
             .summary("Remove a member")
             .describe(
                 "Also clears their team memberships and revokes the tokens they held \
@@ -409,6 +438,7 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::OrgAdmin)
             .takes("InviteRequest")
             .returns("Invite")
+            .status(201)
             .summary("Invite someone by email")
             .describe(
                 "Mails a single-use link, good for 14 days. Supersedes any live \
@@ -416,6 +446,7 @@ pub fn catalog() -> Vec<Endpoint> {
             ),
         Endpoint::delete("/api/orgs/{org}/invites/{id}", orgs::revoke_invite)
             .auth(Auth::OrgAdmin)
+            .status(204)
             .summary("Withdraw an invitation"),
         Endpoint::post("/api/orgs/{org}/invites/accept", orgs::accept_invite)
             .takes("AcceptInviteRequest")
@@ -435,6 +466,7 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::OrgAdmin)
             .takes("CreateTeamRequest")
             .returns("Team")
+            .status(201)
             .summary("Create a team"),
         Endpoint::get("/api/orgs/{org}/teams/{team}", teams::get_team)
             .auth(Auth::OrgMember)
@@ -447,6 +479,7 @@ pub fn catalog() -> Vec<Endpoint> {
             .summary("Rename a team"),
         Endpoint::delete("/api/orgs/{org}/teams/{team}", teams::delete_team)
             .auth(Auth::OrgAdmin)
+            .status(204)
             .summary("Delete a team")
             .describe(
                 "Refused while repos are still scoped to it: a null team means \
@@ -464,6 +497,7 @@ pub fn catalog() -> Vec<Endpoint> {
             teams::add_team_member,
         )
         .auth(Auth::OrgAdmin)
+        .status(204)
         .summary("Put a member on a team")
         .describe("Idempotent. The user must already be a member of the org."),
         Endpoint::delete(
@@ -471,6 +505,7 @@ pub fn catalog() -> Vec<Endpoint> {
             teams::remove_team_member,
         )
         .auth(Auth::OrgAdmin)
+        .status(204)
         .summary("Take a member off a team"),
         // ----------------------------------------------------------- repos
         Endpoint::get("/api/orgs/{org}/repos", repos::list_repos)
@@ -482,6 +517,7 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::OrgAdmin)
             .takes("RegisterRepoRequest")
             .returns("Repo")
+            .status(201)
             .summary("Register a repo")
             .describe(
                 "Remotes are normalized, so the SSH and HTTPS forms of one repository \
@@ -515,6 +551,7 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::OrgMember)
             .takes("MintTokenRequest")
             .returns("MintedToken")
+            .status(201)
             .summary("Mint a personal access token")
             .describe(
                 "The compatibility path for clients whose OAuth support is partial. \
@@ -523,6 +560,7 @@ pub fn catalog() -> Vec<Endpoint> {
             ),
         Endpoint::delete("/api/orgs/{org}/tokens/{id}", tokens::revoke_token)
             .auth(Auth::OrgMember)
+            .status(204)
             .summary("Revoke one of your tokens")
             .describe("Takes effect on the agent's next call, not at some later expiry."),
         Endpoint::get("/api/orgs/{org}/usage", usage::get_usage)
