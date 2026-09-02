@@ -36,20 +36,32 @@ serverless model would fight. See `CLAUDE.md` for why the process must stay warm
   cluster), `min_machines_running = 1` / `auto_stop_machines = false` (no idle
   scale-to-zero), health check on `GET /readyz`.
 
-## What's still required before the first real deploy (Task 13 in the milestone plan)
+## What's assembled (Task 13 in the milestone plan)
 
-`df-server/src/main.rs` is currently a stub. Before `fly deploy` can succeed:
+`df-server/src/main.rs` now assembles the real server:
 
-1. Assemble the real Axum router (df-auth + df-mcp + df-billing + df-trackers + df-web)
-   bound to `DF_BIND`.
-2. Add `/healthz` (liveness) and `/readyz` (readiness — checks DB connectivity) endpoints.
-3. Run pending migrations at startup under a Postgres advisory lock (so multiple
-   machines starting concurrently don't race migrations).
-4. Structured logging via `tracing-subscriber` (already a dependency).
-5. Confirm `DF_PUBLIC_URL` / `DF_RESOURCE_URI` in `fly.toml` once the final hostname
-   (Fly default `https://dark-factory-mcp.fly.dev` or a custom domain) is decided.
+1. The Axum router merges df-mcp (`/mcp`, bearer-authenticated) and df-web
+   (console API, OAuth AS, `/.well-known/…`), bound to `DF_BIND`. df-mcp's own
+   copy of `/.well-known/oauth-protected-resource` is left out of the merge —
+   see `df_mcp::mcp_only_router` — since df-web already serves that path and
+   Axum panics on two handlers for one path.
+2. `/healthz` (liveness, no DB check) and `/readyz` (readiness — `SELECT 1`
+   against the pool) are mounted directly in `df-server`.
+3. Migrations run at startup via `Db::migrate`, which already takes a Postgres
+   advisory lock for the duration (`sqlx::migrate!`'s built-in behavior), so
+   several machines starting concurrently on a fresh database wait rather than
+   racing through the same DDL.
+4. Structured (JSON) logging via `tracing-subscriber`, filtered by `RUST_LOG`.
+5. Graceful shutdown on `SIGTERM`/Ctrl+C: stops accepting new connections,
+   waits for in-flight requests, then calls `Watcher::shutdown()` to release
+   its detached `LISTEN` connection before the process exits.
 
-Once those land, first deploy is:
+Confirming `DF_PUBLIC_URL` / `DF_RESOURCE_URI` in `fly.toml` against the final
+hostname (Fly default `https://dark-factory-mcp.fly.dev` or a custom domain) and
+running the first live `fly deploy` are still pending a deliberate go — deploying
+spends real infrastructure and secrets already staged for this app.
+
+Once that decision is made, first deploy is:
 
 ```bash
 fly deploy -a dark-factory-mcp

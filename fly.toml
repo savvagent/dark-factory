@@ -5,10 +5,10 @@
 # isolated from the `light_factory` / nels-api databases on the same cluster.
 # DATABASE_URL is already staged as a secret via `fly mpg attach`.
 #
-# TODO(task 13): this cannot deploy successfully until df-server actually
-# binds DF_BIND, serves /healthz + /readyz, and runs migrations under an
-# advisory lock at startup. Until then, treat this file as the target shape,
-# not a working deploy.
+# df-server now binds DF_BIND, serves /healthz + /readyz, and runs migrations
+# under an advisory lock at startup (see docs/deploy/fly.md), so this file
+# describes a working deploy target — the first `fly deploy` itself is still a
+# deliberate, separate step.
 
 app = "dark-factory-mcp"
 primary_region = "iad"
