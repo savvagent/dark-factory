@@ -658,6 +658,43 @@ async fn a_withdrawn_invitation_stops_working(pool: PgPool) {
         .expect(StatusCode::GONE);
 }
 
+/// An invitation whose mail never went out must not be left live. Nobody has
+/// the link, it is invisible to the admin as a problem, and the "one live
+/// invite per address" rule would make a retry supersede it anyway.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn an_invitation_whose_mail_fails_is_withdrawn(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    h.mailer.start_failing();
+
+    let attempted = Call::post("/api/orgs/acme/invites")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "email": "bob@acme.test" }))
+        .send(&h.router)
+        .await;
+
+    attempted.expect(StatusCode::BAD_GATEWAY);
+    assert_eq!(attempted.error_code(), Some("mail_undeliverable"));
+    assert!(
+        !attempted.text.contains("told this mailer to fail"),
+        "the provider's own message is for the operator, not the caller: {}",
+        attempted.text
+    );
+
+    let pending = Call::get("/api/orgs/acme/invites")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    pending.expect(StatusCode::OK);
+    assert!(
+        pending.body.as_array().unwrap().is_empty(),
+        "an invitation nobody received was left live: {}",
+        pending.text
+    );
+}
+
 /// Only an owner may hand out ownership, whether directly or by invitation —
 /// otherwise the invite endpoint is a way around the role check on members.
 #[sqlx::test(migrations = "../df-core/migrations")]

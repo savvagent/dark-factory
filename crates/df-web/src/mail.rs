@@ -91,9 +91,14 @@ impl Mailer for LogMailer {
 
 /// Collects messages in memory. Tests assert on what was sent, and read the
 /// links out of it rather than reaching into the database for a token.
+///
+/// Can also be told to start failing, which is the only way to exercise what a
+/// handler does when delivery does not work — the interesting half of the
+/// mailer contract, and the half a happy-path fake would never reach.
 #[derive(Default)]
 pub struct CapturingMailer {
     sent: std::sync::Mutex<Vec<Mail>>,
+    failing: std::sync::atomic::AtomicBool,
 }
 
 impl CapturingMailer {
@@ -116,11 +121,20 @@ impl CapturingMailer {
     pub fn clear(&self) {
         self.sent.lock().expect("mail capture poisoned").clear();
     }
+
+    /// Make every subsequent send fail, as an unreachable provider would.
+    pub fn start_failing(&self) {
+        self.failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[async_trait::async_trait]
 impl Mailer for CapturingMailer {
     async fn send(&self, mail: Mail) -> Result<(), MailError> {
+        if self.failing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(MailError("the test told this mailer to fail".into()));
+        }
         self.sent.lock().expect("mail capture poisoned").push(mail);
         Ok(())
     }

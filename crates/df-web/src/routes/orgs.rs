@@ -298,12 +298,13 @@ pub async fn list_invites(
 /// The token is generated here and stored only as a hash, like every other
 /// credential in the product; `df-core` never sees the plaintext.
 ///
-/// **The mail is sent before the transaction commits, and that is deliberate.**
-/// Committing first and then failing to send leaves a live invitation nobody
-/// has the link to, which an admin can only fix by revoking and re-inviting —
-/// while a send that succeeds against a rolled-back transaction produces a link
-/// that cleanly reports itself invalid. Given one of the two has to happen, the
-/// recoverable one is the right one to choose.
+/// **Write, commit, then send — and withdraw the invitation if the send
+/// fails.** No database transaction is held open across the call to a mail
+/// provider; the invitation is cleaned up afterwards instead. That ordering
+/// costs a brief window in which a live invitation exists that nobody has
+/// received, which is harmless — it is single-use, it expires, and a retry
+/// supersedes it — and it avoids pinning a pooled connection to whatever
+/// latency someone else's SMTP has today.
 pub async fn create_invite(
     State(state): State<AppState>,
     ctx: OrgCtx,
@@ -319,6 +320,12 @@ pub async fn create_invite(
     let token = df_auth::crypto::generate(df_auth::crypto::prefix::INVITE);
     let email = req.email.trim().to_string();
 
+    // Committed before the mail goes out, and the transaction is closed first.
+    // The tidy-looking alternative — hold it open and commit only after a
+    // successful send — would pin a pooled connection across an unbounded call
+    // to somebody else's SMTP provider, which is the same trade `watch` refuses
+    // in df-billing for the same reason: a handful of slow sends would exhaust
+    // the pool for every other request in the process.
     let mut tx = state.db.begin(ctx.org.id).await?;
     let invite = tx
         .create_invite(&email, req.role, Some(ctx.user.id), &token.hash)
@@ -330,6 +337,7 @@ pub async fn create_invite(
             .detail(serde_json::json!({ "email": email, "role": role_name(req.role) })),
     )
     .await?;
+    tx.commit().await?;
 
     let link = state.config.url(&format!(
         "/invite/{}?token={}",
@@ -342,7 +350,7 @@ pub async fn create_invite(
         .clone()
         .unwrap_or_else(|| ctx.user.email.clone());
 
-    state
+    let delivery = state
         .mailer
         .send(mail::invitation(
             &email,
@@ -351,9 +359,29 @@ pub async fn create_invite(
             role_name(req.role),
             &link,
         ))
-        .await?;
+        .await;
 
-    tx.commit().await?;
+    if let Err(e) = delivery {
+        // Withdraw what nobody received. A live invitation whose link exists
+        // only in a lost SMTP response is worse than no invitation: it is
+        // invisible to the admin as a problem, and the "one live invite per
+        // address" rule means a retry would supersede it anyway. If this
+        // cleanup also fails the invite stays *visible* in the pending list,
+        // where an admin can withdraw it — so the fallback degrades to
+        // something a person can see and act on.
+        let mut tx = state.db.begin(ctx.org.id).await?;
+        if let Err(cleanup) = tx.revoke_invite(invite.id).await {
+            tracing::error!(
+                error = %cleanup,
+                invite = %invite.id,
+                "could not withdraw an invitation whose mail failed to send"
+            );
+        } else {
+            tx.commit().await?;
+        }
+        return Err(e.into());
+    }
+
     Ok((http::StatusCode::CREATED, Json(invite)).into_response())
 }
 
