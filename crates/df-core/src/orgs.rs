@@ -176,6 +176,23 @@ impl Db {
         Ok(user)
     }
 
+    /// Record that this user has proved control of their email address.
+    ///
+    /// Idempotent, and it reports which call did the work: a user who clicks the
+    /// same verification link twice has done nothing wrong, but only the first
+    /// click is worth an audit event.
+    pub async fn mark_email_verified(&self, user: UserId) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE users SET email_verified_at = now() \
+             WHERE id = $1 AND email_verified_at IS NULL",
+        )
+        .bind(user)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
     pub async fn add_member(&self, org: OrgId, user: UserId, role: Role) -> Result<()> {
         sqlx::query(
             "INSERT INTO org_members (org_id, user_id, role) VALUES ($1,$2,$3) \

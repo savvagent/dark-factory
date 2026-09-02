@@ -2,8 +2,11 @@
 //!
 //! Two layers that must not be conflated:
 //!
-//! - **Layer 2, who the human is**: [`totp`] (passwordless TOTP with replay
-//!   refusal, throttling, and recovery), plus enterprise OIDC federation.
+//! - **Layer 2, who the human is**: [`login`] is the front door, over [`totp`]
+//!   (passwordless TOTP with replay refusal, throttling, and recovery),
+//!   [`magic`] (single-use email links for verification and account recovery),
+//!   and [`sessions`] (the console's browser cookie). Enterprise OIDC
+//!   federation joins this layer later.
 //! - **Layer 1, what a client may do**: the OAuth 2.1 authorization server and
 //!   the token model.
 //!
@@ -19,10 +22,15 @@
 
 pub mod crypto;
 pub mod error;
+pub mod login;
+pub mod magic;
 pub mod oauth;
 pub mod ratelimit;
+pub mod sessions;
 pub mod tokens;
 pub mod totp;
 
 pub use error::{AuthError, Result};
+pub use login::LoggedIn;
+pub use sessions::Session;
 pub use tokens::Principal;

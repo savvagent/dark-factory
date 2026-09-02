@@ -383,6 +383,82 @@ pub async fn sweep_used_steps(db: &Db) -> Result<u64> {
     Ok(n)
 }
 
+/// Does this user have a TOTP credential they can actually log in with?
+///
+/// An unconfirmed credential does not count — it is an abandoned enrollment,
+/// and treating it as a second factor would lock the account behind a secret
+/// nobody finished scanning.
+pub async fn has_confirmed_credential(db: &Db, user: UserId) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM totp_credentials WHERE user_id = $1 AND confirmed_at IS NOT NULL",
+    )
+    .bind(user)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(n > 0)
+}
+
+/// Remove this user's second factor entirely, so they can enrol a new one.
+///
+/// Called after a recovery magic link is redeemed — the premise of that flow is
+/// that the authenticator is gone, so leaving the old secret in place would
+/// leave the account permanently unreachable by its own login path.
+///
+/// The unused recovery codes go too. They were printed alongside the secret
+/// being discarded, they may well be in the same lost wallet, and enrollment
+/// issues a fresh set anyway.
+pub async fn reset(db: &Db, user: UserId, ip: Option<&str>) -> Result<()> {
+    let mut tx = db.begin_unpinned().await?;
+
+    sqlx::query("DELETE FROM totp_credentials WHERE user_id = $1")
+        .bind(user)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM recovery_codes WHERE user_id = $1 AND used_at IS NULL")
+        .bind(user)
+        .execute(&mut *tx)
+        .await?;
+    // Consumed steps belong to a secret that no longer exists. Keeping them
+    // would refuse a step number the *new* secret is entitled to reuse.
+    sqlx::query("DELETE FROM totp_used_steps WHERE user_id = $1")
+        .bind(user)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    let _ = db
+        .audit_global(
+            Entry::new(action::TOTP_RESET)
+                .actor(user)
+                .from_request(ip, None),
+        )
+        .await;
+
+    Ok(())
+}
+
+/// Do a verification's arithmetic for an address that has no account.
+///
+/// Called from [`crate::login`] on the unknown-user path. It does not make the
+/// two paths take equal time — a real verification also reads a row and writes
+/// one — but the modular exponentiation-free HMAC over three candidate steps is
+/// the largest single term that would otherwise be missing, and skipping it
+/// makes "no such user" trivially distinguishable with a stopwatch. The
+/// throttle is what actually makes the residual difference unusable; this
+/// narrows it rather than pretending to close it.
+pub(crate) fn decoy_check(code: &str) {
+    // A fixed secret is fine: the result is discarded and only the work matters.
+    const DECOY: [u8; 20] = [0x5f; 20];
+    let _ = std::hint::black_box(match_code(
+        &DECOY,
+        "decoy@invalid",
+        "dark-factory",
+        code,
+        Utc::now().timestamp(),
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

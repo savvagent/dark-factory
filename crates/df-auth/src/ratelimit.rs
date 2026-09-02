@@ -78,6 +78,21 @@ pub async fn record(db: &Db, bucket: &str, successful: bool) -> Result<()> {
     Ok(())
 }
 
+/// Charge one unit against a bucket that limits a *rate* rather than a failure
+/// count — issuing an email link, say, where every attempt succeeds and the
+/// thing being defended is the mailbox on the other end.
+///
+/// Implemented as a recorded failure because that is what
+/// [`recent_failures`] counts, and the two policies want the same arithmetic.
+/// The distinction is only in what the call site means: [`record`] reports an
+/// outcome, this consumes an allowance. There is deliberately no success to
+/// reset the count — an unthrottled "email me a link" endpoint is a mail bomb
+/// aimed at whatever address the attacker types, and it does not become safe
+/// because the previous send worked.
+pub async fn charge(db: &Db, bucket: &str) -> Result<()> {
+    record(db, bucket, false).await
+}
+
 /// Failures in the window since the most recent success.
 async fn recent_failures(db: &Db, bucket: &str) -> Result<(i64, Option<DateTime<Utc>>)> {
     let row: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
