@@ -44,7 +44,9 @@ pub struct Config {
     /// PEM-encoded GitHub App private key. Optional for the same reason as
     /// `github_app_id`; PEM validity is checked later, when a task constructs
     /// a `GithubAppClient` from it, rather than here where the key is just
-    /// configuration data.
+    /// configuration data. Literal `\n` escapes (how a multi-line PEM is
+    /// commonly stored in a single-line `.env` value or a CI secret) are
+    /// normalized to real newlines before storage.
     pub github_app_private_key: Option<String>,
     /// Shared secret for GitHub webhook signature verification. Optional
     /// because GitHub integration itself is optional per deployment.
@@ -126,7 +128,8 @@ impl Config {
                     })
                 })
                 .transpose()?,
-            github_app_private_key: optional("DF_GITHUB_APP_PRIVATE_KEY"),
+            github_app_private_key: optional("DF_GITHUB_APP_PRIVATE_KEY")
+                .map(normalize_pem_newlines),
             github_app_webhook_secret: optional("DF_GITHUB_APP_WEBHOOK_SECRET"),
 
             client_ip_header: optional("DF_CLIENT_IP_HEADER")
@@ -215,6 +218,13 @@ fn list(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Normalize a PEM value that arrived as a literal `\n`-escaped single line —
+/// the common shape for a multi-line secret stored in a `.env` file or a CI
+/// secret store that doesn't preserve real newlines.
+fn normalize_pem_newlines(value: String) -> String {
+    value.replace("\\n", "\n")
+}
+
 #[cfg(test)]
 impl Config {
     /// A complete, valid `Config` for tests.
@@ -281,6 +291,22 @@ mod tests {
     #[test]
     fn a_list_treats_absent_empty_and_whitespace_alike() {
         assert!(list("DF_TEST_ABSENT_LIST_XYZ").is_empty());
+    }
+
+    #[test]
+    fn a_pem_with_literal_newline_escapes_is_normalized() {
+        assert_eq!(
+            normalize_pem_newlines(
+                "-----BEGIN RSA PRIVATE KEY-----\\nabc\\n-----END RSA PRIVATE KEY-----".into()
+            ),
+            "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"
+        );
+    }
+
+    #[test]
+    fn a_pem_with_real_newlines_already_is_left_unchanged() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----";
+        assert_eq!(normalize_pem_newlines(pem.into()), pem);
     }
 
     #[test]

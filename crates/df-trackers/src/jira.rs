@@ -417,7 +417,7 @@ mod tests {
             201,
             serde_json::json!({ "id": "comment-1" }),
         ));
-        server.push(MockResponse::json(204, serde_json::json!({})));
+        server.push(MockResponse::text(204, ""));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
             .with_bases(server.base_url.clone(), server.base_url.clone());
