@@ -1,56 +1,57 @@
 //! Signing up, signing in, and the second factor.
 //!
-//! ## Every link is consumed on `POST`
+//! ## There is no email
 //!
-//! No route in this file spends a credential on a `GET`. The emailed URL points
-//! at a console *page*; the page renders a button; the button `POST`s the token
-//! to one of the endpoints here. Corporate mail scanners, link-preview
-//! fetchers, and antivirus gateways follow every URL in every message they
-//! handle, and a single-use `GET` is spent before the human ever clicks it. The
-//! resulting failure — "your link has already been used" on the first click —
-//! looks exactly like an attack and is not.
+//! No mailer, no verification link, no recovery link. An authenticator app is
+//! the only factor; [`login_recovery_code`] is the only self-service way back in
+//! without one, and an org admin resetting a member's credential is the only
+//! assisted one.
 //!
-//! ## The bootstrap problem, and how verification resolves it
+//! ## The bootstrap problem, and how signup resolves it
 //!
 //! A new account has no second factor, so it cannot log in; enrolling one needs
 //! a session, so it cannot be reached. Something has to break the circle, and
-//! [`verify`] is where: **a verification link opens a session only for an
-//! account that has no confirmed TOTP credential.**
+//! [`signup`] is where: **it hands back a TOTP enrollment without a session, and
+//! issues the session only once [`confirm_signup`] proves possession.**
 //!
-//! That is a rule about what the link is worth, not a convenience. Before
-//! enrollment, control of the mailbox is the strongest factor the account has,
-//! and it is the same factor the user would present anyway. The moment a
-//! confirmed authenticator exists, the link stops being enough on its own — a
-//! verification mail opened later on a phone marks the address verified and
-//! nothing else. `df_auth::login::verify_email` deliberately opens no session
-//! for exactly this reason, and leaves the decision here.
+//! No credential exists in between. The pending secret is stored unconfirmed by
+//! `totp::begin_enrollment` and is worthless to anyone who cannot produce a code
+//! from it, so an abandoned signup leaves nothing to steal and no session in a
+//! place nobody asked for one.
 //!
-//! ## Constant shape
+//! ## What this costs, stated plainly
 //!
-//! [`signup`] and [`request_link`] answer identically whether or not the
-//! address is known. `df-auth` spends a whole module on making login
-//! indistinguishable across unknown / disabled / wrong-code / replayed; an
-//! endpoint here that said "no such user" would hand back the enumeration
-//! oracle in a single line.
+//! [`signup`] **is** an account-enumeration oracle, and deliberately so.
+//!
+//! Handing the enrollment back in the HTTP response is the whole point — there
+//! is no mailbox to send it to. But it must be refused for an account that
+//! already has a confirmed authenticator, or typing somebody's address would
+//! re-enroll their account and take it over. That refusal is a different answer
+//! from the success case, and no amount of response shaping hides it: an
+//! attacker who cannot tell them apart by the body can tell them apart by
+//! whether a code they invent is ever accepted.
+//!
+//! So the constant-shape machinery that used to live here is gone rather than
+//! quietly weakened, because a defense that does not hold is worse than an
+//! absent one — it stops people asking the question. What *is* still defended:
+//! [`login_totp`] and [`login_recovery_code`] remain indistinguishable across
+//! unknown address, disabled account, wrong code and replayed code, because
+//! those paths hand nothing back and have no reason to leak. Signup and login
+//! now make different promises, and each says which.
+//!
+//! The throttle in [`throttle_by_source`] still applies, so enumeration costs a
+//! request each and is rate-limited per source.
 
 use axum::extract::{Json, State};
 use axum::response::{IntoResponse, Response};
-use df_auth::magic::Purpose;
-use df_auth::{login, magic, sessions, totp};
+use df_auth::{login, sessions, totp};
 use df_core::orgs::User;
 use http::request::Parts;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
-use crate::mail;
 use crate::session::{self, CurrentUser};
 use crate::state::{client_ip, AppState};
-
-/// Floor `request_link`'s total handling time is padded up to. See that
-/// handler's comment: this absorbs the latency difference between minting
-/// and mailing a link (known address) and doing neither (unknown address)
-/// for any mail provider fast enough to fit inside it.
-const LINK_RESPONSE_FLOOR: std::time::Duration = std::time::Duration::from_millis(150);
 
 // --------------------------------------------------------------- payloads
 
@@ -62,26 +63,13 @@ pub struct SignupRequest {
     pub name: Option<String>,
 }
 
+/// Finish signup: the address that started it, plus a code from the app it was
+/// just scanned into.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LinkRequest {
+pub struct ConfirmSignupRequest {
     pub email: String,
-    /// `verify` to confirm an address, `recover` to get back in without an
-    /// authenticator.
-    pub purpose: LinkPurpose,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LinkPurpose {
-    Verify,
-    Recover,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TokenRequest {
-    pub token: String,
+    pub code: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,27 +87,6 @@ pub struct ConfirmTotpRequest {
     pub code: String,
 }
 
-/// The answer to every "we have sent you something" request.
-///
-/// One shape, always. There is no field here that varies with whether the
-/// address exists, because any such field is the enumeration oracle again.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Accepted {
-    pub sent: bool,
-    pub message: &'static str,
-}
-
-impl Accepted {
-    fn new() -> Self {
-        Self {
-            sent: true,
-            message: "If that address can receive it, a link is on its way. \
-                      It works once and expires in 10 minutes.",
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionOpened {
@@ -129,19 +96,24 @@ pub struct SessionOpened {
     pub must_enroll_totp: bool,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Verified {
-    pub email_verified: bool,
-    pub must_enroll_totp: bool,
-    /// Whether this response also carried a session cookie. See the module
-    /// docs: only an account with no confirmed authenticator gets one.
-    pub signed_in: bool,
-}
-
 // ---------------------------------------------------------------- handlers
 
-/// `POST /api/auth/signup` — create the account and mail a verification link.
+/// `POST /api/auth/signup` — create the account and start TOTP enrollment.
+///
+/// Returns the provisioning URI, the manual key, and ten recovery codes. **No
+/// session and no confirmed credential exist yet**: the secret is stored
+/// unconfirmed, and [`confirm_signup`] is what turns it into an account anyone
+/// can sign into.
+///
+/// Refused for an address that already has a confirmed authenticator, because
+/// handing out a fresh enrollment for one would be account takeover by typing
+/// somebody's address. That refusal is the enumeration oracle the module docs
+/// describe, and it is the price of having no mailbox to send a secret to.
+///
+/// Re-running signup for an address that started but never finished is allowed
+/// and supersedes the pending secret — someone who closed the tab before
+/// scanning has to be able to start again, and the abandoned secret was never
+/// worth anything.
 pub async fn signup(
     State(state): State<AppState>,
     parts: Parts,
@@ -149,8 +121,6 @@ pub async fn signup(
 ) -> ApiResult<Response> {
     let email = req.email.trim().to_string();
 
-    // A malformed address is a client bug, not an enumeration probe, so it is
-    // reported plainly. Everything past this point is constant-shape.
     if email.is_empty() || !email.contains('@') {
         return Err(ApiError::bad_request(format!(
             "{email:?} is not an email address"
@@ -159,82 +129,108 @@ pub async fn signup(
 
     throttle_by_source(&state, &parts).await?;
 
-    state
+    // Checked before the upsert so a probe cannot create rows for addresses it
+    // does not own. `upsert_user` would otherwise happily make one per guess.
+    if let Some(existing) = state
+        .db
+        .get_user_by_email(&email)
+        .await
+        .map_err(ApiError::from)?
+    {
+        if totp::has_confirmed_credential(&state.db, existing.id).await? {
+            return Err(ApiError::conflict(
+                "account_exists",
+                "that address already has an authenticator enrolled. Sign in with a \
+                 code from it, or use a recovery code if the app is gone.",
+            ));
+        }
+    }
+
+    let user = state
         .db
         .upsert_user(&email, req.name.as_deref())
         .await
         .map_err(ApiError::from)?;
 
-    send_link(&state, &email, Purpose::VerifyEmail).await?;
-    Ok((http::StatusCode::ACCEPTED, Json(Accepted::new())).into_response())
+    let enrollment = totp::begin_enrollment(
+        &state.db,
+        &state.cipher,
+        user.id,
+        &user.email,
+        &state.config.totp_issuer,
+    )
+    .await?;
+
+    Ok(Json(EnrollmentResponse {
+        provisioning_uri: enrollment.provisioning_uri,
+        manual_key: enrollment.manual_key,
+        recovery_codes: enrollment.recovery_codes,
+    })
+    .into_response())
 }
 
-/// `POST /api/auth/link` — mail a verification or recovery link.
+/// `POST /api/auth/signup/confirm` — prove possession and open the first session.
 ///
-/// Reachable without a session, because both callers are people who cannot get
-/// one: someone whose verification mail never arrived, and someone whose phone
-/// is gone.
-///
-/// Throttled twice, and both are needed. `magic::issue` limits per address,
-/// which protects one stranger's mailbox from being flooded; that alone does
-/// nothing against a script walking a list of a thousand addresses, so
-/// [`throttle_by_source`] limits per source as well.
-pub async fn request_link(
+/// The other half of [`signup`]. Takes the address rather than a session,
+/// because there is no session yet — that is the whole bootstrap problem — and
+/// the code itself is the proof: only someone holding the secret just issued for
+/// that address can produce one.
+pub async fn confirm_signup(
     State(state): State<AppState>,
     parts: Parts,
-    Json(req): Json<LinkRequest>,
+    Json(req): Json<ConfirmSignupRequest>,
 ) -> ApiResult<Response> {
-    let email = req.email.trim().to_string();
-    let purpose = match req.purpose {
-        LinkPurpose::Verify => Purpose::VerifyEmail,
-        LinkPurpose::Recover => Purpose::RecoverTotp,
-    };
-
     throttle_by_source(&state, &parts).await?;
 
-    // Unknown addresses must get the same answer *and the same latency
-    // shape* as known ones, or a timing measurement answers the question the
-    // identical response body is written to refuse. Minting a link and
-    // mailing it (a real provider, not `LogMailer`, has its own network
-    // latency) only happens for a known address; padding this handler's
-    // total time up to a fixed floor absorbs that difference for any
-    // provider fast enough to fit inside it. It is not a complete fix for a
-    // provider slow enough to exceed the floor on its own — a background
-    // delivery queue would be — but it closes the gap for the common case
-    // without deferring the "was the mailer even called" observation tests
-    // rely on into a race against a spawned task.
-    let started = std::time::Instant::now();
-
-    // Note the order — the throttle inside `magic::issue` still runs for
-    // known addresses, so this cannot be used to distinguish them by timing
-    // a lockout either.
-    if state
+    let user = state
         .db
-        .get_user_by_email(&email)
+        .get_user_by_email(req.email.trim())
         .await
         .map_err(ApiError::from)?
-        .is_some()
-    {
-        send_link(&state, &email, purpose).await?;
+        .ok_or_else(|| ApiError::bad_request("start by signing up with this address"))?;
+
+    // A confirmed credential already existing means this is not a signup being
+    // finished — it is someone trying to attach a second authenticator to an
+    // account they may not own. Enrolling another one is a signed-in operation
+    // (`POST /api/me/totp`) precisely so it cannot be reached from here.
+    if totp::has_confirmed_credential(&state.db, user.id).await? {
+        return Err(ApiError::conflict(
+            "account_exists",
+            "that address already has an authenticator enrolled. Sign in instead.",
+        ));
     }
 
-    if let Some(remaining) = LINK_RESPONSE_FLOOR.checked_sub(started.elapsed()) {
-        tokio::time::sleep(remaining).await;
-    }
+    totp::confirm_enrollment(
+        &state.db,
+        &state.cipher,
+        user.id,
+        &user.email,
+        &state.config.totp_issuer,
+        &req.code,
+    )
+    .await?;
 
-    Ok((http::StatusCode::ACCEPTED, Json(Accepted::new())).into_response())
+    // No audit row here: `totp::confirm_enrollment` already writes
+    // TOTP_ENROLLED, and a second one from this handler would double-count
+    // every signup in the trail.
+    let opened = sessions::create(&state.db, user.id).await?;
+
+    let body = Json(SessionOpened {
+        user,
+        must_enroll_totp: false,
+    });
+    Ok(session::with_cookie(
+        body.into_response(),
+        session::set_cookie(&opened.token),
+    ))
 }
 
-/// Limit how many links one source may ask for, whatever addresses it names.
+/// Limit how many signup or confirmation attempts one source may make.
 ///
-/// **Charged before the address is looked up, always.** Charging it only on the
-/// path that actually sends would make the throttle itself an oracle: an
-/// attacker probing addresses would watch their own budget move and learn which
-/// ones exist. The bucket has to advance identically for every request or it
-/// undoes the constant-shape response above it.
-///
-/// A `429` is the one non-constant answer these endpoints give, and an
-/// acceptable one — it is keyed on traffic the caller generated themselves.
+/// Signup is the enumeration surface (see the module docs) and this is what
+/// prices it: probing addresses costs a request each, per source, rather than
+/// being free. It does not make the oracle go away — nothing does, once the
+/// secret has to come back in the response — it makes walking a list expensive.
 async fn throttle_by_source(state: &AppState, parts: &Parts) -> ApiResult<()> {
     let Some(ip) = client_ip(parts, &state.config) else {
         // Nothing trustworthy to key on. Deliberately not a shared "unknown"
@@ -242,85 +238,10 @@ async fn throttle_by_source(state: &AppState, parts: &Parts) -> ApiResult<()> {
         return Ok(());
     };
 
-    let bucket = format!("link:{ip}");
+    let bucket = format!("signup:{ip}");
     df_auth::ratelimit::check(&state.db, &bucket).await?;
     df_auth::ratelimit::charge(&state.db, &bucket).await?;
     Ok(())
-}
-
-/// Mint a link, put it in a message, and hand it to the mailer.
-async fn send_link(state: &AppState, email: &str, purpose: Purpose) -> ApiResult<()> {
-    let issued = magic::issue(&state.db, email, purpose).await?;
-
-    // Both links point at a console *page*, never at an endpoint. The page
-    // renders a button that POSTs the token back — see the module docs.
-    let mail = match purpose {
-        Purpose::VerifyEmail => {
-            let link = state.config.url(&format!("/verify?token={}", issued.token));
-            mail::verify_email(email, &link)
-        }
-        Purpose::RecoverTotp => {
-            let link = state
-                .config
-                .url(&format!("/recover?token={}", issued.token));
-            mail::recover_account(email, &link)
-        }
-        // Invitations carry their own token and are mailed from the invites
-        // handler, which knows the org. Reaching here with one is a wiring bug.
-        Purpose::AcceptInvite => {
-            return Err(ApiError::internal(
-                "send_link",
-                "invitations are mailed by the invites handler",
-            ))
-        }
-    };
-
-    state.mailer.send(mail).await?;
-    Ok(())
-}
-
-/// `POST /api/auth/verify` — spend a verification link.
-///
-/// **Never a `GET`.** See the module docs.
-pub async fn verify(
-    State(state): State<AppState>,
-    Json(req): Json<TokenRequest>,
-) -> ApiResult<Response> {
-    let user_id = login::verify_email(&state.db, &req.token).await?;
-    let enrolled = totp::has_confirmed_credential(&state.db, user_id).await?;
-
-    let body = Verified {
-        email_verified: true,
-        must_enroll_totp: !enrolled,
-        signed_in: !enrolled,
-    };
-
-    if enrolled {
-        // The account already has a second factor, so the link is not enough to
-        // be signed in by. Marking the address verified is all it does.
-        return Ok(Json(body).into_response());
-    }
-
-    let opened = sessions::create(&state.db, user_id).await?;
-    Ok(session::with_cookie(
-        Json(body).into_response(),
-        session::set_cookie(&opened.token),
-    ))
-}
-
-/// `POST /api/auth/recover` — spend a recovery link.
-///
-/// Destroys the TOTP credential and opens a session, so the user can enrol a
-/// new authenticator. That is the point of the link: it is reached for when the
-/// old authenticator is gone.
-pub async fn recover(
-    State(state): State<AppState>,
-    parts: Parts,
-    Json(req): Json<TokenRequest>,
-) -> ApiResult<Response> {
-    let ip = client_ip(&parts, &state.config);
-    let logged_in = login::recover_with_magic_link(&state.db, &req.token, ip.as_deref()).await?;
-    signed_in_response(&state, logged_in).await
 }
 
 /// `POST /api/auth/login` — email plus an authenticator code.

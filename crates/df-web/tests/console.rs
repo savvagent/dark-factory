@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{add_member, harness, link_token, now_code, onboard, org_with_owner, Call};
+use common::{add_member, harness, now_code, onboard, org_with_owner, Call};
 use df_core::orgs::Role;
 use http::StatusCode;
 use sqlx::PgPool;
@@ -22,14 +22,6 @@ use sqlx::PgPool;
 async fn a_new_user_signs_up_enrols_and_registers_a_repo(pool: PgPool) {
     let h = harness(pool);
     let rob = onboard(&h, "rob@acme.test").await;
-
-    // The verification mail went to the right place and carried a link.
-    let mail = h.mailer.sent();
-    assert_eq!(mail.len(), 1, "expected exactly one verification mail");
-    assert_eq!(mail[0].to, "rob@acme.test");
-    assert!(mail[0]
-        .text
-        .contains("https://console.dark-factory.test/verify?token="));
 
     let me = Call::get("/api/me")
         .with_session(&rob.session)
@@ -65,130 +57,6 @@ async fn a_new_user_signs_up_enrols_and_registers_a_repo(pool: PgPool) {
     repos.expect(StatusCode::OK);
     assert_eq!(repos.body.as_array().unwrap().len(), 1);
 }
-
-/// The bootstrap rule from `routes::auth`: a verification link opens a session
-/// only while the account has no second factor. Once one exists, the link marks
-/// the address verified and nothing more — a mail opened later on a phone must
-/// not be a way in.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn a_verification_link_stops_opening_sessions_once_totp_exists(pool: PgPool) {
-    let h = harness(pool);
-    onboard(&h, "rob@acme.test").await;
-
-    h.mailer.clear();
-    Call::post("/api/auth/link")
-        .json(serde_json::json!({ "email": "rob@acme.test", "purpose": "verify" }))
-        .send(&h.router)
-        .await
-        .expect(StatusCode::ACCEPTED);
-
-    let token = link_token(&h.mailer.last().unwrap());
-    let verified = Call::post("/api/auth/verify")
-        .json(serde_json::json!({ "token": token }))
-        .send(&h.router)
-        .await;
-    verified.expect(StatusCode::OK);
-
-    assert_eq!(verified.body["emailVerified"], true);
-    assert_eq!(verified.body["signedIn"], false);
-    assert!(
-        verified.session_cookie().is_none(),
-        "an account with a confirmed authenticator must not be signed in by an \
-         emailed link alone"
-    );
-}
-
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn a_link_is_single_use(pool: PgPool) {
-    let h = harness(pool);
-    Call::post("/api/auth/signup")
-        .json(serde_json::json!({ "email": "rob@acme.test" }))
-        .send(&h.router)
-        .await
-        .expect(StatusCode::ACCEPTED);
-
-    let token = link_token(&h.mailer.last().unwrap());
-    let body = serde_json::json!({ "token": token });
-
-    Call::post("/api/auth/verify")
-        .json(body.clone())
-        .send(&h.router)
-        .await
-        .expect(StatusCode::OK);
-
-    let replayed = Call::post("/api/auth/verify")
-        .json(body)
-        .send(&h.router)
-        .await;
-    replayed.expect(StatusCode::BAD_REQUEST);
-    assert_eq!(replayed.error_code(), Some("credential_expired"));
-}
-
-/// Signup and the link endpoint must answer identically for an address that
-/// exists and one that does not — anything else is an account-enumeration
-/// oracle reachable without credentials.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn signup_and_link_do_not_reveal_whether_an_address_is_known(pool: PgPool) {
-    let h = harness(pool);
-    onboard(&h, "rob@acme.test").await;
-    h.mailer.clear();
-
-    let known = Call::post("/api/auth/link")
-        .json(serde_json::json!({ "email": "rob@acme.test", "purpose": "recover" }))
-        .send(&h.router)
-        .await;
-    let unknown = Call::post("/api/auth/link")
-        .json(serde_json::json!({ "email": "nobody@acme.test", "purpose": "recover" }))
-        .send(&h.router)
-        .await;
-
-    assert_eq!(known.status, unknown.status);
-    assert_eq!(
-        known.body, unknown.body,
-        "the response distinguishes a known address from an unknown one"
-    );
-
-    // And only the real address was actually mailed.
-    let sent = h.mailer.sent();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].to, "rob@acme.test");
-}
-
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn a_recovery_link_resets_the_authenticator_and_signs_in(pool: PgPool) {
-    let h = harness(pool);
-    let rob = onboard(&h, "rob@acme.test").await;
-    h.mailer.clear();
-
-    Call::post("/api/auth/link")
-        .json(serde_json::json!({ "email": "rob@acme.test", "purpose": "recover" }))
-        .send(&h.router)
-        .await
-        .expect(StatusCode::ACCEPTED);
-
-    let recovered = Call::post("/api/auth/recover")
-        .json(serde_json::json!({ "token": link_token(&h.mailer.last().unwrap()) }))
-        .send(&h.router)
-        .await;
-    recovered.expect(StatusCode::OK);
-
-    assert_eq!(recovered.body["mustEnrollTotp"], true);
-    let session = recovered
-        .session_cookie()
-        .expect("recovery opens a session");
-
-    // The old authenticator is gone.
-    let refused = Call::post("/api/auth/login")
-        .json(serde_json::json!({ "email": "rob@acme.test", "code": now_code(&rob.totp) }))
-        .send(&h.router)
-        .await;
-    refused.expect(StatusCode::BAD_REQUEST);
-    assert_eq!(refused.error_code(), Some("invalid_credentials"));
-
-    // And the session it opened is good enough to enrol a new one.
-    common::enroll(&h, &session, "rob@acme.test").await;
-}
-
 #[sqlx::test(migrations = "../df-core/migrations")]
 async fn signing_in_and_out_works_and_a_dead_cookie_is_refused(pool: PgPool) {
     let h = harness(pool);
@@ -326,18 +194,22 @@ async fn another_orgs_data_is_not_merely_forbidden_it_is_invisible(pool: PgPool)
         "the refusal leaked the other org's contents"
     );
 }
-
+/// Claiming a public org slug must cost more than typing an address.
+///
+/// Reachable only through the seam that signup itself cannot produce: an
+/// account with a session but no confirmed authenticator, which is what an
+/// admin-reset member looks like. The session is created directly because no
+/// endpoint hands one out in that state — which is the property, not a
+/// shortcut around it.
 #[sqlx::test(migrations = "../df-core/migrations")]
-async fn creating_an_org_needs_a_verified_address(pool: PgPool) {
+async fn creating_an_org_needs_a_confirmed_authenticator(pool: PgPool) {
     let h = harness(pool);
 
-    // Signed up but never verified: sign in is impossible, so reach the state
-    // the endpoint guards by giving this account a session another way.
     Call::post("/api/auth/signup")
         .json(serde_json::json!({ "email": "rob@acme.test" }))
         .send(&h.router)
         .await
-        .expect(StatusCode::ACCEPTED);
+        .expect(StatusCode::OK);
 
     let user =
         h.db.get_user_by_email("rob@acme.test")
@@ -355,7 +227,7 @@ async fn creating_an_org_needs_a_verified_address(pool: PgPool) {
         .send(&h.router)
         .await;
     refused.expect(StatusCode::FORBIDDEN);
-    assert!(refused.text.contains("confirm your email"));
+    assert!(refused.text.contains("enrol an authenticator"));
 }
 
 #[sqlx::test(migrations = "../df-core/migrations")]
@@ -553,15 +425,89 @@ async fn removing_a_member_revokes_their_tokens_for_that_org(pool: PgPool) {
         .expect(StatusCode::OK);
 }
 
+/// Signup hands the secret back in its own response, so it has to refuse an
+/// account that already has an authenticator — otherwise typing somebody's
+/// address re-enrols their account and takes it over.
+///
+/// This is the enumeration oracle `routes::auth` documents. It is tested so it
+/// stays a decision somebody made rather than something that drifts: if this
+/// ever starts answering 200, account takeover is one request away.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn signup_refuses_an_address_that_already_has_an_authenticator(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+
+    let again = Call::post("/api/auth/signup")
+        .json(serde_json::json!({ "email": "rob@acme.test" }))
+        .send(&h.router)
+        .await;
+    again.expect(StatusCode::CONFLICT);
+    assert_eq!(again.error_code(), Some("account_exists"));
+
+    // And the original credential still works — the refused signup must not
+    // have disturbed it.
+    let signed_in = Call::post("/api/auth/login")
+        .json(serde_json::json!({ "email": "rob@acme.test", "code": now_code(&rob.totp) }))
+        .send(&h.router)
+        .await;
+    signed_in.expect(StatusCode::OK);
+}
+
+/// Someone who closed the tab before scanning has to be able to start again.
+/// The abandoned secret was never confirmed and was never worth anything.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn signup_can_be_restarted_while_no_authenticator_is_confirmed(pool: PgPool) {
+    let h = harness(pool);
+
+    let first = Call::post("/api/auth/signup")
+        .json(serde_json::json!({ "email": "rob@acme.test" }))
+        .send(&h.router)
+        .await;
+    first.expect(StatusCode::OK);
+
+    let second = Call::post("/api/auth/signup")
+        .json(serde_json::json!({ "email": "rob@acme.test" }))
+        .send(&h.router)
+        .await;
+    second.expect(StatusCode::OK);
+    assert_ne!(
+        first.body["manualKey"], second.body["manualKey"],
+        "restarting signup must supersede the abandoned secret"
+    );
+}
+
+/// Until a code proves possession there is no session and no account anyone can
+/// sign into. A signup that stops halfway must leave nothing usable behind.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn signup_opens_no_session_until_a_code_is_proved(pool: PgPool) {
+    let h = harness(pool);
+
+    let started = Call::post("/api/auth/signup")
+        .json(serde_json::json!({ "email": "rob@acme.test" }))
+        .send(&h.router)
+        .await;
+    started.expect(StatusCode::OK);
+    assert!(
+        started.session_cookie().is_none(),
+        "signup must not open a session before enrollment is confirmed"
+    );
+
+    let wrong = Call::post("/api/auth/signup/confirm")
+        .json(serde_json::json!({ "email": "rob@acme.test", "code": "000000" }))
+        .send(&h.router)
+        .await;
+    assert_ne!(wrong.status, StatusCode::OK);
+    assert!(wrong.session_cookie().is_none());
+}
+
 // ---------------------------------------------------------------- invites
 
 #[sqlx::test(migrations = "../df-core/migrations")]
-async fn an_invitation_is_mailed_accepted_once_and_grants_its_role(pool: PgPool) {
+async fn an_invitation_code_is_handed_back_accepted_once_and_grants_its_role(pool: PgPool) {
     let h = harness(pool);
     let rob = onboard(&h, "rob@acme.test").await;
     org_with_owner(&h, "acme", &rob).await;
     let bob = onboard(&h, "bob@acme.test").await;
-    h.mailer.clear();
 
     let invited = Call::post("/api/orgs/acme/invites")
         .with_session(&rob.session)
@@ -570,14 +516,14 @@ async fn an_invitation_is_mailed_accepted_once_and_grants_its_role(pool: PgPool)
         .await;
     invited.expect(StatusCode::CREATED);
 
-    let mail = h.mailer.last().expect("no invitation mail");
-    assert_eq!(mail.to, "bob@acme.test");
-    assert!(
-        mail.subject.contains("acme"),
-        "the org must be named: {}",
-        mail.subject
+    // The code comes back to the admin — there is no mailbox it went to
+    // instead — and the link is the same secret wrapped in a console URL.
+    let token = invited.body["code"].as_str().expect("no code").to_string();
+    assert!(token.starts_with("df_inv_"), "unexpected code: {token}");
+    assert_eq!(
+        invited.body["link"],
+        format!("https://console.dark-factory.test/invite/acme?token={token}")
     );
-    let token = link_token(&mail);
 
     let pending = Call::get("/api/orgs/acme/invites")
         .with_session(&rob.session)
@@ -617,16 +563,15 @@ async fn an_invitation_cannot_be_accepted_by_the_wrong_account(pool: PgPool) {
     let rob = onboard(&h, "rob@acme.test").await;
     org_with_owner(&h, "acme", &rob).await;
     let mallory = onboard(&h, "mallory@evil.test").await;
-    h.mailer.clear();
 
-    Call::post("/api/orgs/acme/invites")
+    let invited = Call::post("/api/orgs/acme/invites")
         .with_session(&rob.session)
         .json(serde_json::json!({ "email": "bob@acme.test" }))
         .send(&h.router)
-        .await
-        .expect(StatusCode::CREATED);
+        .await;
+    invited.expect(StatusCode::CREATED);
 
-    let token = link_token(&h.mailer.last().unwrap());
+    let token = invited.body["code"].as_str().unwrap().to_string();
     let refused = Call::post("/api/orgs/acme/invites/accept")
         .with_session(&mallory.session)
         .json(serde_json::json!({ "token": token }))
@@ -661,7 +606,6 @@ async fn a_withdrawn_invitation_stops_working(pool: PgPool) {
     let rob = onboard(&h, "rob@acme.test").await;
     org_with_owner(&h, "acme", &rob).await;
     let bob = onboard(&h, "bob@acme.test").await;
-    h.mailer.clear();
 
     let invited = Call::post("/api/orgs/acme/invites")
         .with_session(&rob.session)
@@ -670,7 +614,7 @@ async fn a_withdrawn_invitation_stops_working(pool: PgPool) {
         .await;
     invited.expect(StatusCode::CREATED);
     let id = invited.body["id"].as_str().unwrap().to_string();
-    let token = link_token(&h.mailer.last().unwrap());
+    let token = invited.body["code"].as_str().unwrap().to_string();
 
     Call::delete(format!("/api/orgs/acme/invites/{id}"))
         .with_session(&rob.session)
@@ -685,44 +629,6 @@ async fn a_withdrawn_invitation_stops_working(pool: PgPool) {
         .await
         .expect(StatusCode::GONE);
 }
-
-/// An invitation whose mail never went out must not be left live. Nobody has
-/// the link, it is invisible to the admin as a problem, and the "one live
-/// invite per address" rule would make a retry supersede it anyway.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn an_invitation_whose_mail_fails_is_withdrawn(pool: PgPool) {
-    let h = harness(pool);
-    let rob = onboard(&h, "rob@acme.test").await;
-    org_with_owner(&h, "acme", &rob).await;
-
-    h.mailer.start_failing();
-
-    let attempted = Call::post("/api/orgs/acme/invites")
-        .with_session(&rob.session)
-        .json(serde_json::json!({ "email": "bob@acme.test" }))
-        .send(&h.router)
-        .await;
-
-    attempted.expect(StatusCode::BAD_GATEWAY);
-    assert_eq!(attempted.error_code(), Some("mail_undeliverable"));
-    assert!(
-        !attempted.text.contains("told this mailer to fail"),
-        "the provider's own message is for the operator, not the caller: {}",
-        attempted.text
-    );
-
-    let pending = Call::get("/api/orgs/acme/invites")
-        .with_session(&rob.session)
-        .send(&h.router)
-        .await;
-    pending.expect(StatusCode::OK);
-    assert!(
-        pending.body.as_array().unwrap().is_empty(),
-        "an invitation nobody received was left live: {}",
-        pending.text
-    );
-}
-
 /// Only an owner may hand out ownership, whether directly or by invitation —
 /// otherwise the invite endpoint is a way around the role check on members.
 #[sqlx::test(migrations = "../df-core/migrations")]
@@ -1337,4 +1243,85 @@ async fn every_documented_get_is_actually_mounted(pool: PgPool) {
         checked > 10,
         "only {checked} GETs were checked; the document looks empty"
     );
+}
+
+/// The only assisted way back into an account, and the limits that make it
+/// safe to have. Without email there is nothing else, so this endpoint carries
+/// weight the mailed recovery link used to.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn an_admin_can_reset_a_members_authenticator_but_gains_nothing_by_it(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    add_member(
+        &h,
+        h.db.get_org_by_slug("acme").await.unwrap().unwrap().id,
+        bob.user,
+        df_core::orgs::Role::Member,
+    )
+    .await;
+
+    let reset = Call::post(format!(
+        "/api/orgs/acme/members/{}/reset-authenticator",
+        bob.user
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await;
+    reset.expect(StatusCode::NO_CONTENT);
+
+    // Bob's old authenticator is gone...
+    let stale = Call::post("/api/auth/login")
+        .json(serde_json::json!({ "email": "bob@acme.test", "code": now_code(&bob.totp) }))
+        .send(&h.router)
+        .await;
+    assert_ne!(
+        stale.status,
+        StatusCode::OK,
+        "the old credential still works"
+    );
+
+    // ...and so is his session, so a reset actually interrupts whoever holds
+    // the account rather than leaving them running.
+    let dead = Call::get("/api/me")
+        .with_session(&bob.session)
+        .send(&h.router)
+        .await;
+    assert_eq!(dead.status, StatusCode::UNAUTHORIZED);
+
+    // The admin gained nothing: no session was handed to Rob for Bob, and Bob
+    // re-enrols himself. Signup is the door back, because he has no session.
+    let restart = Call::post("/api/auth/signup")
+        .json(serde_json::json!({ "email": "bob@acme.test" }))
+        .send(&h.router)
+        .await;
+    restart.expect(StatusCode::OK);
+}
+
+/// An admin must not reach through this endpoint what the role check refuses
+/// everywhere else — resetting an owner is an owner's business.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn an_admin_cannot_reset_an_owners_authenticator(pool: PgPool) {
+    let h = harness(pool);
+    let owner = onboard(&h, "owner@acme.test").await;
+    let org = org_with_owner(&h, "acme", &owner).await;
+    let admin = onboard(&h, "admin@acme.test").await;
+    add_member(&h, org, admin.user, df_core::orgs::Role::Admin).await;
+
+    let refused = Call::post(format!(
+        "/api/orgs/acme/members/{}/reset-authenticator",
+        owner.user
+    ))
+    .with_session(&admin.session)
+    .send(&h.router)
+    .await;
+    refused.expect(StatusCode::FORBIDDEN);
+
+    // The owner's credential is untouched.
+    Call::post("/api/auth/login")
+        .json(serde_json::json!({ "email": "owner@acme.test", "code": now_code(&owner.totp) }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
 }

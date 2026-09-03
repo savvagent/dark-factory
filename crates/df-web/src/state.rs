@@ -5,14 +5,13 @@ use std::sync::Arc;
 use df_auth::crypto::Cipher;
 use df_core::Db;
 
-use crate::mail::Mailer;
-
 /// Deployment-dependent settings.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Public base URL of the console and the authorization server — the origin
-    /// a browser sees. Used to build the links that go in email, so a wrong
-    /// value produces links that 404 rather than links that leak.
+    /// a browser sees. Every link the product hands out is built from it: the
+    /// OAuth issuer, both discovery documents, and the invitation URL an admin
+    /// copies. A wrong value produces links that 404 rather than links that leak.
     pub public_url: String,
 
     /// Canonical URI of the MCP resource server. Tokens minted here — including
@@ -71,8 +70,8 @@ impl Config {
         }
     }
 
-    /// Join a path onto the public URL. Every emailed link goes through here so
-    /// there is one place a trailing slash can be got wrong.
+    /// Join a path onto the public URL. Every link handed to a human goes
+    /// through here so there is one place a trailing slash can be got wrong.
     pub fn url(&self, path: &str) -> String {
         format!("{}/{}", self.public_url, path.trim_start_matches('/'))
     }
@@ -84,7 +83,6 @@ pub struct AppState {
     /// Decrypts TOTP secrets. Held as an `Arc` because the key material is
     /// loaded once at startup and shared by every request.
     pub cipher: Arc<Cipher>,
-    pub mailer: Arc<dyn Mailer>,
     pub config: Arc<Config>,
     /// Reads the org's plan and period counters for the usage endpoint. Never
     /// charges anything — the console is not a billable surface, and a customer
@@ -93,7 +91,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: Db, cipher: Cipher, mailer: Arc<dyn Mailer>, config: Config) -> Self {
+    pub fn new(db: Db, cipher: Cipher, config: Config) -> Self {
         let meter = df_billing::Meter::new(
             config.enforce_quotas,
             format!("{}/settings/billing", config.public_url),
@@ -101,7 +99,6 @@ impl AppState {
         Self {
             db,
             cipher: Arc::new(cipher),
-            mailer,
             config: Arc::new(config),
             meter,
         }
@@ -110,7 +107,7 @@ impl AppState {
 
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // No cipher, no mailer credentials.
+        // No cipher.
         f.debug_struct("AppState")
             .field("config", &self.config)
             .finish_non_exhaustive()

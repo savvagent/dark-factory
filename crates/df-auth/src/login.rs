@@ -34,7 +34,6 @@ use serde::Serialize;
 
 use crate::crypto::Cipher;
 use crate::error::{AuthError, Result};
-use crate::magic::{self, Purpose};
 use crate::ratelimit;
 use crate::sessions::{self, Session};
 use crate::totp;
@@ -45,7 +44,6 @@ use crate::totp;
 pub enum Method {
     Totp,
     RecoveryCode,
-    MagicLink,
 }
 
 /// A successful login.
@@ -106,10 +104,14 @@ pub async fn with_totp(
 
 /// Log in with one of the codes issued at enrollment.
 ///
-/// The other half of "my phone is in a taxi". Unlike the magic link this does
-/// **not** reset TOTP — the user still holds the secret, they just cannot reach
-/// it right now, and destroying it would force a re-enrollment they did not ask
-/// for.
+/// The other half of "my phone is in a taxi", and the **only** self-service way
+/// back in: there is no emailed recovery link, because there is no email.
+///
+/// Deliberately does **not** reset TOTP — the user still holds the secret, they
+/// just cannot reach it right now, and destroying it would force a
+/// re-enrollment they did not ask for. Someone who has lost the authenticator
+/// itself needs `totp::reset`, which only an org admin can reach on their
+/// behalf.
 pub async fn with_recovery_code(
     db: &Db,
     email: &str,
@@ -131,64 +133,6 @@ pub async fn with_recovery_code(
     };
 
     finish(db, &key, ip, outcome, Method::RecoveryCode).await
-}
-
-/// Redeem a recovery link: log the user in **and** clear their second factor.
-///
-/// The premise of this flow is that the authenticator is gone for good, so
-/// leaving the old secret in place would leave the account permanently
-/// unreachable by its own login path. The caller is expected to send the user
-/// straight into enrollment — [`LoggedIn::must_enroll_totp`] says so.
-///
-/// No decoy path and no email throttle here: the caller presents a token, not
-/// an address, and a token either exists or does not. The enumeration surface
-/// was on [`magic::issue`], which is throttled there.
-pub async fn recover_with_magic_link(db: &Db, token: &str, ip: Option<&str>) -> Result<LoggedIn> {
-    let email = magic::consume(db, token, Purpose::RecoverTotp).await?;
-
-    // A link outlives nothing else: if the account was deleted or disabled
-    // between issuance and redemption, the link stops working with it.
-    let user = resolve_account(db, &email)
-        .await?
-        .ok_or(AuthError::UnknownUser)?;
-
-    totp::reset(db, user.id, ip).await?;
-
-    let session = sessions::create(db, user.id).await?;
-    audit_success(db, user.id, ip, "magic_link").await;
-
-    Ok(LoggedIn {
-        user: user.id,
-        session_token: session.token,
-        session: session.session,
-        method: Method::MagicLink,
-        // Unconditionally true: `reset` just deleted the credential.
-        must_enroll_totp: true,
-    })
-}
-
-/// Redeem a verification link, marking the address proved.
-///
-/// Deliberately does **not** open a session. Verification is a fact about an
-/// address, and the click may well arrive on a different device from the one
-/// that started signup — a phone opening a link that silently signs it in is a
-/// session in a place the user did not ask for one. The caller decides whether
-/// to log them in next.
-pub async fn verify_email(db: &Db, token: &str) -> Result<UserId> {
-    let email = magic::consume(db, token, Purpose::VerifyEmail).await?;
-
-    let user = db
-        .get_user_by_email(&email)
-        .await?
-        .ok_or(AuthError::UnknownUser)?;
-
-    if db.mark_email_verified(user.id).await? {
-        let _ = db
-            .audit_global(Entry::new(action::EMAIL_VERIFIED).actor(user.id))
-            .await;
-    }
-
-    Ok(user.id)
 }
 
 /// End a session and record it. The counterpart to every constructor above.
@@ -283,17 +227,6 @@ async fn note_unknown(db: &Db, email_key: &str, ip: Option<&str>, method: &str) 
         tracing::error!(error = %e, "failed to write audit event for a login attempt");
     }
 }
-
-async fn audit_success(db: &Db, user: UserId, ip: Option<&str>, method: &str) {
-    let entry = Entry::new(action::LOGIN_SUCCEEDED)
-        .actor(user)
-        .from_request(ip, None)
-        .detail(serde_json::json!({ "method": method }));
-    if let Err(e) = db.audit_global(entry).await {
-        tracing::error!(error = %e, "failed to write audit event for a login");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

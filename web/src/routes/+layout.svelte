@@ -18,13 +18,16 @@
   /**
    * Pages reachable without a session.
    *
-   * `/verify` and `/recover` are here because they are what an emailed link
-   * opens, and the whole point of pointing mail at a page is that the page
-   * loads for someone who is not signed in. `/invite/…` is deliberately *not*
-   * here: accepting an invitation requires a verified session whose address
-   * matches the one invited, so it sends the visitor to sign in first.
+   * Just the two doors. `/signup` carries the whole account-creation flow now —
+   * address, recovery codes, and authenticator enrollment in one visit — because
+   * there is no email and so no second visit to come back from.
+   *
+   * `/invite/…` is deliberately *not* here: redeeming an invitation requires a
+   * session whose address matches the one invited, so it sends the visitor to
+   * sign in first. That check is what keeps a code that goes astray from being
+   * a free seat.
    */
-  const PUBLIC = ['/login', '/signup', '/verify', '/recover'];
+  const PUBLIC = ['/login', '/signup'];
 
   const isPublic = $derived(PUBLIC.some((p) => page.url.pathname === p));
   const onEnrollment = $derived(page.url.pathname === '/enroll');

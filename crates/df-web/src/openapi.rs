@@ -549,31 +549,6 @@ fn response_schemas() -> Value {
             "properties": { "org": reference("Org"), "role": role },
             "required": ["org", "role"],
         },
-        "Accepted": {
-            "type": "object",
-            "description":
-                "The constant-shape answer to every 'we have sent you something' \
-                 request. Identical whether or not the address exists.",
-            "properties": {
-                "sent": { "type": "boolean" },
-                "message": { "type": "string" },
-            },
-            "required": ["sent", "message"],
-        },
-        "Verified": {
-            "type": "object",
-            "properties": {
-                "emailVerified": { "type": "boolean" },
-                "mustEnrollTotp": { "type": "boolean" },
-                "signedIn": {
-                    "type": "boolean",
-                    "description":
-                        "Whether a session cookie came with this response. Only an \
-                         account with no confirmed authenticator gets one.",
-                },
-            },
-            "required": ["emailVerified", "mustEnrollTotp", "signedIn"],
-        },
         "SessionOpened": {
             "type": "object",
             "properties": {
@@ -600,6 +575,24 @@ fn response_schemas() -> Value {
             "properties": { "codes": { "type": "array", "items": { "type": "string" } } },
             "required": ["codes"],
         },
+        "CreatedInvite": {
+            "type": "object",
+            "description":
+                "An invitation plus its one-time code, returned only from the call \
+                 that mints it. Nothing is emailed; the admin delivers the code.",
+            "allOf": [reference("Invite")],
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The single-use code. Shown once — only its hash is stored.",
+                },
+                "link": {
+                    "type": "string",
+                    "description": "The same code as a console URL that redeems it.",
+                },
+            },
+            "required": ["code", "link"],
+        },
     })
 }
 
@@ -616,18 +609,16 @@ fn request_schemas() -> Value {
             },
             "required": ["email"],
         },
-        "LinkRequest": {
+        "ConfirmSignupRequest": {
             "type": "object",
+            "description":
+                "Finishes signup: the address that started it, and a code from the \
+                 authenticator it was just scanned into.",
             "properties": {
                 "email": { "type": "string", "format": "email" },
-                "purpose": { "type": "string", "enum": ["verify", "recover"] },
+                "code": { "type": "string" },
             },
-            "required": ["email", "purpose"],
-        },
-        "TokenRequest": {
-            "type": "object",
-            "properties": { "token": { "type": "string" } },
-            "required": ["token"],
+            "required": ["email", "code"],
         },
         "LoginRequest": {
             "type": "object",
@@ -827,9 +818,13 @@ mod tests {
     }
 
     /// **The rule from the plan, as a test.** No credential is ever spent on a
-    /// `GET`: mail scanners and link-preview fetchers follow every URL in every
-    /// message, and a single-use `GET` is burned before the human ever clicks
-    /// it — a failure that looks exactly like an attack and is not.
+    /// `GET`: link-preview fetchers follow every URL in every message, and a
+    /// single-use `GET` is burned before the human ever clicks it — a failure
+    /// that looks exactly like an attack and is not.
+    ///
+    /// The product sends no mail any more, which narrows the list but does not
+    /// retire the rule: an invitation code now travels through Slack, a ticket,
+    /// or a chat window, and every one of those unfurls links too.
     ///
     /// Named endpoints rather than a pattern match, because the property is
     /// about these specific redemptions. Moving one to `GET`, or deleting it,
@@ -837,8 +832,7 @@ mod tests {
     #[test]
     fn every_single_use_redemption_is_a_post() {
         let redemptions = [
-            "/api/auth/verify",
-            "/api/auth/recover",
+            "/api/auth/signup/confirm",
             "/api/orgs/{org}/invites/accept",
             "/oauth/token",
         ];
@@ -859,16 +853,21 @@ mod tests {
         }
     }
 
-    /// The other half: the pages those links actually point at are not routes
-    /// here at all. `/verify` and `/recover` are console pages that render a
-    /// button; the server sees nothing until the button is pressed.
+    /// The other half: the page an invitation link points at is not a route
+    /// here at all. `/invite/{org}` is a console page that renders a button; the
+    /// server sees nothing until the button is pressed.
+    ///
+    /// `/verify` and `/recover` are listed too, and must stay absent for a
+    /// different reason — they are gone. There is no email, so there is nothing
+    /// to verify an address with and no recovery link to spend. Re-adding either
+    /// as a route means somebody has quietly reintroduced a mailer.
     #[test]
-    fn the_emailed_urls_are_pages_not_endpoints() {
-        for path in ["/verify", "/recover"] {
+    fn redeemable_urls_are_pages_not_endpoints() {
+        for path in ["/invite/{org}", "/verify", "/recover"] {
             assert!(
                 !catalog().iter().any(|e| e.path == path),
-                "{path} is the URL that goes in email. It must stay a client-side \
-                 page — mounting it as a handler is how a link gets spent by a scanner."
+                "{path} is a URL handed to a human. It must stay a client-side page — \
+                 mounting it as a handler is how a link gets spent by a link preview."
             );
         }
     }

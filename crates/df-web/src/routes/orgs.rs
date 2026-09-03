@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
-use crate::mail;
 use crate::session::{role_name, CurrentUser, OrgCtx};
 use crate::state::{client_ip, AppState};
 
@@ -83,12 +82,18 @@ pub async fn create_org(
     caller: CurrentUser,
     Json(req): Json<CreateOrgRequest>,
 ) -> ApiResult<Response> {
-    // An unverified address must not be able to claim an org slug — the slug is
-    // a public identifier, and squatting it costs nothing if anyone can type an
-    // address they do not own.
-    if caller.user.email_verified_at.is_none() {
+    // Claiming an org slug — a public identifier — must cost more than typing an
+    // address. There is no email verification to lean on, so the bar is a
+    // confirmed authenticator: the account has to be one somebody can actually
+    // sign back into.
+    //
+    // Very nearly redundant, since signup issues no session until enrollment is
+    // confirmed. Not quite: `login_recovery_code` opens a session, and an admin
+    // may have reset that member's credential, which leaves a signed-in account
+    // with nothing enrolled. This is the check that notices.
+    if !df_auth::totp::has_confirmed_credential(&state.db, caller.user.id).await? {
         return Err(ApiError::forbidden(
-            "confirm your email address before creating an organization",
+            "enrol an authenticator before creating an organization",
         ));
     }
 
@@ -308,6 +313,67 @@ pub async fn force_logout(
 
 // ---------------------------------------------------------------- invites
 
+/// `POST /api/orgs/{org}/members/{user}/reset-authenticator` — clear a member's
+/// second factor so they can enrol a new one.
+///
+/// **The only assisted way back into an account.** There is no emailed recovery
+/// link, so someone who has lost both their authenticator and their recovery
+/// codes has exactly one other route: an admin of an org they belong to.
+///
+/// That places a real trust boundary where an admin can be *made* to help, so
+/// the limits are deliberate:
+///
+/// - Admin-only, and an owner's credential may be reset only by an owner —
+///   the same ordering as `remove_member`, so an admin cannot reach through
+///   this endpoint what the role check refuses elsewhere.
+/// - It grants nothing. The credential is destroyed and **no session is
+///   opened**; the member must still complete enrollment themselves, from an
+///   authenticator only they hold. An admin who resets a colleague cannot
+///   thereby sign in as them.
+/// - Every live session of theirs dies with it, so a reset cannot be used to
+///   quietly leave an existing session running.
+///
+/// An org's last owner has nobody above them: their recovery codes are the end
+/// of the line, which is what the console says when it issues them.
+pub async fn reset_member_authenticator(
+    State(state): State<AppState>,
+    ctx: OrgCtx,
+    Path((_org, user)): Path<(String, Uuid)>,
+    parts: Parts,
+) -> ApiResult<Response> {
+    ctx.require_admin()?;
+    let target = UserId::from(user);
+
+    let current = state
+        .db
+        .member_role(ctx.org.id, target)
+        .await?
+        .ok_or_else(|| ApiError::not_found("that user is not a member of this org"))?;
+
+    if current == Role::Owner && target != ctx.user.id {
+        ctx.require_owner()?;
+    }
+
+    let ip = client_ip(&parts, &state.config);
+    df_auth::totp::reset(&state.db, target, ip.as_deref()).await?;
+
+    // Their sessions were opened by a credential that no longer exists.
+    // Leaving them live would mean a reset does not actually interrupt
+    // whoever is currently holding the account.
+    df_auth::sessions::revoke_all(&state.db, target).await?;
+
+    let mut tx = state.db.begin(ctx.org.id).await?;
+    tx.audit(
+        Entry::new(action::TOTP_RESET)
+            .actor(ctx.user.id)
+            .target("user", target.to_string()),
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(http::StatusCode::NO_CONTENT.into_response())
+}
+
 /// `GET /api/orgs/{org}/invites` — invitations still outstanding.
 pub async fn list_invites(
     State(state): State<AppState>,
@@ -320,18 +386,24 @@ pub async fn list_invites(
     Ok(Json(invites))
 }
 
-/// `POST /api/orgs/{org}/invites` — invite someone by email.
+/// `POST /api/orgs/{org}/invites` — invite someone by email address.
+///
+/// **The code comes back to the admin, who delivers it themselves.** dark-factory
+/// sends no mail, so there is no "we have emailed them" step and no window in
+/// which a live invitation exists that nobody received — the two failure modes
+/// the mailed version had to work around. How the code travels is the admin's
+/// business: Slack, a ticket, out loud across a desk. That is constraint 2 in
+/// `CLAUDE.md` — the server ships no opinion about the workflow around it.
 ///
 /// The token is generated here and stored only as a hash, like every other
-/// credential in the product; `df-core` never sees the plaintext.
+/// credential in the product; `df-core` never sees the plaintext. It is
+/// returned **once**, in this response. There is no endpoint that reads it
+/// back, because only the hash is kept — an admin who loses it re-invites,
+/// which supersedes the old one.
 ///
-/// **Write, commit, then send — and withdraw the invitation if the send
-/// fails.** No database transaction is held open across the call to a mail
-/// provider; the invitation is cleaned up afterwards instead. That ordering
-/// costs a brief window in which a live invitation exists that nobody has
-/// received, which is harmless — it is single-use, it expires, and a retry
-/// supersedes it — and it avoids pinning a pooled connection to whatever
-/// latency someone else's SMTP has today.
+/// The address is the account the invitation is *for*, and acceptance checks it
+/// (`Error::InviteWrongAccount`), so a leaked code is not a free seat: it is
+/// only redeemable by someone signed in as that address.
 pub async fn create_invite(
     State(state): State<AppState>,
     ctx: OrgCtx,
@@ -347,12 +419,6 @@ pub async fn create_invite(
     let token = df_auth::crypto::generate(df_auth::crypto::prefix::INVITE);
     let email = req.email.trim().to_string();
 
-    // Committed before the mail goes out, and the transaction is closed first.
-    // The tidy-looking alternative — hold it open and commit only after a
-    // successful send — would pin a pooled connection across an unbounded call
-    // to somebody else's SMTP provider, which is the same trade `watch` refuses
-    // in df-billing for the same reason: a handful of slow sends would exhaust
-    // the pool for every other request in the process.
     let mut tx = state.db.begin(ctx.org.id).await?;
     let invite = tx
         .create_invite(&email, req.role, Some(ctx.user.id), &token.hash)
@@ -366,50 +432,31 @@ pub async fn create_invite(
     .await?;
     tx.commit().await?;
 
-    let link = state.config.url(&format!(
-        "/invite/{}?token={}",
-        ctx.org.slug,
-        token.into_plaintext()
-    ));
-    let inviter = ctx
-        .user
-        .name
-        .clone()
-        .unwrap_or_else(|| ctx.user.email.clone());
+    let code = token.into_plaintext();
+    let link = state
+        .config
+        .url(&format!("/invite/{}?token={}", ctx.org.slug, code));
 
-    let delivery = state
-        .mailer
-        .send(mail::invitation(
-            &email,
-            &ctx.org.name,
-            &inviter,
-            role_name(req.role),
-            &link,
-        ))
-        .await;
+    Ok((
+        http::StatusCode::CREATED,
+        Json(CreatedInvite { invite, code, link }),
+    )
+        .into_response())
+}
 
-    if let Err(e) = delivery {
-        // Withdraw what nobody received. A live invitation whose link exists
-        // only in a lost SMTP response is worse than no invitation: it is
-        // invisible to the admin as a problem, and the "one live invite per
-        // address" rule means a retry would supersede it anyway. If this
-        // cleanup also fails the invite stays *visible* in the pending list,
-        // where an admin can withdraw it — so the fallback degrades to
-        // something a person can see and act on.
-        let mut tx = state.db.begin(ctx.org.id).await?;
-        if let Err(cleanup) = tx.revoke_invite(invite.id).await {
-            tracing::error!(
-                error = %cleanup,
-                invite = %invite.id,
-                "could not withdraw an invitation whose mail failed to send"
-            );
-        } else {
-            tx.commit().await?;
-        }
-        return Err(e.into());
-    }
-
-    Ok((http::StatusCode::CREATED, Json(invite)).into_response())
+/// An invitation, plus the one-time code — returned only from the call that
+/// mints it.
+///
+/// `code` and `link` are the same secret twice: the bare code for an admin
+/// reading it out or pasting it into chat, and a URL that drops the invitee on
+/// the console page which redeems it. Neither is recoverable afterwards.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedInvite {
+    #[serde(flatten)]
+    pub invite: df_core::invites::Invite,
+    pub code: String,
+    pub link: String,
 }
 
 /// `DELETE /api/orgs/{org}/invites/{id}` — withdraw an invitation.
@@ -431,10 +478,11 @@ pub async fn revoke_invite(
 /// points at a page that renders a button, and mail scanners that follow the
 /// link find a page rather than a spent invitation.
 ///
-/// Requires a session, and the session's *verified* address must match the one
-/// invited. Signing in is what proves the address; without that check a
-/// forwarded invitation mail is a way into someone else's org for whoever reads
-/// it first.
+/// Requires a session whose address matches the one invited. Signing in is what
+/// proves the address — a session exists only for an account holding a confirmed
+/// authenticator — so a forwarded code is not a way into someone else's org for
+/// whoever reads it first. This is what keeps a leaked invite code from being a
+/// free seat.
 pub async fn accept_invite(
     State(state): State<AppState>,
     caller: CurrentUser,
@@ -442,9 +490,9 @@ pub async fn accept_invite(
     parts: Parts,
     Json(req): Json<AcceptInviteRequest>,
 ) -> ApiResult<Json<Joined>> {
-    if caller.user.email_verified_at.is_none() {
+    if !df_auth::totp::has_confirmed_credential(&state.db, caller.user.id).await? {
         return Err(ApiError::forbidden(
-            "confirm your own email address before accepting an invitation",
+            "enrol an authenticator before accepting an invitation",
         ));
     }
 

@@ -156,17 +156,22 @@ why it lives here and not in `df-mcp`. Four conventions:
 - **The router and the OpenAPI document are built from one list.** Adding a route means
   adding it to `catalog.rs` with its summary and description; `router()` mounts the list and
   `openapi::document` renders it. A route not in the catalog is not reachable, on purpose.
-- **No credential is ever spent on a `GET`.** Mail scanners and link-preview fetchers follow
-  every URL in every message, so an emailed link points at a console *page* that renders a
-  button, and the button `POST`s the token. `every_single_use_redemption_is_a_post` asserts
+- **No credential is ever spent on a `GET`.** Link-preview fetchers follow every URL in
+  every message, so an invitation link points at a console *page* that renders a button, and
+  the button `POST`s the token. The product sends no mail, which narrows the list but does
+  not retire the rule — a code pasted into Slack gets unfurled just as eagerly. `every_single_use_redemption_is_a_post` asserts
   it. The session cookie's attributes — `HttpOnly`, `Secure`, `Path=/`, `SameSite=Lax`, and
   the `__Host-` prefix — are asserted for the same reason: losing one is a silent
   regression that no other test would notice. `Lax` specifically, because `Strict` would
   drop the cookie on the top-level navigation into `/oauth/authorize`.
 
-Mail delivery is the `Mailer` trait. `LogMailer` is the development implementation and is
-loud on purpose — a quiet no-op mailer looks identical to a working one until someone asks
-why nobody has joined.
+**There is no mailer, and adding one is a product decision, not a convenience.** Nothing in
+this product sends email: an authenticator app is the only factor, recovery codes are the
+only self-service way back in, an org admin clearing a member's credential
+(`reset_member_authenticator`) is the only assisted one, and invitations are codes the admin
+delivers themselves. `users.email` is a unique key and a label in the audit trail — never a
+destination. A `Mailer` trait reappearing here means somebody has reintroduced a dependency
+the design removed on purpose.
 
 The console API is read-only over the queue, and a unit test
 (`the_queue_is_read_only_over_the_console`) fails if a write ever appears under `/jobs`.
@@ -191,8 +196,8 @@ Four things hold, and the first explains the other three.
 - **The server's rules are mirrored, never re-implemented.** A `404` on an org renders as
   "no such organization" and never "you don't have access", because the API answers `404`
   for both cases on purpose. `OrgContext.isAdmin` hides buttons; `OrgCtx` is what refuses
-  them. Emailed links open *pages* that `POST` — `/verify`, `/recover`, `/invite/{org}` —
-  so a mail scanner following the URL burns nothing.
+  them. An invitation link opens a *page* that `POST`s — `/invite/{org}` — so a link
+  preview following the URL burns nothing.
 
 - **Nothing about the deployment is baked into the bundle.** The MCP endpoint and the
   grantable scopes are read from `/.well-known/oauth-protected-resource` at runtime. A
@@ -211,8 +216,8 @@ and that frame is where one org's data renders under another's heading.
 
 Org pages live under `/o/[org]`, not `/[org]`, so no org slug can collide with a page name.
 The paths the *server* names — `/login`, `/verify`, `/recover`, `/invite/{org}`,
-`/settings/billing` — are fixed by what goes in email and in `df-billing`'s upgrade prompt,
-and cannot be renamed here alone.
+`/settings/billing` — are fixed by what the server puts in an invitation link and in
+`df-billing`'s upgrade prompt, and cannot be renamed here alone.
 
 ## `df-server` — assembly, and the two things only it can get wrong
 
@@ -272,7 +277,9 @@ Two layers that must not be conflated:
   clients with incomplete OAuth support. Tokens are opaque and stored only as SHA-256
   hashes. A token's org is fixed at issuance and cannot be pivoted.
 - **Layer 2 — who the human is**: passwordless TOTP for individuals, enterprise OIDC
-  federation for orgs that bind an IdP. No password is ever accepted or stored.
+  federation for orgs that bind an IdP. No password is ever accepted or stored, and **no
+  email is ever sent** — signup hands back the enrollment directly and the account exists
+  the moment a code from it is accepted.
 
 Redirect URI matching is exact, with one carve-out: `http://127.0.0.1`, `http://[::1]` and
 `http://localhost` ignore the port (RFC 8252 §7.3) and match on everything else. Do not
@@ -281,8 +288,21 @@ once excluded on sound-sounding reasoning, and it silently removed the OAuth pat
 Code, which registers `http://localhost:<port>/callback`. `docs/clients/matrix.md` records
 what each client actually sends.
 
-TOTP without recovery is not shippable — recovery codes and the email magic link are part
-of the feature, not a follow-up.
+TOTP without recovery is not shippable, and with no email the recovery story is entirely
+in-band: **recovery codes** (issued at enrollment, shown once) and an **org admin clearing a
+member's credential**. Both are part of the feature, not a follow-up. The consequence to
+keep in view is that an org's last owner has nobody above them — their recovery codes are
+the end of the line, and the console says so when it issues them.
+
+**Signup is an account-enumeration oracle, deliberately.** The TOTP secret has to come back
+in signup's own response because there is no mailbox to send it to, and it must be refused
+for an address that already has a confirmed authenticator or typing someone's address would
+take over their account. No response shaping hides that difference. The constant-shape
+machinery that used to guard signup was removed rather than left in place looking like it
+still worked; `login_totp` and `login_recovery_code` remain indistinguishable across unknown
+address, disabled account, wrong code and replayed code, because those hand nothing back.
+`signup_refuses_an_address_that_already_has_an_authenticator` pins the tradeoff so it stays
+a decision somebody made.
 
 ## Metering
 

@@ -80,12 +80,7 @@ fn web_state(db: Db, config: &Config) -> Result<df_web::AppState> {
     let cipher = df_auth::crypto::Cipher::from_base64_key(&config.encryption_key)
         .context("DF_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
-    Ok(df_web::AppState::new(
-        db,
-        cipher,
-        Arc::new(df_web::LogMailer),
-        web_config(config),
-    ))
+    Ok(df_web::AppState::new(db, cipher, web_config(config)))
 }
 
 /// Every setting `df-web` takes from this deployment, in one place so it can be

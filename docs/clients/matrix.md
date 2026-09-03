@@ -25,8 +25,10 @@ run below is the milestone's "done means" criterion, executed rather than argued
 
 ## What was verified, in order
 
-1. **Sign-up through the console API**: signup → `LogMailer` link → verify → TOTP enrolment
-   (secret, recovery codes, confirmation) → create org `acme` → register repo `widget`.
+1. **Sign-up through the console API**: signup → TOTP enrolment (secret, recovery codes)
+   → confirm → create org `acme` → register repo `widget`. Verified before email was
+   removed from the product; the emailed verification step in between is now gone, and
+   signup returns the enrollment directly.
 2. **PAT path** on both clients: mint in the console, paste into the client's config, call
    tools.
 3. **OAuth path**: RFC 7591 dynamic registration, `/oauth/authorize` with PKCE S256 and an
