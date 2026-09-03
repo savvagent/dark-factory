@@ -288,7 +288,7 @@ UI) are recorded in `docs/plans/2026-09-03-df-trackers.md` and build on this fou
 
 ## Risks & Open Questions
 
-- The existing free-form `repos.tracker_binding` text column (Milestone 1) and the new
+- The existing free-form `repos.tracker_binding` `jsonb` column (Milestone 1) and the new
   structured `tracker_bindings` table now both describe "what tracker a repo maps to".
   Reconciling them (migrating the free-form column's data into the new table, or
   deprecating the column) is deferred to a later Milestone 2 task once the sync engine

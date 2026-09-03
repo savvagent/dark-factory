@@ -19,6 +19,12 @@ use crate::error::{Error, Result};
 use crate::ids::{OrgId, RepoId};
 
 const NONCE_BYTES: usize = 12;
+/// AES-256-GCM's authentication tag, which the `aes-gcm` crate appends to the
+/// ciphertext rather than returning separately. A combined blob shorter than
+/// `NONCE_BYTES + GCM_TAG_BYTES` cannot possibly be a real sealed value —
+/// there is no tag to authenticate against — so it is rejected while decoding
+/// the stored encoding, before any attempt to open it.
+const GCM_TAG_BYTES: usize = 16;
 const CONNECTION_COLS: &str = "id, org_id, provider, external_id, encrypted_credentials, \
                                encrypted_webhook_secret, created_at, updated_at";
 const BINDING_COLS: &str = "id, org_id, repo_id, connection_id, provider, external_ref, \
@@ -95,11 +101,18 @@ fn encode_sealed(sealed: &Sealed) -> Result<String> {
 }
 
 fn decode_sealed(encoded: &str) -> Result<Sealed> {
-    let combined = B64.decode(encoded).map_err(|_| {
-        Error::Crypto("failed to open secret — wrong key or tampered ciphertext".into())
-    })?;
-    if combined.len() < NONCE_BYTES {
-        return Err(Error::Crypto("stored nonce has the wrong length".into()));
+    // A base64 or length failure here is a corrupted *stored encoding*, not a
+    // failed decryption — `Cipher::open` hasn't been called yet, so the
+    // caller has not learned anything about the key or the ciphertext's
+    // authenticity. Say so distinctly; conflating the two would send an
+    // operator debugging a truncated column value chasing the wrong key.
+    let combined = B64
+        .decode(encoded)
+        .map_err(|_| Error::Crypto("stored sealed value is not valid base64".into()))?;
+    if combined.len() < NONCE_BYTES + GCM_TAG_BYTES {
+        return Err(Error::Crypto(
+            "stored sealed value is too short to contain a nonce and an authentication tag".into(),
+        ));
     }
     Ok(Sealed {
         nonce: combined[..NONCE_BYTES].to_vec(),

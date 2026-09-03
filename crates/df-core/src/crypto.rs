@@ -29,7 +29,11 @@ impl std::fmt::Debug for Cipher {
     }
 }
 
-/// Ciphertext plus the nonce it was sealed under. Stored as two columns.
+/// Ciphertext plus the nonce it was sealed under. Storage-agnostic on
+/// purpose: a caller is free to persist the two fields separately or combine
+/// them into one column — `df_core::trackers` does the latter, encoding
+/// `nonce || ciphertext` as base64 into a single TEXT column, because the new
+/// tracker tables have no reason to carry a second column for a 12-byte value.
 pub struct Sealed {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
