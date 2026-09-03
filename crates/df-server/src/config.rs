@@ -38,6 +38,20 @@ pub struct Config {
     pub encryption_key: String,
     pub totp_issuer: String,
 
+    /// GitHub App id for tracker integration. Optional because deployments
+    /// that do not enable GitHub integration have no App configured.
+    pub github_app_id: Option<i64>,
+    /// PEM-encoded GitHub App private key. Optional for the same reason as
+    /// `github_app_id`; PEM validity is checked later, when a task constructs
+    /// a `GithubAppClient` from it, rather than here where the key is just
+    /// configuration data. Literal `\n` escapes (how a multi-line PEM is
+    /// commonly stored in a single-line `.env` value or a CI secret) are
+    /// normalized to real newlines before storage.
+    pub github_app_private_key: Option<String>,
+    /// Shared secret for GitHub webhook signature verification. Optional
+    /// because GitHub integration itself is optional per deployment.
+    pub github_app_webhook_secret: Option<String>,
+
     /// See `df_web::Config::client_ip_header` — the header a trusted proxy
     /// writes the client address into, if any.
     pub client_ip_header: Option<String>,
@@ -105,6 +119,18 @@ impl Config {
 
             encryption_key: required("DF_ENCRYPTION_KEY")?,
             totp_issuer: optional("DF_TOTP_ISSUER").unwrap_or_else(|| "dark-factory".into()),
+            github_app_id: optional("DF_GITHUB_APP_ID")
+                .map(|value| {
+                    value.trim().parse::<i64>().with_context(|| {
+                        format!(
+                            "DF_GITHUB_APP_ID={value:?} is not valid; expected an integer App id"
+                        )
+                    })
+                })
+                .transpose()?,
+            github_app_private_key: optional("DF_GITHUB_APP_PRIVATE_KEY")
+                .map(normalize_pem_newlines),
+            github_app_webhook_secret: optional("DF_GITHUB_APP_WEBHOOK_SECRET"),
 
             client_ip_header: optional("DF_CLIENT_IP_HEADER")
                 .map(|v| v.trim().to_ascii_lowercase())
@@ -192,6 +218,13 @@ fn list(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Normalize a PEM value that arrived as a literal `\n`-escaped single line —
+/// the common shape for a multi-line secret stored in a `.env` file or a CI
+/// secret store that doesn't preserve real newlines.
+fn normalize_pem_newlines(value: String) -> String {
+    value.replace("\\n", "\n")
+}
+
 #[cfg(test)]
 impl Config {
     /// A complete, valid `Config` for tests.
@@ -207,6 +240,9 @@ impl Config {
             resource_uri: "https://factory.example.com/mcp".into(),
             encryption_key: "k".into(),
             totp_issuer: "dark-factory".into(),
+            github_app_id: None,
+            github_app_private_key: None,
+            github_app_webhook_secret: None,
             client_ip_header: None,
             enforce_quotas: false,
             upgrade_url: "https://factory.example.com/settings/billing".into(),
@@ -255,6 +291,22 @@ mod tests {
     #[test]
     fn a_list_treats_absent_empty_and_whitespace_alike() {
         assert!(list("DF_TEST_ABSENT_LIST_XYZ").is_empty());
+    }
+
+    #[test]
+    fn a_pem_with_literal_newline_escapes_is_normalized() {
+        assert_eq!(
+            normalize_pem_newlines(
+                "-----BEGIN RSA PRIVATE KEY-----\\nabc\\n-----END RSA PRIVATE KEY-----".into()
+            ),
+            "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"
+        );
+    }
+
+    #[test]
+    fn a_pem_with_real_newlines_already_is_left_unchanged() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----";
+        assert_eq!(normalize_pem_newlines(pem.into()), pem);
     }
 
     #[test]
