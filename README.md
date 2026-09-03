@@ -37,8 +37,10 @@ Build order: [`docs/plans/2026-09-01-milestone-1.md`](docs/plans/2026-09-01-mile
 
 ## Status
 
-Milestone 1, tasks 2–11 and 13 of 13 complete. `df-server` binds a port and serves every
-surface on it; what remains is task 12, the client conformance run.
+Milestone 1, tasks 2–12 of 13 complete. `df-server` binds a port and serves every surface
+on it, and two real coding agents have coordinated on one queue through it — see
+[`docs/clients/matrix.md`](docs/clients/matrix.md). What remains is the first live deploy
+(task 13) and CI (task 1).
 
 | Crate | State |
 |---|---|

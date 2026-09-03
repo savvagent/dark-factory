@@ -61,11 +61,22 @@
     })();
   });
 
+  // Not $state: it identifies a request, it is never rendered, and making it
+  // reactive would retrigger the effect that writes it.
+  let latest = 0;
+
   $effect(() => {
     const slug = org.slug;
     // Read inside the effect so each becomes a dependency.
     const filters = { status, repo, team, mine, limit: 200 };
     if (!slug) return;
+
+    // Every dependency of this effect — the org *and* each filter — starts a new
+    // request, so staleness is decided by sequence rather than by comparing the
+    // org alone. Two quick filter changes otherwise race, and the first
+    // response can land after the second and repaint the table with rows that
+    // do not match the controls the reader is looking at.
+    const seq = ++latest;
 
     loading = true;
     error = undefined;
@@ -73,16 +84,17 @@
     void (async () => {
       try {
         const found = await api.jobs(slug, filters);
-        if (org.slug !== slug) return;
+        if (seq !== latest) return;
         jobs = found;
       } catch (e) {
+        if (seq !== latest) return;
         // An unregistered repo or team slug is a 404 naming what *is*
         // registered — better than an empty table, which reads as a quiet
         // queue rather than as a question nobody asked.
         error = e instanceof ApiError ? e.message : 'Could not load the queue.';
         jobs = [];
       } finally {
-        loading = false;
+        if (seq === latest) loading = false;
       }
     })();
   });

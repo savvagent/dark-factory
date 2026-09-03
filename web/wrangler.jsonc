@@ -4,7 +4,10 @@
   // for the account-side setup this file cannot express, and worker/index.ts for
   // why it is a proxy rather than a second origin.
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "dark-factory-console",
+  // The default config is the development one, and it is named as such: a
+  // bare `wrangler deploy` should never be able to land on the Worker the
+  // console actually runs on. Production is a named environment below.
+  "name": "dark-factory-console-dev",
   "main": "worker/index.ts",
   "compatibility_date": "2026-09-02",
 
@@ -35,10 +38,28 @@
   },
 
   "vars": {
-    // Where df-server listens. Not a secret — a hostname — and deliberately not
-    // a default that could point at production from a staging build. Override
-    // per environment: `wrangler deploy --var DF_ORIGIN:https://…`.
-    "DF_ORIGIN": "https://dark-factory.fly.dev"
+    // Where df-server listens. Not a secret — a hostname.
+    //
+    // The default is the local origin on purpose. A deploy that forgets to name
+    // an environment then proxies to somewhere that is not listening and fails
+    // loudly, which is the failure everyone wants; the same slot holding a
+    // production hostname would mean a staging Worker silently serving real
+    // user traffic from production, and nothing about it would look wrong.
+    "DF_ORIGIN": "http://127.0.0.1:8080"
+  },
+
+  // Production is named, never inherited: `wrangler deploy --env production`.
+  //
+  // `name` is stated here because wrangler otherwise derives it by suffixing the
+  // top-level one, and a deploy that silently created `dark-factory-console-dev-production`
+  // would look successful while serving nobody.
+  "env": {
+    "production": {
+      "name": "dark-factory-console",
+      "vars": {
+        "DF_ORIGIN": "https://dark-factory-mcp.fly.dev"
+      }
+    }
   },
 
   "observability": {

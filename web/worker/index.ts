@@ -39,14 +39,14 @@ const ORIGIN_PREFIXES = ['/api', '/oauth', '/mcp', '/.well-known', '/healthz', '
  * belongs to the console, and `/mcp-guide` is a page. Sending either to the
  * origin would answer a JSON `404` for a route the SPA was going to render.
  */
-function belongsToOrigin(path: string): boolean {
+export function belongsToOrigin(path: string): boolean {
   return ORIGIN_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
 }
 
 export interface Env {
   /** The built `web/build` bundle, uploaded with the Worker. */
   ASSETS: Fetcher;
-  /** Where `df-server` actually listens, e.g. `https://dark-factory.fly.dev`. */
+  /** Where `df-server` actually listens, e.g. `https://dark-factory-mcp.fly.dev`. */
   DF_ORIGIN: string;
 }
 
@@ -59,6 +59,21 @@ export default {
       // into `index.html`, which is what makes a hard refresh of
       // `/o/acme/queue` work.
       return env.ASSETS.fetch(request);
+    }
+
+    if (!env.DF_ORIGIN) {
+      // Loud, and in the one place it can be seen. Without this the failure is
+      // a URL constructor throwing inside a proxy hop, which reaches the caller
+      // as a bare 500 with nothing naming the cause.
+      return new Response(
+        JSON.stringify({
+          error: 'misconfigured',
+          error_description:
+            'this Worker has no DF_ORIGIN, so it does not know where df-server is. ' +
+            'Deploy with --env production, or pass --var DF_ORIGIN:https://…'
+        }),
+        { status: 500, headers: { 'content-type': 'application/json' } }
+      );
     }
 
     const target = new URL(url.pathname + url.search, env.DF_ORIGIN);

@@ -26,6 +26,19 @@
   const percent = $derived(Math.round(fraction * 100));
   const width = $derived(Math.min(100, Math.max(0, percent)));
   const tone = $derived(fraction >= 1 ? 'bg-bad' : usage.warning ? 'bg-warn' : 'bg-accent');
+
+  // An org over its bucket has `billableUsed > includedOps`, and `aria-valuenow`
+  // above `aria-valuemax` is invalid ARIA — assistive tech may clamp it, report
+  // it as the maximum, or ignore the meter. Clamp the machine-readable value and
+  // put the real one in `aria-valuetext`, so going over is still announced
+  // rather than rounded away. The caption and the percentage stay unclamped:
+  // somebody over their allowance needs to see by how much.
+  const ariaRange = $derived({
+    'aria-valuenow': Math.min(usage.billableUsed, usage.includedOps),
+    'aria-valuemin': 0,
+    'aria-valuemax': usage.includedOps,
+    'aria-valuetext': `${usage.billableUsed.toLocaleString()} of ${usage.includedOps.toLocaleString()} billable operations (${percent}%)`
+  });
 </script>
 
 <div>
@@ -39,9 +52,7 @@
   <div
     class="mt-1.5 h-2 overflow-hidden rounded-full bg-raised"
     role="meter"
-    aria-valuenow={usage.billableUsed}
-    aria-valuemin={0}
-    aria-valuemax={usage.includedOps}
+    {...ariaRange}
     aria-label="Billable operations used this period"
   >
     <div class="h-full rounded-full transition-all {tone}" style="width: {width}%"></div>

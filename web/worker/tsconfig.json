@@ -16,5 +16,5 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["index.ts"]
+  "include": ["index.ts", "index.test.ts"]
 }

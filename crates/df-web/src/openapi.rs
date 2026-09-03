@@ -474,7 +474,12 @@ fn queue_schemas() -> Value {
                 "ticketRef": { "type": ["string", "null"], "examples": ["ACME-17"] },
                 "tracker": { "type": ["string", "null"], "enum": ["jira", "github", null] },
                 "agentType": { "type": ["string", "null"] },
-                "metadata": { "type": "object" },
+                // Deliberately unconstrained. The column is JSONB and the server
+                // never reads it, so anything a client can serialise is a legal
+                // value — `{"type": "object"}` would promise a shape nothing
+                // enforces, and generated clients would then reject their own
+                // data. `true` is JSON Schema's "any value".
+                "metadata": true,
                 "createdAt": timestamp,
                 "startedAt": { "type": ["string", "null"], "format": "date-time" },
                 "completedAt": { "type": ["string", "null"], "format": "date-time" },

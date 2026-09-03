@@ -34,12 +34,19 @@ Cloudflare in any meaningful sense, which is what the issue asked for.
 
 ```bash
 cd web
-npm run build          # adapter-static → web/build
-npx wrangler deploy    # or: npm run deploy, which does both
+npm run build                          # adapter-static → web/build
+npx wrangler deploy --env production   # or: npm run deploy, which does both
 ```
 
-`DF_ORIGIN` in `wrangler.jsonc` names the `df-server` deployment. Override it per
-environment rather than editing the file:
+**Naming the environment is load-bearing.** The default configuration is the development
+one: a different Worker (`dark-factory-console-dev`) whose `DF_ORIGIN` is
+`http://127.0.0.1:8080`. A bare `wrangler deploy` therefore cannot overwrite the Worker the
+console runs on, and cannot silently point a staging build at production — it deploys
+something that proxies to an origin nobody is running, which fails immediately and visibly.
+`--env production` is the only path to the real hostname.
+
+Another environment is a block in `wrangler.jsonc` beside `production`, or a one-off
+override:
 
 ```bash
 npx wrangler deploy --var DF_ORIGIN:https://dark-factory-staging.fly.dev
@@ -56,7 +63,7 @@ Three environment variables on `df-server`, and none of them is optional.
 | Variable | Value | Why |
 |---|---|---|
 | `DF_PUBLIC_URL` | `https://console.example.com` | The Worker's hostname, never the origin's. Every emailed link, the OAuth issuer, and both discovery documents are built from it. Point it at the origin and the console tells agents to connect to a host the browser never uses. |
-| `DF_ALLOWED_HOSTS` | the origin's hostname, e.g. `dark-factory.fly.dev` | **See the trap below.** Without it every authenticated MCP call fails. |
+| `DF_ALLOWED_HOSTS` | the origin's hostname, e.g. `dark-factory-mcp.fly.dev` | **See the trap below.** Without it every authenticated MCP call fails. |
 | `DF_CLIENT_IP_HEADER` | `cf-connecting-ip` | Cloudflare overwrites this header inbound. `fly-client-ip` would now hold a Cloudflare edge address, and every per-IP throttle would count all of Cloudflare as one caller. |
 
 `DF_RESOURCE_URI` defaults to `$DF_PUBLIC_URL/mcp` and needs nothing.
@@ -64,7 +71,7 @@ Three environment variables on `df-server`, and none of them is optional.
 ### Trap 1 — `DF_ALLOWED_HOSTS`, or the MCP endpoint refuses every call
 
 A Worker cannot set the `Host` header on a subrequest; it is derived from the URL being
-fetched, so the origin sees `Host: dark-factory.fly.dev` while `DF_PUBLIC_URL` says
+fetched, so the origin sees `Host: dark-factory-mcp.fly.dev` while `DF_PUBLIC_URL` says
 `console.example.com`. `rmcp` validates that header — the check exists because a hosted MCP
 server that answers to any `Host` is DNS-rebindable — and rejects the mismatch:
 
@@ -157,3 +164,6 @@ them on Cloudflare's network without the Worker being involved in the response b
   (milestone 1, task 1).
 - The Worker's copy of the bundle and the copy inside the `df-server` image are deployed
   separately, so they can drift. Whoever wires up CI should deploy both from one commit.
+- `worker/index.test.ts` asserts the Worker's prefix rule against the same cases the Rust
+  side asserts, but nothing mechanically ties the two lists together. A third copy would
+  need the same treatment.

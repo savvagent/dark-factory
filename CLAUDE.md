@@ -62,8 +62,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 
 cd web && npm install
-npm run check                 # svelte-check, strict — the console's `cargo test`
+npm run check                 # svelte-check + tsc over worker/ — the console's `cargo test`
 npm run lint                  # prettier --check — the console's `cargo fmt --check`
+npm test                      # vitest — the Cloudflare Worker's routing rule
 npm run build                 # static bundle into web/build
 
 cargo run -p df-server        # everything on one port, reading .env

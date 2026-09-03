@@ -205,6 +205,34 @@ fn list(name: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+impl Config {
+    /// A complete, valid `Config` for tests.
+    ///
+    /// One fixture rather than a literal per test: a new field then fails to
+    /// compile here once, instead of being quietly defaulted in every test that
+    /// happens to build a `Config` by hand.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            database_url: "postgres://x".into(),
+            bind: "0.0.0.0:8080".parse().expect("test bind"),
+            public_url: "https://factory.example.com".into(),
+            resource_uri: "https://factory.example.com/mcp".into(),
+            encryption_key: "k".into(),
+            totp_issuer: "dark-factory".into(),
+            client_ip_header: None,
+            enforce_quotas: false,
+            upgrade_url: "https://factory.example.com/settings/billing".into(),
+            allow_log_mailer: true,
+            extra_allowed_hosts: vec![],
+            allowed_origins: vec![],
+            static_dir: "web/build".into(),
+            run_migrations: true,
+            log_format: LogFormat::Text,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -244,23 +272,8 @@ mod tests {
 
     #[test]
     fn allowed_hosts_always_contain_the_public_origins_host() {
-        let config = Config {
-            database_url: "postgres://x".into(),
-            bind: "0.0.0.0:8080".parse().unwrap(),
-            public_url: "https://factory.example.com".into(),
-            resource_uri: "https://factory.example.com/mcp".into(),
-            encryption_key: "k".into(),
-            totp_issuer: "dark-factory".into(),
-            client_ip_header: None,
-            enforce_quotas: false,
-            upgrade_url: "https://factory.example.com/settings/billing".into(),
-            allow_log_mailer: true,
-            extra_allowed_hosts: vec!["dark-factory.fly.dev".into()],
-            allowed_origins: vec![],
-            static_dir: "web/build".into(),
-            run_migrations: true,
-            log_format: LogFormat::Text,
-        };
+        let mut config = Config::for_test();
+        config.extra_allowed_hosts = vec!["dark-factory.fly.dev".into()];
 
         assert_eq!(
             config.allowed_hosts(),

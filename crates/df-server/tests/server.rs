@@ -111,7 +111,7 @@ async fn the_whole_router_assembles(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let watcher = Watcher::spawn(pool).await.unwrap();
 
-    let _app = df_server::router(db, watcher.clone(), &config("web/build"));
+    let _app = df_server::router(db, watcher.clone(), &config("web/build")).expect("router");
 
     watcher.shutdown().await;
 }
@@ -123,7 +123,7 @@ async fn the_whole_router_assembles(pool: PgPool) {
 async fn discovery_is_open_and_answers_on_one_origin(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let watcher = Watcher::spawn(pool).await.unwrap();
-    let app = df_server::router(db, watcher.clone(), &config("web/build"));
+    let app = df_server::router(db, watcher.clone(), &config("web/build")).expect("router");
 
     let resource = get(app.clone(), "/.well-known/oauth-protected-resource").await;
     assert_eq!(resource.status(), http::StatusCode::OK);
@@ -146,7 +146,7 @@ async fn discovery_is_open_and_answers_on_one_origin(pool: PgPool) {
 async fn the_mcp_endpoint_points_an_unauthenticated_caller_at_this_origin(pool: PgPool) {
     let db = Db::from_pool(pool.clone());
     let watcher = Watcher::spawn(pool).await.unwrap();
-    let app = df_server::router(db, watcher.clone(), &config("web/build"));
+    let app = df_server::router(db, watcher.clone(), &config("web/build")).expect("router");
 
     let response = app
         .clone()
@@ -228,7 +228,7 @@ async fn the_console_fallback_stops_at_the_api(pool: PgPool) {
     let bundle = Bundle::new("spa");
     let db = Db::from_pool(pool.clone());
     let watcher = Watcher::spawn(pool).await.unwrap();
-    let app = df_server::router(db, watcher.clone(), &config(bundle.path()));
+    let app = df_server::router(db, watcher.clone(), &config(bundle.path())).expect("router");
 
     // A console route the server has never heard of renders the app.
     let deep_link = get(app.clone(), "/o/acme/queue").await;

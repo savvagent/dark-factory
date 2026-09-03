@@ -77,6 +77,21 @@ pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
         return false;
     }
 
+    // Neither a fragment nor userinfo may be smuggled through this branch. The
+    // exact-equality test above catches both on any other URI, but the
+    // comparison below comes down to scheme, host, path and query, so without
+    // this `http://localhost:1/cb#x` and `http://evil.com@localhost:1/cb` would
+    // each match a plain registration. Neither changes where the browser
+    // actually delivers the code — it dispatches on host — but a fragment does
+    // silently break delivery, because `?code=…` appended after a `#` is never
+    // sent to the server at all, and the agent waits forever for a code that was
+    // issued. Refusing the match turns that into an error the caller can read.
+    let clean =
+        |u: &url::Url| u.fragment().is_none() && u.username().is_empty() && u.password().is_none();
+    if !clean(&reg) || !clean(&req) {
+        return false;
+    }
+
     reg.scheme() == req.scheme()
         && reg.host_str() == req.host_str()
         && reg.path() == req.path()
@@ -112,6 +127,16 @@ fn validate_registerable_redirect(uri: &str) -> Result<()> {
     if parsed.scheme() == "http" && !is_loopback_redirect(&parsed) {
         return Err(AuthError::InvalidRequest(
             "redirect_uri must use https, except for http on 127.0.0.1, [::1] or localhost".into(),
+        ));
+    }
+
+    // Credentials in a redirect URI are never part of where the code lands, and
+    // a client registering them has either misunderstood the field or is trying
+    // to make two different-looking URIs compare equal. Refused for the same
+    // reason as the fragment above: say so now rather than at match time.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AuthError::InvalidRequest(
+            "redirect_uri must not contain a username or password".into(),
         ));
     }
 
@@ -678,6 +703,39 @@ mod tests {
             reg,
             "https://localhost:3118/callback"
         ));
+    }
+
+    /// The loopback branch compares scheme, host, path and query — so anything
+    /// it does *not* compare has to be refused outright, or it becomes a way to
+    /// make two different URIs match.
+    #[test]
+    fn the_loopback_branch_refuses_what_it_does_not_compare() {
+        let reg = "http://localhost:3118/callback";
+
+        // A fragment: the browser keeps it, so `?code=…` appended afterwards is
+        // never sent and the client waits for a code it will never see.
+        assert!(!redirect_uri_matches(
+            reg,
+            "http://localhost:49152/callback#x"
+        ));
+        assert!(!redirect_uri_matches(
+            "http://127.0.0.1:1/cb#x",
+            "http://127.0.0.1:2/cb"
+        ));
+
+        // Userinfo: not where the code lands, and not compared below.
+        assert!(!redirect_uri_matches(
+            reg,
+            "http://evil.com@localhost:49152/callback"
+        ));
+        assert!(!redirect_uri_matches(
+            reg,
+            "http://user:pw@localhost:49152/callback"
+        ));
+
+        // And neither may be registered in the first place.
+        assert!(validate_registerable_redirect("http://evil.com@localhost:3118/cb").is_err());
+        assert!(validate_registerable_redirect("https://user:pw@app.example.com/cb").is_err());
     }
 
     #[test]

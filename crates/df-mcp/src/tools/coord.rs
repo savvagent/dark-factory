@@ -446,7 +446,17 @@ impl Factory {
                 Outcome::Changed => out::WatchOutcome::Changed,
                 Outcome::Timeout => out::WatchOutcome::Timeout,
             },
-            waited_seconds: started.elapsed().as_secs(),
+            waited_seconds: match outcome {
+                // Measured, because a wake-up can happen at any point and the
+                // caller needs the real number to pace itself.
+                Outcome::Changed => started.elapsed().as_secs(),
+                // The budget, not the measurement. A timeout waited the whole
+                // allowance by definition, and `as_secs()` truncates — 29.998s
+                // would be reported as 29 and read as "there is a second of
+                // headroom left", which is how a polling loop drifts faster
+                // than it was told to.
+                Outcome::Timeout => secs,
+            },
         }))
     }
 }

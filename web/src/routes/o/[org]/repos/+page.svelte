@@ -42,10 +42,18 @@
   let creating = $state(false);
   let formError = $state<string | undefined>(undefined);
 
+  // Not $state: it identifies a request and is never rendered.
+  let latest = 0;
+
   $effect(() => {
     const org_ = org.slug;
     const withInactive = includeInactive;
     if (!org_) return;
+
+    // Sequence rather than an org comparison, because the include-inactive
+    // toggle is a dependency too: flipped twice quickly, the first response can
+    // land after the second and show the list the toggle no longer asks for.
+    const seq = ++latest;
 
     loading = true;
     error = undefined;
@@ -53,13 +61,14 @@
     void (async () => {
       try {
         const [r, t] = await Promise.all([api.repos(org_, withInactive), api.teams(org_)]);
-        if (org.slug !== org_) return;
+        if (seq !== latest) return;
         repos = r;
         teams = t;
       } catch (e) {
+        if (seq !== latest) return;
         error = e instanceof ApiError ? e.message : 'Could not load repos.';
       } finally {
-        loading = false;
+        if (seq === latest) loading = false;
       }
     })();
   });

@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let app = router(db, watcher.clone(), &config);
+    let app = router(db, watcher.clone(), &config)?;
 
     let listener = TcpListener::bind(config.bind)
         .await

@@ -11,8 +11,9 @@ npm install
 npm run dev      # Vite on :5173, proxying /api /oauth /.well-known to DF_API_ORIGIN
 npm run check    # svelte-check + tsc over worker/ — the type gate
 npm run lint     # prettier --check
+npm test         # vitest — the Worker's routing rule, which mirrors the server's
 npm run build    # static bundle in build/
-npm run deploy   # build, then wrangler deploy — see docs/deploy/cloudflare.md
+npm run deploy   # build, then deploy the production Worker — docs/deploy/cloudflare.md
 ```
 
 `npm run dev` needs a server behind it. Set `DF_API_ORIGIN` if it is not on
@@ -88,10 +89,17 @@ with a page name. The routes the _server_ names — `/login`, `/verify`, `/recov
 SPA from its own network and the Worker forwards `/api`, `/oauth`, `/.well-known`, `/mcp`,
 `/healthz` and `/readyz` to `df-server`.
 
+**It deploys `--env production`, and that is not a formality.** The default configuration
+names a _different_ Worker (`dark-factory-console-dev`) pointing at `http://127.0.0.1:8080`,
+so a bare `wrangler deploy` cannot land on the Worker the console actually runs on, and a
+deploy that forgets which environment it is in proxies to something that is not listening
+rather than quietly serving production traffic.
+
 It proxies rather than redirecting for the same reason the app is a SPA at all — the
 `__Host-` cookie is bound to one origin, so the API cannot live on a second hostname. The
 prefix list in `worker/index.ts` mirrors `API_PREFIXES` in `crates/df-server/src/lib.rs` and
-must not drift from it.
+must not drift from it — `worker/index.test.ts` is the half of that check which lives here,
+and `api_prefixes_do_not_match_by_string_prefix_alone` is the other half.
 
 Two things on the `df-server` side are not optional and are easy to miss:
 `DF_ALLOWED_HOSTS` must name the origin's own hostname, or every authenticated MCP call

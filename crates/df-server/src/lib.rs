@@ -24,6 +24,7 @@ pub mod health;
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -52,12 +53,18 @@ fn is_api_path(path: &str) -> bool {
 }
 
 /// Build the whole application.
-pub fn router(db: Db, watcher: Arc<Watcher>, config: &Config) -> Router {
-    let web = df_web::router(web_state(db.clone(), config));
+///
+/// Fallible because the encryption key is only a `String` until something tries
+/// to use it. `Config::from_env` cannot prove the key parses without building a
+/// `Cipher`, and a `Config` assembled by hand — a test, a future binary — need
+/// not have come from the environment at all. Returning the error keeps this
+/// crate's rule that a bad value is a named failure and never a panic.
+pub fn router(db: Db, watcher: Arc<Watcher>, config: &Config) -> Result<Router> {
+    let web = df_web::router(web_state(db.clone(), config)?);
 
     let mcp = df_mcp::mcp_endpoint(db.clone(), watcher, mcp_config(config));
 
-    health::router(db)
+    Ok(health::router(db)
         .merge(web)
         .merge(mcp)
         .fallback_service(console(config))
@@ -65,22 +72,39 @@ pub fn router(db: Db, watcher: Arc<Watcher>, config: &Config) -> Router {
         // would put `Authorization` and `Cookie` into the logs — every bearer
         // token and every session cookie, in plaintext, in whatever the log
         // aggregator retains. Do not turn it on.
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http()))
 }
 
 /// `df-web`'s state, with the settings that are this deployment's to decide.
-fn web_state(db: Db, config: &Config) -> df_web::AppState {
-    let mut web_config = df_web::Config::new(&config.public_url, &config.resource_uri);
-    web_config.totp_issuer = config.totp_issuer.clone();
-    web_config.client_ip_header = config.client_ip_header.clone();
+fn web_state(db: Db, config: &Config) -> Result<df_web::AppState> {
+    let cipher = df_auth::crypto::Cipher::from_base64_key(&config.encryption_key)
+        .context("DF_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
-    df_web::AppState::new(
+    Ok(df_web::AppState::new(
         db,
-        df_auth::crypto::Cipher::from_base64_key(&config.encryption_key)
-            .expect("DF_ENCRYPTION_KEY was validated at startup"),
+        cipher,
         Arc::new(df_web::LogMailer),
-        web_config,
-    )
+        web_config(config),
+    ))
+}
+
+/// Every setting `df-web` takes from this deployment, in one place so it can be
+/// tested without a database.
+///
+/// Split out because the failure mode is silence: a field added to
+/// `df_web::Config` that nothing here assigns keeps its `Default`, and the
+/// console then reports that default as fact. `enforce_quotas` reached exactly
+/// that state once already — see `every_deployment_setting_reaches_df_web`.
+fn web_config(config: &Config) -> df_web::Config {
+    let mut web = df_web::Config::new(&config.public_url, &config.resource_uri);
+    web.totp_issuer = config.totp_issuer.clone();
+    web.client_ip_header = config.client_ip_header.clone();
+    // The console reports this as `enforced` on the usage endpoint. It has to be
+    // the same value `df-mcp` is refusing calls with, or a customer whose agent
+    // just got `quota_exceeded` reads their own dashboard and is told nothing is
+    // being enforced.
+    web.enforce_quotas = config.enforce_quotas;
+    web
 }
 
 fn mcp_config(config: &Config) -> df_mcp::Config {
@@ -138,6 +162,30 @@ fn not_found(path: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A setting that `df-server` reads but never passes on is invisible: the
+    /// console reports `df_web::Config`'s default and calls it fact. This is not
+    /// hypothetical — `enforce_quotas` survived a merge on one side of the tree
+    /// and was never assigned on the other, so an org whose agents were being
+    /// refused would have been shown `enforced: false`.
+    #[test]
+    fn every_deployment_setting_reaches_df_web() {
+        let mut config = Config::for_test();
+        config.totp_issuer = "acme-factory".into();
+        config.client_ip_header = Some("cf-connecting-ip".into());
+        config.enforce_quotas = true;
+
+        let web = web_config(&config);
+
+        assert_eq!(web.totp_issuer, "acme-factory");
+        assert_eq!(web.client_ip_header.as_deref(), Some("cf-connecting-ip"));
+        assert!(
+            web.enforce_quotas,
+            "df-web was left with the default while df-mcp refuses billable calls"
+        );
+        assert_eq!(web.public_url, config.public_url);
+        assert_eq!(web.resource_uri, config.resource_uri);
+    }
 
     #[test]
     fn api_prefixes_do_not_match_by_string_prefix_alone() {
