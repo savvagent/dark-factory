@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch/PR should cancel the run already in
+# flight rather than queue behind it — nobody wants CI results for a commit
+# they've already superseded.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Mirrors the hand-run gate exactly: fmt --check, clippy -D warnings, then
+  # cargo test. All three ran by hand against the same checkout, so they stay
+  # one job rather than three — a fmt failure should still let clippy and
+  # test report their own results in the same log.
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      # Same image, user, db name and port-mapping rationale as compose.yaml:
+      # `cargo test` runs `#[sqlx::test]` against a real Postgres, no mocks.
+      # The service account is a superuser, matching local `podman compose`,
+      # which is what lets 0007_rls.sql's `CREATE ROLE df_app` succeed and
+      # exercise the explicit `SET LOCAL ROLE` guard the isolation tests pin.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: factory
+          POSTGRES_PASSWORD: factory
+          POSTGRES_DB: dark_factory
+        ports:
+          - 15433:5432
+        options: >-
+          --health-cmd "pg_isready -U factory -d dark_factory"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://factory:factory@localhost:15433/dark_factory
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  # Mirrors web/README's three commands: check (svelte-check + tsc over
+  # worker/), lint (prettier --check), test (vitest). No build here — the
+  # build step has no gate of its own beyond these three, and df-server's own
+  # startup requires `web/` to be built first, not CI.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run check
+
+      - run: npm run lint
+
+      - run: npm test
