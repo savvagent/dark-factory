@@ -6,3 +6,5 @@ web/.svelte-kit
 web/.wrangler
 web/build
 *.log
+# Feature worktrees live inside the repo; never stage their contents.
+.worktrees/
