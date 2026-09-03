@@ -169,21 +169,41 @@ A passkey is cryptographically bound to the WebAuthn **relying party id**, which
 refuses to boot on a mismatch rather than failing at somebody's first sign-in).
 
 **Changing that host invalidates every passkey ever registered.** Nothing can soften it;
-that is what binding a credential to an origin means. Today the app answers on
-`dark-factory-mcp.fly.dev`, so that is the rp_id. Moving the console to a custom domain or
-to the Cloudflare Worker hostname in [issue #2](https://github.com/savvagent/dark-factory/issues/2)
-means every user re-registers — worth settling *before* anyone but you has an account.
+that is what binding a credential to an origin means. This is exactly why the hostname
+below was settled before the first account existed, and why moving the console behind the
+Cloudflare Worker in [issue #2](https://github.com/savvagent/dark-factory/issues/2) is
+designed to keep `DF_PUBLIC_URL` unchanged rather than to swap it for a new one.
 
 Note also that account creation now requires a browser: there is no scripted signup, so
 `docs/clients/matrix.md`'s conformance sequence needs a real browser or a virtual
 authenticator for its first step.
 
-Confirming `DF_PUBLIC_URL` / `DF_RESOURCE_URI` in `fly.toml` against the final
-hostname (Fly default `https://dark-factory-mcp.fly.dev` or a custom domain) and
-running the first live `fly deploy` are still pending a deliberate go — deploying
-spends real infrastructure and secrets already staged for this app.
+## The hostname, and why it was settled early
 
-Once that decision is made, first deploy is:
+The public hostname is **`df.savvagent.com`**, and the app answers on
+`dark-factory-mcp.fly.dev` without advertising it. DNS is at Namecheap:
+
+```
+A     df.savvagent.com  →  66.241.124.226            (Fly shared IPv4)
+AAAA  df.savvagent.com  →  2a09:8280:1::181:a2ef:0   (this app's dedicated IPv6)
+```
+
+`fly certs add df.savvagent.com` issues and renews the certificate; nothing else
+in DNS is needed, because the dedicated IPv6 is what Fly validates ownership
+against.
+
+**This was decided before the first account existed, on purpose.** `DF_PUBLIC_URL`
+is the OAuth issuer, the token audience, and both discovery documents — and, as the
+section above lays out, it is also the WebAuthn relying party id that every passkey is
+cryptographically bound to. Doing it while the database held zero users cost nothing.
+
+A later move behind a Cloudflare Worker keeps this same hostname: a Worker custom
+domain serves `df.savvagent.com` directly and proxies to the Fly app, so
+`DF_ORIGIN` becomes `dark-factory-mcp.fly.dev` and `DF_PUBLIC_URL` does not
+change. See `cloudflare.md`, whose `DF_ALLOWED_HOSTS` trap is exactly about that
+split.
+
+Deploying is:
 
 ```bash
 fly deploy -a dark-factory-mcp
