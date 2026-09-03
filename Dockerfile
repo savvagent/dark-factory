@@ -1,51 +1,67 @@
 # syntax=docker/dockerfile:1
-#
-# Builds the single df-server binary that mounts every HTTP surface on one
-# port (see CLAUDE.md). No sqlx offline cache exists yet (no query!/query_as!
-# macros are in use), so this build needs no DATABASE_URL or SQLX_OFFLINE.
-#
-# TODO(task 11): once crates/df-web ships a SvelteKit console, add a node
-# stage here to build it and COPY the output into the runtime image next to
-# the binary, the same way migrations are copied below.
 
-FROM rust:1.85-slim-bookworm AS builder
-WORKDIR /build
+# ---------------------------------------------------------------- console
+# The SPA is built first and separately. It changes on a different cadence
+# from the server and shares none of its toolchain, so a Rust edit must not
+# reinstall npm packages and a console edit must not recompile a workspace.
+FROM node:22-slim AS console
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /web
+# Manifests alone, so `npm ci` is cached until a dependency actually changes.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
 
-# Deliberately not `COPY rust-toolchain.toml`: this image's rustc is 1.85, but
-# it ships via rustup, and rustup honors a `rust-toolchain.toml` it finds in
-# the working directory — including its `channel = "stable"`. Copying the
-# file in would make cargo fetch and install whatever "stable" is that day
-# (plus rustfmt/clippy, neither of which this build needs) instead of using
-# the 1.85 already on the image, silently defeating the `FROM` tag's pin and
-# making the build depend on rustup's network availability.
-#
-# Manifests are copied ahead of `crates/` so a lockfile-only change does not
-# require re-copying source, but this is not full dependency-layer caching:
-# there is one `cargo build` below, over the whole workspace, so any source
-# edit under `crates/` still invalidates it. A `cargo-chef`-style recipe stage
-# would get real separate caching; not worth the added moving parts yet at
-# this build's size.
-COPY Cargo.toml Cargo.lock ./
-COPY crates crates
-RUN cargo build --release -p df-server
+COPY web/ ./
+RUN npm run build
 
-FROM debian:bookworm-slim AS runtime
+# ---------------------------------------------------------------- server
+FROM rust:1-slim-bookworm AS build
+
 WORKDIR /app
+COPY . .
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+# No DATABASE_URL, and no `.sqlx` offline data, because there is nothing to
+# check against at compile time: every statement in df-core is a runtime
+# `sqlx::query`, not a `query!` macro. That is what makes this image buildable
+# on a machine with no database.
+#
+# The cache mounts hold the registry and the target directory across builds.
+# `target/` lives inside one, so the binary has to be copied out within the
+# same RUN — anything left there vanishes with the mount.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    cargo build --release -p df-server \
+    && cp target/release/df-server /usr/local/bin/df-server
+
+# ---------------------------------------------------------------- runtime
+FROM debian:bookworm-slim AS runtime
+
+# ca-certificates is not optional: Postgres over TLS and every outbound tracker
+# call verify against these roots, and without them the failure is a TLS error
+# that reads like a network problem.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Migrations run at startup under an advisory lock (task 13), so the binary
-# needs the migration files alongside it, not just embedded query metadata.
-COPY --from=builder /build/target/release/df-server /app/df-server
-COPY crates/df-core/migrations /app/migrations
+# Nothing here needs to write to the filesystem or bind a privileged port.
+# A high uid rather than --system, which warns above SYS_UID_MAX, and no shell.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin factory
+USER factory
 
-ENV RUST_LOG=info,df_server=info
+COPY --from=build   /usr/local/bin/df-server /usr/local/bin/df-server
+COPY --from=console /web/build               /srv/console
+
+# The console bundle's location is the one path baked into the image, so it is
+# the one that gets a default here rather than in every deployment.
+ENV DF_STATIC_DIR=/srv/console \
+    DF_BIND=0.0.0.0:8080 \
+    DF_LOG_FORMAT=json \
+    RUST_LOG=info
+
 EXPOSE 8080
 
-ENTRYPOINT ["/app/df-server"]
+# Exec form, so the process is PID 1 and receives SIGTERM directly. Under the
+# shell form it would be a child of /bin/sh, which does not forward signals —
+# the graceful shutdown would never run and every deploy would hard-kill
+# whatever was in flight.
+ENTRYPOINT ["/usr/local/bin/df-server"]

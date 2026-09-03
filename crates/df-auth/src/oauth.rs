@@ -51,15 +51,19 @@ pub const DEFAULT_SCOPES: &[&str] = &["jobs:read", "repos:read"];
 /// server hands an attacker authorization codes.
 ///
 /// The one carve-out is RFC 8252 §7.3, and it is not optional — it is what makes
-/// CLI agents work at all. A native client listens on an ephemeral loopback port
-/// it cannot know at registration time, so for `http://127.0.0.1` and
-/// `http://[::1]` the **port is ignored** while scheme, host, and path must still
-/// match exactly.
+/// CLI agents work at all. A native client listens on a loopback port it cannot
+/// know at registration time, so for `http://127.0.0.1`, `http://[::1]` and
+/// `http://localhost` the **port is ignored** while scheme, host, path and query
+/// must still match exactly.
 ///
-/// `localhost` is deliberately excluded from the carve-out: it resolves through
-/// the host's name resolution and can be redirected, whereas the literal
-/// loopback addresses cannot. A client registering `http://localhost:1234/cb`
-/// gets exact matching, port included.
+/// `localhost` is in the carve-out because the clients this server exists for put
+/// it there: Claude Code registers `http://localhost:<port>/callback`, and an
+/// authorization server that refuses that string does not have an OAuth path for
+/// Claude Code — it has a 400 and a PAT. The name resolves through the host's
+/// resolver, which is a weaker guarantee than the literal addresses; the reason
+/// that is acceptable is that anyone who can point `localhost` elsewhere already
+/// owns the machine the agent runs on, and the code they would intercept is worth
+/// nothing without the PKCE verifier, which never leaves the client.
 pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
     if registered == requested {
         return true;
@@ -69,7 +73,22 @@ pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
         return false;
     };
 
-    if !is_literal_loopback(&reg) || !is_literal_loopback(&req) {
+    if !is_loopback_redirect(&reg) || !is_loopback_redirect(&req) {
+        return false;
+    }
+
+    // Neither a fragment nor userinfo may be smuggled through this branch. The
+    // exact-equality test above catches both on any other URI, but the
+    // comparison below comes down to scheme, host, path and query, so without
+    // this `http://localhost:1/cb#x` and `http://evil.com@localhost:1/cb` would
+    // each match a plain registration. Neither changes where the browser
+    // actually delivers the code — it dispatches on host — but a fragment does
+    // silently break delivery, because `?code=…` appended after a `#` is never
+    // sent to the server at all, and the agent waits forever for a code that was
+    // issued. Refusing the match turns that into an error the caller can read.
+    let clean =
+        |u: &url::Url| u.fragment().is_none() && u.username().is_empty() && u.password().is_none();
+    if !clean(&reg) || !clean(&req) {
         return false;
     }
 
@@ -79,13 +98,13 @@ pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
         && reg.query() == req.query()
 }
 
-/// A literal loopback address over http — never a name that resolution could
-/// point elsewhere.
-fn is_literal_loopback(u: &url::Url) -> bool {
+/// A loopback callback over http — the only shape in which cleartext is allowed,
+/// and the only shape whose port is ignored when matching.
+fn is_loopback_redirect(u: &url::Url) -> bool {
     u.scheme() == "http"
         && matches!(
             u.host_str(),
-            Some("127.0.0.1") | Some("[::1]") | Some("::1")
+            Some("127.0.0.1") | Some("[::1]") | Some("::1") | Some("localhost")
         )
 }
 
@@ -105,9 +124,19 @@ fn validate_registerable_redirect(uri: &str) -> Result<()> {
     // Plain http is allowed only for literal loopback (native apps). Anything
     // else must be https, or the authorization code crosses the network in the
     // clear.
-    if parsed.scheme() == "http" && !is_literal_loopback(&parsed) {
+    if parsed.scheme() == "http" && !is_loopback_redirect(&parsed) {
         return Err(AuthError::InvalidRequest(
-            "redirect_uri must use https, except for http on 127.0.0.1 or [::1]".into(),
+            "redirect_uri must use https, except for http on 127.0.0.1, [::1] or localhost".into(),
+        ));
+    }
+
+    // Credentials in a redirect URI are never part of where the code lands, and
+    // a client registering them has either misunderstood the field or is trying
+    // to make two different-looking URIs compare equal. Refused for the same
+    // reason as the fragment above: say so now rather than at match time.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AuthError::InvalidRequest(
+            "redirect_uri must not contain a username or password".into(),
         ));
     }
 
@@ -642,12 +671,13 @@ mod tests {
     fn loopback_carve_out_does_not_leak_to_anything_else() {
         let reg = "http://127.0.0.1:1455/callback";
         for attack in [
-            "http://127.0.0.1:49152/evil",         // different path
-            "http://127.0.0.1:49152/callback?x=1", // added query
-            "http://evil.com:1455/callback",       // different host
-            "https://127.0.0.1:1455/callback",     // different scheme
-            "http://127.0.0.2:1455/callback",      // adjacent address
-            "http://localhost:49152/callback",     // name, not literal
+            "http://127.0.0.1:49152/evil",             // different path
+            "http://127.0.0.1:49152/callback?x=1",     // added query
+            "http://evil.com:1455/callback",           // different host
+            "https://127.0.0.1:1455/callback",         // different scheme
+            "http://127.0.0.2:1455/callback",          // adjacent address
+            "http://localhost:49152/callback",         // a different loopback name
+            "http://localhost.evil.com:1455/callback", // suffix of the name
         ] {
             assert!(
                 !redirect_uri_matches(reg, attack),
@@ -656,16 +686,56 @@ mod tests {
         }
     }
 
-    /// `localhost` resolves through the host's name resolution and can be
-    /// pointed elsewhere, so it gets exact matching, port included.
+    /// `localhost` gets the same port carve-out as the literal addresses, and it
+    /// has to: this is the exact string Claude Code registers, captured from a
+    /// conformance run against the running server.
     #[test]
-    fn localhost_does_not_get_the_port_carve_out() {
-        let reg = "http://localhost:1455/callback";
-        assert!(redirect_uri_matches(reg, "http://localhost:1455/callback"));
+    fn localhost_gets_the_port_carve_out_because_that_is_what_agents_register() {
+        let reg = "http://localhost:3118/callback";
+        assert!(validate_registerable_redirect(reg).is_ok());
+        assert!(redirect_uri_matches(reg, "http://localhost:3118/callback"));
+        assert!(redirect_uri_matches(reg, "http://localhost:49152/callback"));
+
+        // The carve-out is still the port and nothing else.
+        assert!(!redirect_uri_matches(reg, "http://localhost:3118/evil"));
+        assert!(!redirect_uri_matches(reg, "http://127.0.0.1:3118/callback"));
         assert!(!redirect_uri_matches(
             reg,
-            "http://localhost:49152/callback"
+            "https://localhost:3118/callback"
         ));
+    }
+
+    /// The loopback branch compares scheme, host, path and query — so anything
+    /// it does *not* compare has to be refused outright, or it becomes a way to
+    /// make two different URIs match.
+    #[test]
+    fn the_loopback_branch_refuses_what_it_does_not_compare() {
+        let reg = "http://localhost:3118/callback";
+
+        // A fragment: the browser keeps it, so `?code=…` appended afterwards is
+        // never sent and the client waits for a code it will never see.
+        assert!(!redirect_uri_matches(
+            reg,
+            "http://localhost:49152/callback#x"
+        ));
+        assert!(!redirect_uri_matches(
+            "http://127.0.0.1:1/cb#x",
+            "http://127.0.0.1:2/cb"
+        ));
+
+        // Userinfo: not where the code lands, and not compared below.
+        assert!(!redirect_uri_matches(
+            reg,
+            "http://evil.com@localhost:49152/callback"
+        ));
+        assert!(!redirect_uri_matches(
+            reg,
+            "http://user:pw@localhost:49152/callback"
+        ));
+
+        // And neither may be registered in the first place.
+        assert!(validate_registerable_redirect("http://evil.com@localhost:3118/cb").is_err());
+        assert!(validate_registerable_redirect("https://user:pw@app.example.com/cb").is_err());
     }
 
     #[test]
@@ -673,6 +743,7 @@ mod tests {
         assert!(validate_registerable_redirect("https://app.example.com/cb").is_ok());
         assert!(validate_registerable_redirect("http://127.0.0.1:1455/cb").is_ok());
         assert!(validate_registerable_redirect("http://[::1]:1455/cb").is_ok());
+        assert!(validate_registerable_redirect("http://localhost:1455/cb").is_ok());
 
         // Cleartext to anywhere but loopback.
         assert!(validate_registerable_redirect("http://app.example.com/cb").is_err());

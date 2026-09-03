@@ -28,15 +28,25 @@ pub struct Config {
     /// launch orphans every enrolled device, so it is set once.
     pub totp_issuer: String,
 
-    /// Trust `X-Forwarded-For` for the client address used in rate limiting and
-    /// the audit trail.
+    /// The header a trusted proxy writes the client address into, lowercase,
+    /// or `None` to use the peer address of the connection.
     ///
-    /// **Off by default, and it must stay off unless a proxy that overwrites the
-    /// header sits in front.** With no such proxy the header is whatever the
-    /// caller typed, and an attacker rotating it walks straight through every
-    /// per-IP throttle — a rate limiter keyed on a spoofable value is worse than
-    /// no rate limiter, because it looks like one.
-    pub trust_forwarded_for: bool,
+    /// **`None` by default, and it must stay `None` unless a proxy sits in
+    /// front.** With no such proxy the header is whatever the caller typed, and
+    /// an attacker rotating it walks straight through every per-IP throttle — a
+    /// rate limiter keyed on a spoofable value is worse than no rate limiter,
+    /// because it looks like one.
+    ///
+    /// **Which header is not a matter of taste.** Only a header the proxy
+    /// *overwrites* is trustworthy. `X-Forwarded-For` is the conventional
+    /// answer and the wrong one on any proxy that *appends* — Fly.io's does, so
+    /// a caller sending `X-Forwarded-For: 1.2.3.4` arrives as
+    /// `1.2.3.4, <real address>` and the left-most entry, the one every
+    /// convention calls the client, is the one the attacker chose. There the
+    /// right value is `fly-client-ip`, which the proxy writes itself and which
+    /// carries exactly one address. Behind nginx or a load balancer configured
+    /// to replace the header, `x-forwarded-for` is correct.
+    pub client_ip_header: Option<String>,
 
     /// Whether hard-stop plans are currently being enforced against.
     ///
@@ -56,7 +66,7 @@ impl Config {
             public_url: public_url.into().trim_end_matches('/').to_string(),
             resource_uri: resource_uri.into(),
             totp_issuer: "dark-factory".into(),
-            trust_forwarded_for: false,
+            client_ip_header: None,
             enforce_quotas: false,
         }
     }
@@ -114,11 +124,12 @@ impl std::fmt::Debug for AppState {
 /// `"unknown"` would put every anonymous caller in one shared bucket, where the
 /// first attacker to trip it locks out everybody else.
 pub fn client_ip(parts: &http::request::Parts, config: &Config) -> Option<String> {
-    if config.trust_forwarded_for {
-        if let Some(forwarded) = parts.headers.get("x-forwarded-for") {
+    if let Some(header) = config.client_ip_header.as_deref() {
+        if let Some(value) = parts.headers.get(header) {
             // The left-most entry is the original client; everything after it
-            // was appended by intermediaries.
-            if let Some(first) = forwarded
+            // was appended by intermediaries. A single-address header like
+            // `Fly-Client-IP` has no comma and falls through this unchanged.
+            if let Some(first) = value
                 .to_str()
                 .ok()
                 .and_then(|v| v.split(',').next())
@@ -140,35 +151,82 @@ pub fn client_ip(parts: &http::request::Parts, config: &Config) -> Option<String
 mod tests {
     use super::*;
 
-    fn parts(header: Option<&str>) -> http::request::Parts {
+    fn parts(headers: &[(&str, &str)]) -> http::request::Parts {
         let mut b = http::Request::builder();
-        if let Some(v) = header {
-            b = b.header("x-forwarded-for", v);
+        for (name, value) in headers {
+            b = b.header(*name, *value);
         }
         b.body(()).unwrap().into_parts().0
     }
 
-    #[test]
-    fn a_forwarded_header_is_ignored_unless_a_proxy_is_trusted() {
-        let config = Config::new("https://console.test", "https://mcp.test/mcp");
-        assert!(!config.trust_forwarded_for, "the default must be off");
-        assert_eq!(client_ip(&parts(Some("203.0.113.9")), &config), None);
+    fn config() -> Config {
+        Config::new("https://console.test", "https://mcp.test/mcp")
     }
 
     #[test]
-    fn the_left_most_forwarded_entry_is_the_client() {
-        let mut config = Config::new("https://console.test", "https://mcp.test/mcp");
-        config.trust_forwarded_for = true;
-
+    fn no_header_is_trusted_until_one_is_named() {
+        let config = config();
+        assert!(
+            config.client_ip_header.is_none(),
+            "the default must trust nothing"
+        );
         assert_eq!(
             client_ip(
-                &parts(Some("203.0.113.9, 70.41.3.18, 150.172.238.178")),
+                &parts(&[
+                    ("x-forwarded-for", "203.0.113.9"),
+                    ("fly-client-ip", "203.0.113.9"),
+                ]),
+                &config
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_named_header_is_read() {
+        let mut config = config();
+        config.client_ip_header = Some("fly-client-ip".into());
+
+        // The header the deployment named wins, and the one it did not name is
+        // not a fallback: on Fly.io `X-Forwarded-For` is caller-influenced, so
+        // reading it when `Fly-Client-IP` is missing would hand an attacker the
+        // value on any request they can make the proxy drop it from.
+        assert_eq!(
+            client_ip(
+                &parts(&[
+                    ("x-forwarded-for", "198.51.100.7"),
+                    ("fly-client-ip", "203.0.113.9"),
+                ]),
                 &config
             ),
             Some("203.0.113.9".into())
         );
-        assert_eq!(client_ip(&parts(Some("  ")), &config), None);
-        assert_eq!(client_ip(&parts(None), &config), None);
+        assert_eq!(
+            client_ip(&parts(&[("x-forwarded-for", "198.51.100.7")]), &config),
+            None
+        );
+    }
+
+    #[test]
+    fn the_left_most_forwarded_entry_is_the_client() {
+        let mut config = config();
+        config.client_ip_header = Some("x-forwarded-for".into());
+
+        assert_eq!(
+            client_ip(
+                &parts(&[(
+                    "x-forwarded-for",
+                    "203.0.113.9, 70.41.3.18, 150.172.238.178"
+                )]),
+                &config
+            ),
+            Some("203.0.113.9".into())
+        );
+        assert_eq!(
+            client_ip(&parts(&[("x-forwarded-for", "  ")]), &config),
+            None
+        );
+        assert_eq!(client_ip(&parts(&[]), &config), None);
     }
 
     #[test]

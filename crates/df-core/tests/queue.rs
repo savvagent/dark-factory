@@ -331,6 +331,44 @@ async fn unresolvable_repo_errors_helpfully(pool: PgPool) {
         msg.contains("register_repo"),
         "must say what to call next: {msg}"
     );
+
+    // A mistyped slug is the commonest way to get here, and it has to be just
+    // as informative as a remote that matched nothing. It is the one the caller
+    // can actually fix from the answer.
+    let mut tx = db.begin(t.org).await.unwrap();
+    let err = tx
+        .resolve_repo(&RepoRef {
+            slug: Some("apo".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    tx.commit().await.unwrap();
+
+    assert_eq!(err.code(), "repo_unresolved");
+    let msg = err.to_string();
+    assert!(msg.contains("apo"), "must repeat what was asked for: {msg}");
+    assert!(msg.contains("api"), "must list registered slugs: {msg}");
+
+    // And a slug that misses stops there. An agent typically passes its
+    // checkout's remote alongside whatever repo it was told to use; falling
+    // back to the remote on a typo would quietly queue the work against the
+    // repository the agent happens to be sitting in.
+    let mut tx = db.begin(t.org).await.unwrap();
+    let err = tx
+        .resolve_repo(&RepoRef {
+            slug: Some("apo".into()),
+            remote: Some("git@github.com:acme/api.git".into()),
+        })
+        .await
+        .unwrap_err();
+    tx.commit().await.unwrap();
+
+    assert_eq!(err.code(), "repo_unresolved");
+    assert!(
+        err.to_string().contains("apo"),
+        "an explicit slug wins over a remote, even when it misses: {err}"
+    );
 }
 
 #[sqlx::test]

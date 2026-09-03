@@ -1,261 +1,158 @@
 //! dark-factory server binary. Assembles every HTTP surface on one port.
-//!
-//! `df-mcp` (agents, bearer tokens) and `df-web` (humans, session cookies) are
-//! separate crates for compile-time layering, not separate processes — see
-//! CLAUDE.md. This binary is the only place they are merged into one router
-//! and bound to one address.
-//!
-//! Startup order matters: migrations must finish before the watcher starts
-//! listening (a fresh database has no `df_changes` channel to listen on until
-//! the migration that creates its trigger runs), and the watcher must be
-//! running before either router is built, because `df-mcp`'s `watch` tool
-//! holds a reference to it.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use axum::routing::get;
-use axum::Router;
+use anyhow::{Context, Result};
 use df_core::watch::Watcher;
 use df_core::Db;
-use tower_http::trace::TraceLayer;
-
-/// Read a required environment variable, or fail with a message that names it.
-fn require_env(name: &str) -> anyhow::Result<String> {
-    std::env::var(name)
-        .map_err(|_| anyhow::anyhow!("{name} is not set; see .env.example for the full list"))
-}
-
-/// Read an optional environment variable, falling back to `default` when unset
-/// or empty — several of these are documented as "blank means derive a
-/// default" in `.env.example`, so an empty string must not shadow it.
-fn env_or(name: &str, default: impl Into<String>) -> String {
-    match std::env::var(name) {
-        Ok(v) if !v.is_empty() => v,
-        _ => default.into(),
-    }
-}
-
-fn env_flag(name: &str) -> bool {
-    matches!(std::env::var(name).as_deref(), Ok("1") | Ok("true"))
-}
-
-/// Liveness: this process is up and can answer HTTP. No database check — a
-/// database outage should surface on `/readyz`, not take the process out of
-/// rotation entirely.
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-/// Readiness: this replica can currently serve tenant data. Fly's health check
-/// hits this, and a failing check pulls the machine out of rotation without
-/// killing it, which is the right response to a database blip.
-async fn readyz(
-    axum::extract::State(db): axum::extract::State<Db>,
-) -> impl axum::response::IntoResponse {
-    match sqlx::query("SELECT 1").execute(db.pool()).await {
-        Ok(_) => (axum::http::StatusCode::OK, "ok"),
-        Err(_) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "database unreachable",
-        ),
-    }
-}
+use df_server::{router, Config, LogFormat};
+use tokio::net::TcpListener;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .json()
-        .init();
+async fn main() -> Result<()> {
+    // Loads `.env` if there is one. `dotenvy` never overwrites a variable that
+    // is already set, so a file that accidentally ships inside an image cannot
+    // override the deployment's real configuration.
+    let dotenv = dotenvy::dotenv();
 
-    let database_url = require_env("DATABASE_URL")?;
-    let bind = env_or("DF_BIND", "0.0.0.0:8080");
-    let public_url = require_env("DF_PUBLIC_URL")?;
-    let resource_uri = require_env("DF_RESOURCE_URI")?;
-    let encryption_key = require_env("DF_ENCRYPTION_KEY")?;
-    let enforce_quotas = env_flag("DF_ENFORCE_QUOTAS");
-    // Off unless a trusted proxy that overwrites `X-Forwarded-For` sits in
-    // front — see `df_web::state::Config::trust_forwarded_for`'s doc comment
-    // for what goes wrong otherwise. Fly's edge (`fly-proxy`) is such a proxy:
-    // every request reaching this process has already passed through it, so
-    // `fly.toml` sets `DF_TRUST_FORWARDED_FOR=1`. Without this wired up, every
-    // request behind Fly carries the same `ConnectInfo` address, and the
-    // per-source throttles in df-auth (signup, magic links, client
-    // registration) key every caller in the world into one bucket — the sixth
-    // request from *anyone* in a 15-minute window locks the endpoint out for
-    // everyone.
-    let trust_forwarded_for = env_flag("DF_TRUST_FORWARDED_FOR");
-    let upgrade_url = env_or(
-        "DF_UPGRADE_URL",
-        format!("{}/settings/billing", public_url.trim_end_matches('/')),
-    );
+    let config = Config::from_env().context(
+        "configuration is incomplete. Copy .env.example to .env for local runs, \
+         or set the variables named above in the deployment",
+    )?;
 
-    let db = Db::connect(&database_url).await?;
+    init_tracing(config.log_format)?;
+    match dotenv {
+        Ok(path) => tracing::debug!(path = %path.display(), "loaded .env"),
+        Err(_) => tracing::debug!("no .env file; using the process environment"),
+    }
 
-    // Runs under a Postgres advisory lock (see `Db::migrate`), so several
-    // machines starting concurrently on a fresh database wait rather than
-    // racing each other through the same DDL.
-    tracing::info!("running migrations");
-    db.migrate().await.map_err(|e| {
-        let msg = e.to_string();
-        // `0007_rls.sql` runs `CREATE ROLE df_app` and `GRANT df_app TO
-        // CURRENT_USER` — both cluster-level operations. A managed-Postgres
-        // role scoped to its own schema (Fly's `schema_admin`, for example)
-        // lacks `CREATEROLE` and fails here with a bare permission error that
-        // gives no hint what to do about it. Recognize that shape and point
-        // at the fix instead of forwarding the raw Postgres message.
-        if msg.contains("permission denied") || msg.contains("must be superuser") {
-            anyhow::anyhow!(
-                "migrations failed: {msg}\n\n\
-                 This looks like the connecting role cannot create roles \
-                 (Fly's schema-scoped Postgres role, for example). Ask the \
-                 managed-Postgres administrator to run, once, as a role with \
-                 CREATEROLE:\n  \
-                 CREATE ROLE df_app NOLOGIN;\n  \
-                 GRANT df_app TO \"<the role in DATABASE_URL>\";\n\
-                 then restart this process — migrations are safe to re-run \
-                 and will pick up from here. See docs/deploy/fly.md."
-            )
-        } else {
-            anyhow::anyhow!("migrations failed: {msg}")
-        }
-    })?;
+    // Validate the key before anything else can be built with it. `Cipher`
+    // construction is infallible from here on, and a bad key is a startup
+    // error naming the variable rather than a panic on the first TOTP enrolment
+    // hours later.
+    df_auth::crypto::Cipher::from_base64_key(&config.encryption_key)
+        .context("DF_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
-    let watcher = Watcher::spawn(db.pool().clone()).await?;
-    spawn_sweeper(db.clone());
-
-    let mut mcp_config = df_mcp::Config::new(resource_uri.clone(), public_url.clone());
-    mcp_config.enforce_quotas = enforce_quotas;
-    mcp_config.upgrade_url = upgrade_url.clone();
-    // Not `df_mcp::router`: that includes its own copy of
-    // `/.well-known/oauth-protected-resource`, and `df-web`'s router below
-    // already serves that path — see `df_mcp::mcp_only_router`'s doc comment.
-    let mcp_router = df_mcp::mcp_only_router(db.clone(), watcher.clone(), mcp_config);
-
-    let cipher = df_auth::crypto::Cipher::from_base64_key(&encryption_key)?;
-    // No SMTP integration exists yet (milestone 1 scope). `LogMailer` writes
-    // every email to the log instead of silently delivering nothing — a loud
-    // no-op beats a quiet one, which looks identical to a working mailer
-    // until someone asks why nobody has joined. But "loud" only helps if an
-    // operator chose it: starting with it silently would mean verification,
-    // recovery, and invitation links are never delivered on a real
-    // deployment, with nobody told until a user reports they never arrived.
-    // Require an explicit opt-in until a real transport exists.
-    if !env_flag("DF_ALLOW_LOG_MAILER") {
+    // Refuse to start with a mailer that delivers nothing unless somebody said
+    // so. `LogMailer` writes each message to the log, which beats a silent
+    // no-op — but only for an operator who knows that is what they are running.
+    // Left implicit, a real deployment sends no verification, recovery, or
+    // invitation mail at all, and the first report comes from a user who never
+    // received a link.
+    if !config.allow_log_mailer {
         anyhow::bail!(
-            "no production mailer is configured (milestone 1 has not wired one \
-             up yet) and DF_ALLOW_LOG_MAILER is not set. Starting anyway would \
-             silently fail to deliver verification, recovery, and invitation \
-             emails. Set DF_ALLOW_LOG_MAILER=1 to run with `LogMailer`, which \
-             writes those emails to this process's logs instead of sending \
-             them — understand that this is not a substitute for real \
-             delivery before doing so. See docs/deploy/fly.md."
+            "no production mailer is configured and DF_ALLOW_LOG_MAILER is not set. \
+             Starting anyway would accept sign-ups and then silently fail to deliver \
+             every verification, recovery, and invitation email. Set \
+             DF_ALLOW_LOG_MAILER=1 to run with LogMailer, which writes those emails \
+             to this process's log instead of sending them — that is a development \
+             transport, not delivery. See docs/deploy/fly.md."
         );
     }
-    let mailer: Arc<dyn df_web::Mailer> = Arc::new(df_web::LogMailer);
-    let web_config = df_web::Config {
-        trust_forwarded_for,
-        enforce_quotas,
-        ..df_web::Config::new(public_url.clone(), resource_uri.clone())
-    };
-    let web_state = df_web::AppState::new(db.clone(), cipher, mailer, web_config);
-    let web_router = df_web::router(web_state);
 
-    let health_router = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .with_state(db.clone());
+    let db = Db::connect(&config.database_url)
+        .await
+        .context("could not connect to DATABASE_URL")?;
 
-    let app = Router::new()
-        .merge(mcp_router)
-        .merge(web_router)
-        .merge(health_router)
-        .layer(TraceLayer::new_for_http());
+    if config.run_migrations {
+        // sqlx holds a Postgres advisory lock for the whole run, so several
+        // replicas starting together is safe: the losers block until the winner
+        // is done rather than racing each other through the same DDL.
+        tracing::info!("applying migrations");
+        db.migrate().await.context("migrations failed")?;
+    } else {
+        tracing::warn!("DF_RUN_MIGRATIONS is off; assuming the schema is already current");
+    }
 
-    let addr: SocketAddr = bind
-        .parse()
-        .map_err(|e| anyhow::anyhow!("DF_BIND {bind:?} is not a valid address: {e}"))?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "listening");
+    let watcher = Watcher::spawn(db.pool().clone())
+        .await
+        .context("could not start the change listener")?;
 
+    if !config.static_dir.is_dir() {
+        // Loud, in the same spirit as `LogMailer`. A missing bundle serves a
+        // 404 on every console page while the API works perfectly, which looks
+        // like a routing bug for as long as it takes someone to notice that
+        // `npm run build` was never run.
+        tracing::warn!(
+            dir = %config.static_dir.display(),
+            "no console bundle at DF_STATIC_DIR; the API will work and every console page will 404. \
+             Run `npm run build` in web/, or set DF_STATIC_DIR"
+        );
+    }
+
+    let app = router(db, watcher.clone(), &config)?;
+
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .with_context(|| format!("could not bind {}", config.bind))?;
+
+    tracing::info!(
+        bind = %config.bind,
+        public_url = %config.public_url,
+        resource_uri = %config.resource_uri,
+        enforce_quotas = config.enforce_quotas,
+        "df-server listening"
+    );
+
+    // `ConnectInfo` is not decoration: `df_web::state::client_ip` reads the peer
+    // address out of it, and that address is what every per-IP throttle and
+    // every audit entry is keyed on. Serve without this and `client_ip` returns
+    // `None` for every request, which silently disables rate limiting on the
+    // login and registration endpoints.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .await
+    .context("server error")?;
 
-    // The watcher holds a detached `LISTEN` connection that outlives the pool
-    // (see CLAUDE.md's "trap in tests" note) — release it explicitly rather
-    // than relying on `Drop`'s best-effort cleanup during shutdown.
+    // After the server, deliberately. `Watcher::spawn` takes a connection out of
+    // the pool for `LISTEN` and detaches it, so dropping the pool does not
+    // reclaim it; `shutdown` stops the task and waits for the connection to go.
+    // Without this the process holds a Postgres session open past the point it
+    // stopped serving anything.
+    tracing::info!("draining");
     watcher.shutdown().await;
+    tracing::info!("stopped");
 
     Ok(())
 }
 
-/// Every append-only auth table that needs periodic cleanup, run forever in
-/// the background.
-///
-/// `magic::sweep`, `sessions::sweep`, `tokens::sweep`,
-/// `totp::sweep_used_steps`, `oauth::sweep_codes`, and `ratelimit::sweep` all
-/// existed with nothing calling them until this bound a port — this is the
-/// long-running process their doc comments assumed. `ratelimit::sweep` is the
-/// acute one: `auth_attempts` gets a row on every login, signup, and magic
-/// link attempt, and `recent_failures` runs a `COUNT(*)` over it on the same
-/// hot path, so an unswept table makes every throttle check slower forever.
-///
-/// Not included: `Tx::sweep_invites` is org-scoped and there is no
-/// all-orgs listing to drive it from here yet, so stale invitations still
-/// need a manual sweep until one exists — a smaller, separate gap than the
-/// six global tables this loop does cover.
-fn spawn_sweeper(db: Db) {
-    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+fn init_tracing(format: LogFormat) -> Result<()> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let registry = tracing_subscriber::registry().with(filter);
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(INTERVAL);
-        // The first tick fires immediately; skip it so a fresh deployment
-        // does not spend its first moments sweeping empty tables instead of
-        // serving traffic.
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            sweep_once(&db).await;
-        }
-    });
-}
-
-async fn sweep_once(db: &Db) {
-    async fn log<E: std::fmt::Display>(table: &str, result: Result<u64, E>) {
-        match result {
-            Ok(0) => {}
-            Ok(deleted) => tracing::info!(table, deleted, "swept"),
-            Err(error) => tracing::warn!(table, %error, "sweep failed"),
-        }
+    match format {
+        LogFormat::Json => registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .init(),
+        LogFormat::Text => registry.with(tracing_subscriber::fmt::layer()).init(),
     }
 
-    log("magic_links", df_auth::magic::sweep(db).await).await;
-    log("sessions", df_auth::sessions::sweep(db).await).await;
-    log("tokens", df_auth::tokens::sweep(db).await).await;
-    log("totp_used_steps", df_auth::totp::sweep_used_steps(db).await).await;
-    log("authorization_codes", df_auth::oauth::sweep_codes(db).await).await;
-    log("auth_attempts", df_auth::ratelimit::sweep(db).await).await;
+    Ok(())
 }
 
+/// Resolves on the first `SIGTERM` or `SIGINT`.
+///
+/// `SIGTERM` is the one that matters — it is what a container runtime sends
+/// before it waits its grace period and then sends `SIGKILL`. A server that
+/// only handles `SIGINT` looks fine in a terminal and is hard-killed on every
+/// single deploy, dropping whatever was in flight.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
-            .expect("failed to install Ctrl+C handler");
+            .expect("failed to install the SIGINT handler");
     };
 
     #[cfg(unix)]
     let terminate = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
+            .expect("failed to install the SIGTERM handler")
             .recv()
             .await;
     };
@@ -264,9 +161,7 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = ctrl_c => tracing::info!("SIGINT; shutting down"),
+        _ = terminate => tracing::info!("SIGTERM; shutting down"),
     }
-
-    tracing::info!("shutdown signal received");
 }

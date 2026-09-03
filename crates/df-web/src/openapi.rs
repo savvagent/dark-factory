@@ -181,7 +181,12 @@ fn tag_for(path: &str) -> &'static str {
 /// runtime one, but a confusing enough compile error to be worth avoiding.
 fn components() -> Value {
     let mut all = serde_json::Map::new();
-    for group in [entity_schemas(), response_schemas(), request_schemas()] {
+    for group in [
+        entity_schemas(),
+        queue_schemas(),
+        response_schemas(),
+        request_schemas(),
+    ] {
         let Value::Object(map) = group else {
             unreachable!("each schema group is an object literal")
         };
@@ -435,6 +440,92 @@ fn entity_schemas() -> Value {
             "required": ["id", "action", "createdAt"],
         },
         "AuditEventList": { "type": "array", "items": reference("AuditEvent") },
+    })
+}
+
+/// The queue's schemas.
+///
+/// A separate group only because `serde_json::json!` expands recursively and
+/// the entity literal had grown past the macro's recursion limit. Splitting is
+/// the honest fix; raising `recursion_limit` crate-wide to keep one big literal
+/// would hide the next one.
+fn queue_schemas() -> Value {
+    let timestamp = json!({ "type": "string", "format": "date-time" });
+    let uuid = json!({ "type": "string", "format": "uuid" });
+
+    json!({
+        "Job": {
+            "type": "object",
+            "description":
+                "One unit of coordinated work, always anchored to a repo. `metadata` \
+                 is opaque — dark-factory never reads it; it is where a customer's own \
+                 skill keeps whatever its methodology needs.",
+            "properties": {
+                "id": { "type": "string", "examples": ["job-42"] },
+                "orgId": uuid,
+                "repoId": uuid,
+                "teamId": { "type": ["string", "null"], "format": "uuid" },
+                "title": { "type": "string" },
+                "description": { "type": ["string", "null"] },
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "in-progress", "completed", "failed"],
+                },
+                "ticketRef": { "type": ["string", "null"], "examples": ["ACME-17"] },
+                "tracker": { "type": ["string", "null"], "enum": ["jira", "github", null] },
+                "agentType": { "type": ["string", "null"] },
+                // Deliberately unconstrained. The column is JSONB and the server
+                // never reads it, so anything a client can serialise is a legal
+                // value — `{"type": "object"}` would promise a shape nothing
+                // enforces, and generated clients would then reject their own
+                // data. `true` is JSON Schema's "any value".
+                "metadata": true,
+                "createdAt": timestamp,
+                "startedAt": { "type": ["string", "null"], "format": "date-time" },
+                "completedAt": { "type": ["string", "null"], "format": "date-time" },
+                "attempts": { "type": "integer" },
+                "result": { "type": ["string", "null"] },
+                "error": { "type": ["string", "null"] },
+                "createdBy": { "type": ["string", "null"], "format": "uuid" },
+                "claimedBy": { "type": ["string", "null"], "format": "uuid" },
+                "claimedByLabel": { "type": ["string", "null"] },
+            },
+            "required": ["id", "orgId", "repoId", "title", "status", "createdAt", "attempts"],
+        },
+        "JobList": { "type": "array", "items": reference("Job") },
+        "JobDetail": {
+            "allOf": [
+                reference("Job"),
+                {
+                    "type": "object",
+                    "properties": {
+                        "dependsOn": {
+                            "type": "array",
+                            "items": { "type": "string", "examples": ["job-41"] },
+                            "description":
+                                "Job ids that must reach `completed` before this one \
+                                 is claimable.",
+                        },
+                    },
+                    "required": ["dependsOn"],
+                },
+            ],
+        },
+        "QueueStats": {
+            "type": "object",
+            "description":
+                "`blocked` overlaps `pending` rather than partitioning it: it counts \
+                 the pending jobs still waiting on a dependency.",
+            "properties": {
+                "pending": { "type": "integer" },
+                "inProgress": { "type": "integer" },
+                "completed": { "type": "integer" },
+                "failed": { "type": "integer" },
+                "blocked": { "type": "integer" },
+                "total": { "type": "integer" },
+            },
+            "required": ["pending", "inProgress", "completed", "failed", "blocked", "total"],
+        },
     })
 }
 
@@ -779,6 +870,27 @@ mod tests {
                 "{path} is the URL that goes in email. It must stay a client-side \
                  page — mounting it as a handler is how a link gets spent by a scanner."
             );
+        }
+    }
+
+    /// The console watches the queue; it does not drive it. Every write to a
+    /// job — enqueue, claim, complete, fail, repend — belongs to the MCP
+    /// surface, because the agent doing the work is the only party that can say
+    /// when it is done. A "mark complete" button here would let a human tell
+    /// the queue something they cannot observe, and the audit trail would
+    /// record it as fact.
+    #[test]
+    fn the_queue_is_read_only_over_the_console() {
+        for endpoint in catalog() {
+            if endpoint.path.contains("/jobs") {
+                assert_eq!(
+                    endpoint.verb,
+                    crate::catalog::Verb::Get,
+                    "{} {} writes to the queue from the console",
+                    endpoint.verb.as_str(),
+                    endpoint.path
+                );
+            }
         }
     }
 

@@ -60,7 +60,19 @@ cargo test -p df-core --test isolation   # tenant isolation
 cargo test -p df-core --test queue       # queue behaviour
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
+
+cd web && npm install
+npm run check                 # svelte-check + tsc over worker/ — the console's `cargo test`
+npm run lint                  # prettier --check — the console's `cargo fmt --check`
+npm test                      # vitest — the Cloudflare Worker's routing rule
+npm run build                 # static bundle into web/build
+
+cargo run -p df-server        # everything on one port, reading .env
+podman build -t dark-factory .   # console stage + rust stage + slim runtime
 ```
+
+`DF_PUBLIC_URL` and `DF_ENCRYPTION_KEY` are required with no defaults; `.env.example` says
+why for each. Build `web/` first or every console page answers `404` while the API works.
 
 Integration tests are `#[sqlx::test]` against a real Postgres — one fresh throwaway
 database per test, migrations auto-applied. There are no mocks for the database, on
@@ -81,6 +93,9 @@ compile-time layering discipline, not separate services.
 | `df-trackers` | GitHub App + JIRA clients, webhook ingest, two-way sync. |
 | `df-web` | Console REST API, session cookies, the AS's HTML endpoints. |
 | `df-server` | Config, migrations, router assembly, graceful shutdown. |
+
+`web/` is the console UI — SvelteKit 2 / Svelte 5 runes / Tailwind v4, TypeScript strict —
+built to static files that `df-server` serves beside `/api`. See `web/README.md`.
 
 **Every SQL statement lives in `df-core`.** A query in `df-mcp` or `df-web` is a bug — it
 bypasses the `Tx` pinning that guard 2 depends on.
@@ -131,6 +146,86 @@ Mail delivery is the `Mailer` trait. `LogMailer` is the development implementati
 loud on purpose — a quiet no-op mailer looks identical to a working one until someone asks
 why nobody has joined.
 
+The console API is read-only over the queue, and a unit test
+(`the_queue_is_read_only_over_the_console`) fails if a write ever appears under `/jobs`.
+Every job write belongs to `df-mcp`: the agent doing the work is the only party that can
+say when it is done, and a "mark complete" button would let a human put something into the
+audit trail that they did not observe.
+
+## `web/` — the console UI
+
+Four things hold, and the first explains the other three.
+
+- **It is a single-page app for a security reason, not a performance one.** The session is
+  an `HttpOnly`, `__Host-`-prefixed cookie, which browsers refuse to store unless it is
+  `Secure`, has `Path=/`, and carries no `Domain` — so it is bound to one origin. A
+  SvelteKit *server* rendering these pages would have to hold that credential to fetch on
+  the user's behalf: a second process with the keys to every console session, for pages
+  behind a login that cannot be cached anyway. `adapter-static` with an `index.html`
+  fallback keeps the cookie in the browser and makes CORS a non-question. The same fact is
+  why `vite.config.ts` *proxies* `/api`, `/oauth`, and `/.well-known` in development — a
+  cross-port `fetch` would not carry the cookie, and no CORS header could rescue it.
+
+- **The server's rules are mirrored, never re-implemented.** A `404` on an org renders as
+  "no such organization" and never "you don't have access", because the API answers `404`
+  for both cases on purpose. `OrgContext.isAdmin` hides buttons; `OrgCtx` is what refuses
+  them. Emailed links open *pages* that `POST` — `/verify`, `/recover`, `/invite/{org}` —
+  so a mail scanner following the URL burns nothing.
+
+- **Nothing about the deployment is baked into the bundle.** The MCP endpoint and the
+  grantable scopes are read from `/.well-known/oauth-protected-resource` at runtime. A
+  hard-coded MCP URL is how a staging build ends up printing a connect command pointing at
+  production.
+
+- **Every coding agent gets the same shape.** `src/lib/clients.ts` is one table with one
+  entry per client and two forms each (OAuth, access token). A bespoke wizard for one agent
+  and a footnote for the rest is the first place constraint 3 would quietly break.
+
+Runes throughout — `$state` / `$derived` / `$props` / `$effect`, no Svelte 4 stores, no
+`export let`. Shared state lives in `.svelte.ts` modules (`session.svelte.ts`) or in
+context (`org.svelte.ts`); the org is read from the route on every access rather than
+copied into state, because a copy and the URL disagree for one frame after a navigation
+and that frame is where one org's data renders under another's heading.
+
+Org pages live under `/o/[org]`, not `/[org]`, so no org slug can collide with a page name.
+The paths the *server* names — `/login`, `/verify`, `/recover`, `/invite/{org}`,
+`/settings/billing` — are fixed by what goes in email and in `df-billing`'s upgrade prompt,
+and cannot be renamed here alone.
+
+## `df-server` — assembly, and the two things only it can get wrong
+
+One binary mounts every surface on one port. Nothing here has business logic; what it has is
+the decisions no single crate could make.
+
+- **Route collisions are a startup panic, so a test builds the router.** `df-web` and
+  `df-mcp` both serve `/.well-known/oauth-protected-resource`, each for a good reason, and
+  `Router::merge` panics rather than choosing. `df-server` mounts `df_mcp::mcp_endpoint`
+  (the MCP route alone) beside `df-web`'s catalog, and `the_whole_router_assembles` reaches
+  that panic before a deployment does.
+- **The console SPA is the fallback, but not under `/api`, `/oauth`, `/mcp`, or
+  `/.well-known`.** `index.html` answering an unknown path is what makes a hard refresh of a
+  deep link work; `index.html` answering `/api/no/such/thing` with `200 text/html` is what
+  makes an agent retry forever against a route that will never exist.
+- **`/healthz` never touches the database and `/readyz` always does.** They answer different
+  questions — "should this process be killed?" and "should traffic come here?" — and wiring
+  liveness to the database turns a brief database blip into a simultaneous cold start of
+  every replica.
+- **`into_make_service_with_connect_info` is load-bearing.** `df_web::state::client_ip`
+  reads the peer address out of `ConnectInfo`, and that address keys every per-IP throttle
+  and every audit entry. Serve without it and `client_ip` returns `None` for every request,
+  silently disabling rate limiting on login and client registration.
+- **`Config::from_env` never falls back quietly.** A variable that is *set* but unparseable
+  is a startup error naming it, not a default — `DF_ENFORCE_QUOTAS=yes-please` reading as
+  "off" is how a billing control gets deployed switched off for a year. `DF_PUBLIC_URL` and
+  `DF_ENCRYPTION_KEY` have no defaults at all, because a wrong value for either fails
+  silently: bad links in somebody's inbox, or tokens minted for an audience nothing accepts.
+- **`DF_CLIENT_IP_HEADER` names the header, and which header is not a matter of taste.**
+  Only a header the proxy *overwrites* can be trusted. On Fly.io that is `fly-client-ip`,
+  never `x-forwarded-for` — fly-proxy appends, so a caller's own value arrives left-most and
+  every throttle keys on something the attacker chose.
+- **Graceful shutdown outlives the server.** `axum::serve(...).with_graceful_shutdown(...)`
+  returns, and only then does `watcher.shutdown().await` run — see the trap below.
+
 ## A trap in tests: the change listener holds a connection
 
 `Watcher::spawn` takes a connection out of the pool for `LISTEN` and **detaches** it, so
@@ -156,6 +251,13 @@ Two layers that must not be conflated:
   hashes. A token's org is fixed at issuance and cannot be pivoted.
 - **Layer 2 — who the human is**: passwordless TOTP for individuals, enterprise OIDC
   federation for orgs that bind an IdP. No password is ever accepted or stored.
+
+Redirect URI matching is exact, with one carve-out: `http://127.0.0.1`, `http://[::1]` and
+`http://localhost` ignore the port (RFC 8252 §7.3) and match on everything else. Do not
+tighten that without registering the change against a real client first — `localhost` was
+once excluded on sound-sounding reasoning, and it silently removed the OAuth path for Claude
+Code, which registers `http://localhost:<port>/callback`. `docs/clients/matrix.md` records
+what each client actually sends.
 
 TOTP without recovery is not shippable — recovery codes and the email magic link are part
 of the feature, not a follow-up.

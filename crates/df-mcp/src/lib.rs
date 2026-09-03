@@ -120,7 +120,7 @@ impl Config {
 /// look for it beside the authorization server's own metadata document — so a
 /// deployment that mounts both crates on one router has two handlers for the
 /// same path. Axum panics on that overlap rather than picking one silently, so
-/// a single-binary assembly (`df-server`) must use [`mcp_only_router`] instead
+/// a single-binary assembly (`df-server`) must use [`mcp_endpoint`] instead
 /// of this function and let `df-web` be the one copy. Both compute the same
 /// JSON from the same `resource_uri`/`public_url`, so which one answers is not
 /// observable to a client either way.
@@ -137,16 +137,24 @@ pub fn router(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
             get(auth::protected_resource_metadata),
         )
         .with_state(rs)
-        .merge(mcp_only_router(db, watcher, config))
+        .merge(mcp_endpoint(db, watcher, config))
 }
 
-/// Just `/mcp`, with no `/.well-known/…` route.
+/// Just `POST /mcp` — [`router`] without the discovery document.
 ///
-/// For a deployment that already gets protected-resource metadata from
-/// somewhere else on the same router — `df-web` is the current example —
-/// so that mounting both surfaces does not double-register the same path.
-/// Standalone deployments and this crate's own tests want [`router`] instead.
-pub fn mcp_only_router(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
+/// `df-server` mounts this rather than [`router`] because `df-web`'s catalog
+/// serves `/.well-known/oauth-protected-resource` too, and when both crates are
+/// merged onto one origin `axum::Router::merge` panics on the collision rather
+/// than picking a winner. Which one wins does not matter — both call
+/// `df_auth::oauth::protected_resource_metadata` with the same configured
+/// resource URI and public URL, so the two documents are byte-identical — and
+/// `df-web`'s is the one the OpenAPI document describes, so that is the one
+/// `df-server` keeps.
+///
+/// The `401` challenge's pointer stays valid either way: it names an absolute
+/// URL under [`Config::public_url`], which is the origin serving both crates.
+/// Keep [`router`] whole for anything mounting the MCP surface on its own.
+pub fn mcp_endpoint(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
     let rs = Arc::new(ResourceServer::new(
         db.clone(),
         config.resource_uri.clone(),
@@ -174,13 +182,11 @@ pub fn mcp_only_router(db: Db, watcher: Arc<Watcher>, config: Config) -> Router 
         transport,
     );
 
-    Router::new()
-        .route_service(
-            "/mcp",
-            any_service(service).layer(axum::middleware::from_fn_with_state(
-                rs.clone(),
-                auth::require_bearer,
-            )),
-        )
-        .with_state(rs)
+    Router::new().route_service(
+        "/mcp",
+        any_service(service).layer(axum::middleware::from_fn_with_state(
+            rs,
+            auth::require_bearer,
+        )),
+    )
 }

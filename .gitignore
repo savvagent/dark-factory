@@ -2,5 +2,7 @@
 .env
 node_modules
 web/.svelte-kit
+# wrangler dev writes bundles and local state here.
+web/.wrangler
 web/build
 *.log

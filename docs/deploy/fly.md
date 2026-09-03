@@ -55,11 +55,13 @@ by anything in this repo.
 
 ## What's scaffolded
 
-- `Dockerfile` — multi-stage build of the `df-server` binary, copies
-  `crates/df-core/migrations` alongside it for startup migrations.
+- `Dockerfile` — a console stage that builds `web/` into `/srv/console`, a Rust
+  stage that builds `df-server`, and a slim non-root runtime holding both. The
+  migrations are not copied in: `Db::migrate` uses the `sqlx::migrate!` macro,
+  which embeds them in the binary at compile time.
 - `fly.toml` — `dark-factory-mcp` app, region `iad` (co-located with the Postgres
-  cluster), `min_machines_running = 1` / `auto_stop_machines = false` (no idle
-  scale-to-zero), health check on `GET /readyz`.
+  cluster), `min_machines_running = 1` with `auto_stop_machines = "suspend"` so a
+  `watch` long poll never pays a cold start, health check on `GET /readyz`.
 
 ## What's assembled (Task 13 in the milestone plan)
 
@@ -68,7 +70,7 @@ by anything in this repo.
 1. The Axum router merges df-mcp (`/mcp`, bearer-authenticated) and df-web
    (console API, OAuth AS, `/.well-known/…`), bound to `DF_BIND`. df-mcp's own
    copy of `/.well-known/oauth-protected-resource` is left out of the merge —
-   see `df_mcp::mcp_only_router` — since df-web already serves that path and
+   see `df_mcp::mcp_endpoint` — since df-web already serves that path and
    Axum panics on two handlers for one path.
 2. `/healthz` (liveness, no DB check) and `/readyz` (readiness — `SELECT 1`
    against the pool) are mounted directly in `df-server`.

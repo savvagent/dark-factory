@@ -21,7 +21,7 @@
 
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 
-use crate::routes::{auth, orgs, repos, teams, tokens, usage};
+use crate::routes::{auth, jobs, orgs, repos, teams, tokens, usage};
 use crate::state::AppState;
 use crate::{oauth, openapi};
 
@@ -541,6 +541,31 @@ pub fn catalog() -> Vec<Endpoint> {
             .returns("LeaseList")
             .summary("Who is in this repo right now")
             .describe("The console's answer to \"why is my agent waiting?\"."),
+        // ----------------------------------------------------------- queue
+        Endpoint::get("/api/orgs/{org}/jobs", jobs::list_jobs)
+            .auth(Auth::OrgMember)
+            .returns("JobList")
+            .summary("The queue, newest first")
+            .describe(
+                "Read-only, and deliberately so: every write to a job belongs to the \
+                 MCP surface, because the agent doing the work is the only party that \
+                 can say when it is done. Filter with `status`, `repo`, `team`, and \
+                 `mine=true`; `repo` and `team` name slugs, and an unregistered one \
+                 is an error listing what is registered.",
+            ),
+        Endpoint::get("/api/orgs/{org}/jobs/stats", jobs::job_stats)
+            .auth(Auth::OrgMember)
+            .returns("QueueStats")
+            .summary("Counts per status, plus how many are blocked")
+            .describe(
+                "`blocked` is not a status — it counts pending jobs still waiting on \
+                 a dependency, which is what separates a queue that is idle from one \
+                 that is stuck. Optionally narrowed to one repo slug.",
+            ),
+        Endpoint::get("/api/orgs/{org}/jobs/{job}", jobs::get_job)
+            .auth(Auth::OrgMember)
+            .returns("JobDetail")
+            .summary("One job, with the jobs it waits on"),
         // -------------------------------------------------- tokens & usage
         Endpoint::get("/api/orgs/{org}/tokens", tokens::list_tokens)
             .auth(Auth::OrgMember)

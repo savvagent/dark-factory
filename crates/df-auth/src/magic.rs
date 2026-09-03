@@ -4,8 +4,8 @@
 //! an account whose authenticator is gone, accept an invitation — and all three
 //! reduce to: mint a high-entropy token, mail it, accept it once, briefly.
 //!
-//! **Why a stored token rather than a signed one.** `DF_SIGNING_KEY` exists and
-//! a signed, self-describing link would need no table. It would also be
+//! **Why a stored token rather than a signed one.** A signed, self-describing
+//! link would need no table at all. It would also be
 //! unrevocable and un-single-usable without a table anyway — the moment you
 //! need "this link has been used", you are storing state, and a signature has
 //! bought nothing but a second failure mode. So these are random tokens stored
