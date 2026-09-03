@@ -44,10 +44,17 @@ pub async fn receive(
                 .github_app_webhook_secret
                 .as_deref()
                 .ok_or_else(|| {
-                    ApiError::internal(
-                        "verify GitHub webhook",
-                        "DF_GITHUB_APP_WEBHOOK_SECRET is not configured",
-                    )
+                    // A misconfigured deployment, not an attacker-observable
+                    // fact — but a distinct public status here would still
+                    // tell an external caller "something about this endpoint
+                    // is different from a plain unknown-provider request", so
+                    // this answers the same uniform 404 and relies on the
+                    // error-level log for operator alerting instead.
+                    tracing::error!(
+                        provider = %provider,
+                        "DF_GITHUB_APP_WEBHOOK_SECRET is not configured; rejecting all GitHub webhooks"
+                    );
+                    webhook_not_found()
                 })?;
             let parsed = verify_and_parse(
                 provider,
@@ -75,12 +82,19 @@ pub async fn receive(
                 .await
                 .map_err(ApiError::from)?
                 .ok_or_else(|| {
-                    ApiError::internal(
-                        "load resolved tracker connection",
-                        format!(
-                            "tracker_connection_index resolved org {org_id}, but org has no {provider} connection"
-                        ),
-                    )
+                    // Should be unreachable: `tracker_connection_index` is
+                    // only ever written alongside the `tracker_connections`
+                    // row it points at (§5a). Treat it as an invariant
+                    // violation to alert on, not a distinct public response —
+                    // a 500 here would let an external caller distinguish
+                    // "unknown id" from "id resolved to a broken row",
+                    // narrowing exactly the thing the index is meant to hide.
+                    tracing::error!(
+                        provider = %provider,
+                        org_id = %org_id,
+                        "tracker_connection_index resolved an org with no matching tracker_connections row"
+                    );
+                    webhook_not_found()
                 })?;
             (tx, connection, parsed)
         }
@@ -102,12 +116,12 @@ pub async fn receive(
                 .await
                 .map_err(ApiError::from)?
                 .ok_or_else(|| {
-                    ApiError::internal(
-                        "load resolved JIRA connection",
-                        format!(
-                            "tracker_connection_index resolved org {org_id}, but org has no jira connection"
-                        ),
-                    )
+                    tracing::error!(
+                        provider = %provider,
+                        org_id = %org_id,
+                        "tracker_connection_index resolved an org with no matching tracker_connections row"
+                    );
+                    webhook_not_found()
                 })?;
             let encoded_secret = connection
                 .encrypted_webhook_secret
