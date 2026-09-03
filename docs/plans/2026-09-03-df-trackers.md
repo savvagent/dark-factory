@@ -85,7 +85,9 @@ whatever the server-side tasks exposed.
 **Files:** `crates/df-core/migrations/0011_trackers.sql`, `crates/df-core/src/crypto.rs`,
 `crates/df-core/src/trackers.rs`, `crates/df-core/src/error.rs`, `crates/df-core/src/lib.rs`,
 `crates/df-core/Cargo.toml`, `crates/df-core/tests/isolation.rs`,
-`crates/df-auth/src/crypto.rs`, `crates/df-auth/Cargo.toml`.
+`crates/df-core/tests/trackers.rs`, `crates/df-auth/src/crypto.rs`,
+`crates/df-auth/Cargo.toml`, `crates/df-server/src/main.rs`, `crates/df-server/src/lib.rs`,
+`crates/df-web/src/state.rs`, `crates/df-web/src/lib.rs`, `crates/df-web/tests/common/mod.rs`.
 
 **Interfaces:** produces `df_core::trackers::{Provider, TrackerConnection, TrackerBinding,
 upsert_connection, get_connection, delete_connection, upsert_binding, get_binding,
