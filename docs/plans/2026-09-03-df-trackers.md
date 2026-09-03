@@ -169,27 +169,38 @@ to consume. Consumes nothing new (no dependency edges added).
 
 ## Task 2 — GitHub App + JIRA OAuth clients ✅ (PR #20)
 
+**Remaining (deferred to the sync-engine task, since `df-trackers` performs no SQL):**
+persisting a rotated JIRA refresh token back into `tracker_connections.encrypted_credentials`,
+and bridging `TrackerConnection.external_id: String` to `GithubAppClient`'s
+`installation_id: i64`. PR #20 shipped the client-side halves of both (`OAuthTokens`
+returns the rotated pair and exposes `seal_refresh_token`/`open_refresh_token`; the GitHub
+client takes a typed `i64`) — the write-back and the parse-and-fail-loudly bridge belong to
+whichever task first constructs a `Tx` around a live call (Task 4 or 5).
+
 **Files:** `crates/df-trackers/src/github.rs`, `crates/df-trackers/src/jira.rs`,
 `crates/df-trackers/src/lib.rs`, `crates/df-trackers/Cargo.toml` (add `jsonwebtoken` for
 GitHub App JWT signing if not already present — check first), `crates/df-server` config
 (`DF_GITHUB_APP_ID`, `DF_GITHUB_APP_PRIVATE_KEY`, `DF_GITHUB_APP_WEBHOOK_SECRET` — new env
 vars, additive, documented in `.env.example` with the *why*).
 
-- [ ] GitHub: mint a JWT from the App id + private key (RS256, 10-minute expiry per
+- [x] GitHub: mint a JWT from the App id + private key (RS256, 10-minute expiry per
       GitHub's own requirement), exchange it for a short-lived installation access token
       per `external_id` (the installation id stored in `tracker_connections`), cache
       in-memory with the token's own expiry (installation tokens are ~1 hour).
-- [ ] GitHub: issue/comment API calls (`POST /repos/{owner}/{repo}/issues/{n}/comments`,
+- [x] GitHub: issue/comment API calls (`POST /repos/{owner}/{repo}/issues/{n}/comments`,
       label read, issue state PATCH) using the minted token.
-- [ ] JIRA: authorization-code exchange for a refresh token pair, encrypted via
+- [x] JIRA: authorization-code exchange for a refresh token pair, encrypted via
       `df_core::crypto::Cipher` into `tracker_connections.encrypted_credentials`;
-      refresh-token rotation on expiry, writing the new sealed value back.
-- [ ] JIRA: issue API calls (comment, transition) using the site id (`external_id`) and
+      refresh-token rotation on expiry, writing the new sealed value back. *(The
+      exchange, rotation, and seal/open helpers shipped in PR #20; the actual write-back
+      into `tracker_connections` needs a `Tx`, which `df-trackers` cannot construct — see
+      Remaining above.)*
+- [x] JIRA: issue API calls (comment, transition) using the site id (`external_id`) and
       the rotating access token.
-- [ ] Recorded-fixture tests (no live network) for both clients, per the design doc's own
+- [x] Recorded-fixture tests (no live network) for both clients, per the design doc's own
       testing guidance for `df-trackers`.
-- [ ] `cargo test -p df-trackers`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all`.
-- [ ] Commit.
+- [x] `cargo test -p df-trackers`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all`.
+- [x] Commit.
 
 ## Task 3 — Webhook ingest ⬜
 
