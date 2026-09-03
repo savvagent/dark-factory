@@ -80,7 +80,14 @@ fn web_state(db: Db, config: &Config) -> Result<df_web::AppState> {
     let cipher = df_auth::crypto::Cipher::from_base64_key(&config.encryption_key)
         .context("DF_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
-    Ok(df_web::AppState::new(db, cipher, web_config(config)))
+    let web_config = web_config(config);
+    // Built here and once: `rp_id` is what every passkey is bound to, so a bad
+    // value must stop the process rather than surface as a browser error on
+    // somebody's first sign-in.
+    let webauthn = df_web::relying_party(&web_config)
+        .context("could not build the WebAuthn relying party from DF_PUBLIC_URL")?;
+
+    Ok(df_web::AppState::new(db, cipher, webauthn, web_config))
 }
 
 /// Every setting `df-web` takes from this deployment, in one place so it can be

@@ -27,10 +27,9 @@
    * sign in first. That check is what keeps a code that goes astray from being
    * a free seat.
    */
-  const PUBLIC = ['/login', '/signup'];
+  const PUBLIC = ['/login', '/signup', '/claim'];
 
   const isPublic = $derived(PUBLIC.some((p) => page.url.pathname === p));
-  const onEnrollment = $derived(page.url.pathname === '/enroll');
 
   $effect(() => {
     void resolve();
@@ -72,12 +71,18 @@
       return;
     }
 
-    if (session.me?.mustEnrollTotp && !onEnrollment) {
-      void goto('/enroll', { replaceState: true });
-      return;
-    }
-
-    if (isPublic && !session.me?.mustEnrollTotp) {
+    // No enrollment gate any more: a session only exists for an account that
+    // already registered a passkey, because the passkey is what creates the
+    // account.
+    //
+    // One exception, and it is not a half-signed-in state so much as a
+    // half-*introduced* one. Signup creates the account from the passkey and
+    // asks for an address on the step after, so between those two the account
+    // is signed in and sitting on `/signup` on purpose. Bouncing it to `/` the
+    // moment the session appears makes that second step unreachable — which is
+    // exactly what it did until a browser test caught it.
+    const needsProfile = session.me != null && session.me.user.email == null;
+    if (isPublic && !needsProfile) {
       void goto('/', { replaceState: true });
     }
   });
@@ -107,7 +112,7 @@
         dark-factory
       </a>
 
-      {#if session.signedIn && !session.me?.mustEnrollTotp}
+      {#if session.signedIn}
         <nav class="ml-2 hidden gap-1 text-sm sm:flex" aria-label="Organizations">
           {#each session.orgs as membership (membership.orgId)}
             <a
@@ -131,7 +136,7 @@
 
       <div class="ml-auto flex items-center gap-3 text-sm">
         {#if session.me}
-          <span class="hidden text-faint sm:inline">{session.me.user.email}</span>
+          <span class="hidden text-faint sm:inline">{session.me.user.email ?? 'no email set'}</span>
           <button
             class="rounded-md border border-edge px-2.5 py-1 text-muted transition hover:bg-raised hover:text-ink disabled:opacity-50"
             onclick={signOut}

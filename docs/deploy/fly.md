@@ -153,15 +153,30 @@ Everything. `/readyz` passes, the API works end to end for an MCP client, and th
 console is served — `web/` is built into `/srv/console` by the Dockerfile's console
 stage, which `DF_STATIC_DIR` points at.
 
-Onboarding is self-contained, which it was not before: **the product sends no email**.
-Signing up hands back the TOTP enrollment in its own response, so an account is created,
-enrolled, and signed in during a single visit to `/signup`, with no mail provider in the
-loop and nothing to configure. Recovery is recovery codes, or an org admin clearing a
-member's authenticator. Invitations are one-time codes the admin copies out of the
-console and delivers themselves.
+Onboarding is self-contained: **the product sends no email**. Signing up creates a passkey
+in the browser, so an account is created and signed in during a single visit to `/signup`,
+with no mail provider in the loop and nothing to configure. Recovery is a second passkey,
+or an org admin clearing a member's keys and handing over the one-time code that comes
+back. Invitations are codes the admin copies out of the console.
 
 There is consequently no `DF_ALLOW_LOG_MAILER`, no `Mailer`, and no deployment state in
 which links go to a log instead of a mailbox.
+
+### `DF_PUBLIC_URL`'s host is now load-bearing in a way it was not before
+
+A passkey is cryptographically bound to the WebAuthn **relying party id**, which
+`df-server` derives from `DF_PUBLIC_URL`'s host and asserts at startup (`df_web::relying_party`
+refuses to boot on a mismatch rather than failing at somebody's first sign-in).
+
+**Changing that host invalidates every passkey ever registered.** Nothing can soften it;
+that is what binding a credential to an origin means. This is exactly why the hostname
+below was settled before the first account existed, and why moving the console behind the
+Cloudflare Worker in [issue #2](https://github.com/savvagent/dark-factory/issues/2) is
+designed to keep `DF_PUBLIC_URL` unchanged rather than to swap it for a new one.
+
+Note also that account creation now requires a browser: there is no scripted signup, so
+`docs/clients/matrix.md`'s conformance sequence needs a real browser or a virtual
+authenticator for its first step.
 
 ## The hostname, and why it was settled early
 
@@ -178,10 +193,9 @@ in DNS is needed, because the dedicated IPv6 is what Fly validates ownership
 against.
 
 **This was decided before the first account existed, on purpose.** `DF_PUBLIC_URL`
-is the OAuth issuer, the token audience, and both discovery documents — and once
-passkeys land it is also the WebAuthn relying party id that every credential is
-cryptographically bound to. Changing it after people hold passkeys re-registers
-all of them. Doing it while the database held zero users cost nothing.
+is the OAuth issuer, the token audience, and both discovery documents — and, as the
+section above lays out, it is also the WebAuthn relying party id that every passkey is
+cryptographically bound to. Doing it while the database held zero users cost nothing.
 
 A later move behind a Cloudflare Worker keeps this same hostname: a Worker custom
 domain serves `df.savvagent.com` directly and proxies to the Fly app, so

@@ -22,6 +22,7 @@ tower-http.workspace = true
 url.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+anyhow.workspace = true
 
 [dev-dependencies]
 # Integration tests link df-web as an external crate, so anything they name
@@ -41,3 +42,6 @@ sha2.workspace = true
 totp-rs.workspace = true
 # `ServiceExt::oneshot`, for driving the assembled router without binding a port.
 tower = { workspace = true, features = ["util"] }
+webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softtoken"] }
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "resident-key-support", "conditional-ui"] }
+webauthn-rs-proto = "0.5.5"

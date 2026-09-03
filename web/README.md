@@ -39,7 +39,7 @@ the session and no CORS header could rescue it.
 
 ## What holds across the app
 
-**No credential is spent on a `GET`.** Invitation links point
+**No credential is spent on a `GET`.** Invitation and claim links point
 at pages here — `/verify`, `/recover`, `/invite/{org}` — which render a button that
 `POST`s the token. Mail scanners and link-preview fetchers follow every URL in every
 message, and a single-use `GET` is burned before the human clicks it. `df-web`'s

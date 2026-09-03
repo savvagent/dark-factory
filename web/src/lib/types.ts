@@ -21,7 +21,8 @@ export type TokenKind = 'oauth' | 'pat';
 
 export interface User {
   id: string;
-  email: string;
+  /** Absent until the account sets one — a passkey creates the account. */
+  email: string | null;
   name: string | null;
   createdAt: string;
   disabledAt: string | null;
@@ -49,8 +50,8 @@ export interface Membership {
 export interface Me {
   user: User;
   orgs: Membership[];
-  mustEnrollTotp: boolean;
-  recoveryCodesRemaining: number;
+  shouldAddPasskey: boolean;
+  passkeyCount: number;
 }
 
 export interface Joined {
@@ -60,19 +61,12 @@ export interface Joined {
 
 export interface SessionOpened {
   user: User;
-  mustEnrollTotp: boolean;
-}
-
-/** Shown exactly once. Only hashes are stored. */
-export interface Enrollment {
-  provisioningUri: string;
-  manualKey: string;
-  recoveryCodes: string[];
+  shouldAddPasskey: boolean;
 }
 
 export interface OrgMember {
   id: string;
-  email: string;
+  email: string | null;
   name: string | null;
   role: Role;
   joinedAt: string;
@@ -98,6 +92,34 @@ export interface Invite {
  * code re-invites rather than looking it up.
  */
 export interface CreatedInvite extends Invite {
+  code: string;
+  link: string;
+}
+
+/** A registered authenticator, as the console lists it. */
+export interface Passkey {
+  id: string;
+  nickname: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+/** A WebAuthn challenge plus the id that lets the server find its own state. */
+export interface RegistrationChallenge {
+  ceremonyId: string;
+  challenge: unknown;
+}
+
+export interface AuthenticationChallenge {
+  ceremonyId: string;
+  challenge: unknown;
+}
+
+/**
+ * A one-time code letting an account register a passkey again, returned once
+ * to the admin who cleared them. Nothing is emailed.
+ */
+export interface ClaimCode {
   code: string;
   link: string;
 }

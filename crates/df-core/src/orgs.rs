@@ -71,7 +71,14 @@ pub struct Org {
 #[serde(rename_all = "camelCase")]
 pub struct User {
     pub id: UserId,
-    pub email: String,
+    /// Absent until the account sets one.
+    ///
+    /// A passkey is what brings an account into existence, so there is a real
+    /// moment — between registering a key and filling in a profile — where an
+    /// account has no address. That is the moment that lets signup take no
+    /// identifier at all, which is what removes the enumeration oracle; the
+    /// nullability is the price and it is worth paying. Unique when set.
+    pub email: Option<String>,
     pub name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -94,7 +101,7 @@ pub struct Membership {
 #[serde(rename_all = "camelCase")]
 pub struct OrgMember {
     pub id: UserId,
-    pub email: String,
+    pub email: Option<String>,
     pub name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -213,6 +220,64 @@ impl Db {
     /// Idempotent because signup, invite acceptance, and federated first-login
     /// all race toward the same row and none of them should fail because
     /// another got there first.
+    /// Create an account with no address, for a passkey that has just been
+    /// registered.
+    ///
+    /// The account is real and signable-into from this moment; the profile
+    /// comes after. Nothing about it is reachable by anyone who does not hold
+    /// the key, so an abandoned registration leaves an inert row rather than a
+    /// claimable identity — which is exactly what the old email-first signup
+    /// could not say.
+    pub async fn create_unclaimed_user(&self) -> Result<User> {
+        let user = sqlx::query_as(&format!(
+            "INSERT INTO users (email, name) VALUES (NULL, NULL) RETURNING {USER_COLS}"
+        ))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(user)
+    }
+
+    /// Set the address and display name on an account that has a passkey.
+    ///
+    /// The address is unique when set, so this is where "that address is taken"
+    /// is discovered. Deliberately a *signed-in* operation: it is the one place
+    /// the product will tell you whether an address is in use, and requiring a
+    /// session makes that answer attributable, rate-limited, and auditable
+    /// rather than something a stranger can walk a list against.
+    pub async fn set_profile(
+        &self,
+        user: UserId,
+        email: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<User> {
+        if let Some(email) = email {
+            let email = email.trim();
+            if email.is_empty() || !email.contains('@') {
+                return Err(Error::Invalid(format!("{email:?} is not an email address")));
+            }
+        }
+
+        let updated = sqlx::query_as(&format!(
+            "UPDATE users SET \
+               email = COALESCE($2, email), \
+               name  = COALESCE($3, name) \
+             WHERE id = $1 RETURNING {USER_COLS}"
+        ))
+        .bind(user)
+        .bind(email.map(str::trim))
+        .bind(name.map(str::trim))
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(d) if d.is_unique_violation() => {
+                Error::Invalid("that email address is already in use".to_string())
+            }
+            _ => Error::from(e),
+        })?;
+
+        Ok(updated)
+    }
+
     pub async fn upsert_user(&self, email: &str, name: Option<&str>) -> Result<User> {
         let email = email.trim();
         if email.is_empty() || !email.contains('@') {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { api, ApiError } from '$lib/api';
   import { useOrg } from '$lib/org.svelte';
-  import { slugPreview } from '$lib/format';
+  import { slugPreview, person } from '$lib/format';
   import type { OrgMember, Team, TeamMember } from '$lib/types';
   import Alert from '$lib/components/Alert.svelte';
   import Button from '$lib/components/Button.svelte';
@@ -194,7 +194,7 @@
                   {#each roster as member (member.userId)}
                     <li class="flex items-center gap-3 py-2 text-sm">
                       <span class="min-w-0 flex-1 truncate text-muted">
-                        {member.name ?? member.email}
+                        {person(member.name, member.email)}
                       </span>
                       {#if org.isAdmin}
                         <Button
@@ -235,7 +235,7 @@
                   >
                     <option value="">Add a member…</option>
                     {#each candidates(team.slug) as member (member.id)}
-                      <option value={member.id}>{member.name ?? member.email}</option>
+                      <option value={member.id}>{person(member.name, member.email)}</option>
                     {/each}
                   </select>
                 </label>
