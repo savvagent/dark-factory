@@ -7,11 +7,21 @@ use crate::{Error, Result};
 const USER_AGENT: &str = "dark-factory/0.1";
 const MAX_ERROR_BODY_BYTES: usize = 256;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: i64,
+}
+
+impl std::fmt::Debug for OAuthTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthTokens")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 impl OAuthTokens {
@@ -242,7 +252,10 @@ fn redact_secret_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, value) in map.iter_mut() {
-                if matches!(key.as_str(), "token" | "access_token" | "refresh_token") {
+                if matches!(
+                    key.as_str(),
+                    "token" | "access_token" | "refresh_token" | "client_secret"
+                ) {
                     *value = Value::String("<redacted>".into());
                 } else {
                     redact_secret_fields(value);

@@ -14,10 +14,19 @@ const JWT_IAT_SKEW_SECONDS: i64 = 30;
 const INSTALLATION_TOKEN_REFRESH_SKEW_SECONDS: i64 = 30;
 const MAX_ERROR_BODY_BYTES: usize = 256;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct CachedToken {
     token: String,
     expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for CachedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -27,10 +36,19 @@ struct AppClaims {
     iss: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct InstallationTokenResponse {
     token: String,
     expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for InstallationTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallationTokenResponse")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +317,10 @@ fn redact_secret_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, value) in map.iter_mut() {
-                if matches!(key.as_str(), "token" | "access_token" | "refresh_token") {
+                if matches!(
+                    key.as_str(),
+                    "token" | "access_token" | "refresh_token" | "client_secret"
+                ) {
                     *value = Value::String("<redacted>".into());
                 } else {
                     redact_secret_fields(value);
