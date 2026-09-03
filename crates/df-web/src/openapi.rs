@@ -570,10 +570,56 @@ fn response_schemas() -> Value {
             },
             "required": ["provisioningUri", "manualKey", "recoveryCodes"],
         },
-        "RecoveryCodes": {
+        "RegistrationChallenge": {
             "type": "object",
-            "properties": { "codes": { "type": "array", "items": { "type": "string" } } },
-            "required": ["codes"],
+            "description":
+                "A WebAuthn creation challenge. Pass `challenge` to \
+                 navigator.credentials.create() and send the result back with the \
+                 same ceremonyId.",
+            "properties": {
+                "ceremonyId": { "type": "string", "format": "uuid" },
+                "challenge": {
+                    "type": "object",
+                    "description": "PublicKeyCredentialCreationOptions, as the W3C defines it.",
+                },
+            },
+            "required": ["ceremonyId", "challenge"],
+        },
+        "AuthenticationChallenge": {
+            "type": "object",
+            "description":
+                "A WebAuthn request challenge. allowCredentials is empty: the \
+                 credential the browser picks is what identifies the account.",
+            "properties": {
+                "ceremonyId": { "type": "string", "format": "uuid" },
+                "challenge": {
+                    "type": "object",
+                    "description": "PublicKeyCredentialRequestOptions, as the W3C defines it.",
+                },
+            },
+            "required": ["ceremonyId", "challenge"],
+        },
+        "Passkey": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "format": "uuid" },
+                "nickname": { "type": ["string", "null"] },
+                "createdAt": { "type": "string", "format": "date-time" },
+                "lastUsedAt": { "type": ["string", "null"], "format": "date-time" },
+            },
+            "required": ["id", "nickname", "createdAt", "lastUsedAt"],
+        },
+        "PasskeyList": { "type": "array", "items": reference("Passkey") },
+        "ClaimCode": {
+            "type": "object",
+            "description":
+                "A one-time code letting an account register a passkey again. \
+                 Returned once, to the admin who asked for it.",
+            "properties": {
+                "code": { "type": "string" },
+                "link": { "type": "string" },
+            },
+            "required": ["code", "link"],
         },
         "CreatedInvite": {
             "type": "object",
@@ -609,16 +655,56 @@ fn request_schemas() -> Value {
             },
             "required": ["email"],
         },
-        "ConfirmSignupRequest": {
+        "FinishRegistration": {
             "type": "object",
-            "description":
-                "Finishes signup: the address that started it, and a code from the \
-                 authenticator it was just scanned into.",
             "properties": {
-                "email": { "type": "string", "format": "email" },
-                "code": { "type": "string" },
+                "ceremonyId": { "type": "string", "format": "uuid" },
+                "credential": {
+                    "type": "object",
+                    "description": "The PublicKeyCredential from navigator.credentials.create().",
+                },
+                "nickname": { "type": ["string", "null"] },
             },
-            "required": ["email", "code"],
+            "required": ["ceremonyId", "credential"],
+        },
+        "FinishAuthentication": {
+            "type": "object",
+            "properties": {
+                "ceremonyId": { "type": "string", "format": "uuid" },
+                "credential": {
+                    "type": "object",
+                    "description": "The PublicKeyCredential from navigator.credentials.get().",
+                },
+            },
+            "required": ["ceremonyId", "credential"],
+        },
+        "ClaimRequest": {
+            "type": "object",
+            "properties": { "code": { "type": "string" } },
+            "required": ["code"],
+        },
+        "FinishClaim": {
+            "type": "object",
+            "description": "The code is spent here, not at claim/start.",
+            "properties": {
+                "ceremonyId": { "type": "string", "format": "uuid" },
+                "code": { "type": "string" },
+                "credential": { "type": "object" },
+                "nickname": { "type": ["string", "null"] },
+            },
+            "required": ["ceremonyId", "code", "credential"],
+        },
+        "ProfileRequest": {
+            "type": "object",
+            "properties": {
+                "email": { "type": ["string", "null"], "format": "email" },
+                "name": { "type": ["string", "null"] },
+            },
+        },
+        "RenameKeyRequest": {
+            "type": "object",
+            "properties": { "nickname": { "type": "string" } },
+            "required": ["nickname"],
         },
         "LoginRequest": {
             "type": "object",
@@ -832,7 +918,9 @@ mod tests {
     #[test]
     fn every_single_use_redemption_is_a_post() {
         let redemptions = [
-            "/api/auth/signup/confirm",
+            "/api/auth/signup/finish",
+            "/api/auth/login/finish",
+            "/api/auth/claim/finish",
             "/api/orgs/{org}/invites/accept",
             "/oauth/token",
         ];
@@ -863,7 +951,7 @@ mod tests {
     /// as a route means somebody has quietly reintroduced a mailer.
     #[test]
     fn redeemable_urls_are_pages_not_endpoints() {
-        for path in ["/invite/{org}", "/verify", "/recover"] {
+        for path in ["/invite/{org}", "/claim", "/verify", "/recover"] {
             assert!(
                 !catalog().iter().any(|e| e.path == path),
                 "{path} is a URL handed to a human. It must stay a client-side page — \

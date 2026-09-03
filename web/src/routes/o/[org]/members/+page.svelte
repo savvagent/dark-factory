@@ -2,8 +2,8 @@
   import { api, ApiError } from '$lib/api';
   import { useOrg } from '$lib/org.svelte';
   import { session } from '$lib/session.svelte';
-  import { relative } from '$lib/format';
-  import type { CreatedInvite, Invite, OrgMember, Role } from '$lib/types';
+  import { relative, person } from '$lib/format';
+  import type { ClaimCode, CreatedInvite, Invite, OrgMember, Role } from '$lib/types';
   import Alert from '$lib/components/Alert.svelte';
   import Button from '$lib/components/Button.svelte';
   import Card from '$lib/components/Card.svelte';
@@ -39,6 +39,7 @@
   let inviting = $state(false);
   let inviteError = $state<string | undefined>(undefined);
   let minted = $state<CreatedInvite | undefined>(undefined);
+  let claim = $state<ClaimCode | undefined>(undefined);
 
   $effect(() => {
     const slug = org.slug;
@@ -103,6 +104,25 @@
     }
   }
 
+  /**
+   * Clear a member's passkeys and hold on to the code that comes back.
+   *
+   * Kept on screen until dismissed, because it is returned exactly once — only
+   * its hash is stored, so an admin who navigates away has to reset again.
+   */
+  async function resetPasskeys(memberId: string) {
+    busy = `${memberId}:reset`;
+    error = undefined;
+    claim = undefined;
+    try {
+      claim = await api.resetMemberPasskeys(org.slug, memberId);
+    } catch (e) {
+      error = e instanceof ApiError ? e.message : 'Could not reset those passkeys.';
+    } finally {
+      busy = undefined;
+    }
+  }
+
   const roles: Role[] = ['owner', 'admin', 'member'];
 </script>
 
@@ -115,6 +135,23 @@
   </div>
 
   {#if error}<Alert>{error}</Alert>{/if}
+
+  {#if claim}
+    <div class="space-y-3 rounded-lg border border-warn/40 bg-warn/5 p-4">
+      <p class="text-sm text-ink">
+        Passkeys cleared. Give them this code — <span class="text-muted"
+          >it is shown only now and cannot be looked up again. If you lose it, reset again.</span
+        >
+      </p>
+      <CopyField label="Link" value={claim.link} />
+      <CopyField label="Code" value={claim.code} />
+      <p class="text-xs text-faint">
+        It works once, expires in 14 days, and is the only way back into that account. Anyone
+        holding it can register a passkey on it, so hand it over the way you would a password.
+      </p>
+      <Button tone="quiet" onclick={() => (claim = undefined)}>Done</Button>
+    </div>
+  {/if}
 
   {#if org.isAdmin}
     <Card
@@ -172,7 +209,7 @@
           <li class="flex flex-wrap items-center gap-3 py-2.5">
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2 text-sm">
-                <span class="text-ink">{member.name ?? member.email}</span>
+                <span class="text-ink">{person(member.name, member.email)}</span>
                 {#if isMe}<span class="text-xs text-faint">(you)</span>{/if}
                 {#if member.disabledAt}
                   <span class="rounded-full border border-bad/50 px-2 py-0.5 text-xs text-bad">
@@ -180,7 +217,9 @@
                   </span>
                 {/if}
               </div>
-              <p class="text-xs text-faint">{member.email} · joined {relative(member.joinedAt)}</p>
+              <p class="text-xs text-faint">
+                {member.email ?? 'no email set'} · joined {relative(member.joinedAt)}
+              </p>
             </div>
 
             {#if org.isAdmin}
@@ -216,28 +255,27 @@
                 Force sign-out
               </Button>
 
-              <!-- The only assisted account recovery there is: no email means no
-                   recovery link, so an admin is the last resort for someone who
-                   has lost both their authenticator and their codes. It grants
-                   nothing — they enrol again themselves. -->
+              <!-- The only assisted account recovery there is. No email means
+                   no recovery link, so an admin is the last resort for someone
+                   who has lost every device they registered. The code it
+                   returns is what stops the emptied account being claimable by
+                   whoever reaches registration first. -->
               {#if org.isOwner || member.role !== 'owner'}
                 <Button
                   tone="quiet"
                   pending={busy === `${member.id}:reset`}
-                  title="Clear their authenticator so they can enrol a new one. Ends their sessions. Gives you no access to the account."
+                  title="Clear their passkeys and get a one-time code they can use to register a new one. Ends their sessions."
                   onclick={() => {
                     if (
                       confirm(
-                        `Clear the authenticator for ${member.email}? They will be signed out everywhere and must enrol again from scratch.`
+                        `Clear every passkey for ${member.email ?? 'this account'}? They will be signed out everywhere and must register again with the code you are about to be given.`
                       )
                     ) {
-                      act(`${member.id}:reset`, () =>
-                        api.resetMemberAuthenticator(org.slug, member.id)
-                      );
+                      resetPasskeys(member.id);
                     }
                   }}
                 >
-                  Reset authenticator
+                  Reset passkeys
                 </Button>
               {/if}
             {/if}

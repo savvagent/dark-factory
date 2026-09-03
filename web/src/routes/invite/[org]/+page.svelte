@@ -59,8 +59,9 @@
     <Alert>This link is missing its token. Ask whoever invited you to send another.</Alert>
   {:else}
     <p class="mt-1 text-sm text-faint">
-      You are signed in as <span class="text-muted">{session.me?.user.email}</span>. An invitation
-      can only be accepted by the address it was sent to.
+      You are signed in as <span class="text-muted"
+        >{session.me?.user.email ?? 'an account with no email set'}</span
+      >. An invitation can only be accepted by the address it was sent to.
     </p>
 
     {#if error}

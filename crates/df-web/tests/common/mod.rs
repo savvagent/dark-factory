@@ -20,6 +20,8 @@ use http::{Request, Response, StatusCode};
 use serde_json::Value;
 use sqlx::PgPool;
 use tower::ServiceExt;
+use webauthn_authenticator_rs::softtoken::SoftToken;
+use webauthn_authenticator_rs::WebauthnAuthenticator;
 
 pub const RESOURCE: &str = "https://mcp.dark-factory.test/mcp";
 pub const PUBLIC_URL: &str = "https://console.dark-factory.test";
@@ -33,7 +35,9 @@ pub struct Harness {
 
 pub fn harness(pool: PgPool) -> Harness {
     let db = Db::from_pool(pool);
-    let state = AppState::new(db.clone(), cipher(), Config::new(PUBLIC_URL, RESOURCE));
+    let config = Config::new(PUBLIC_URL, RESOURCE);
+    let webauthn = df_web::relying_party(&config).expect("relying party");
+    let state = AppState::new(db.clone(), cipher(), webauthn, config);
 
     Harness {
         db,
@@ -206,107 +210,187 @@ pub struct Account {
     pub user: UserId,
     pub email: String,
     pub session: String,
-    pub totp: totp_rs::TOTP,
-    pub recovery_codes: Vec<String>,
+    /// The account's authenticator, kept so a test can sign in again.
+    pub auth: Authenticator,
+    /// base64url, for `allowCredentials`.
+    pub credential_id: String,
 }
 
-/// Take an address through signup → enrollment → confirmation, exactly as a
-/// person would, and hand back a live session.
+/// A software authenticator, standing in for a browser's.
 ///
-/// Deliberately not a shortcut that inserts rows: the point of most of these
-/// tests is that the sequence works end to end, and a fixture that skips it
-/// would test a state the product cannot actually reach.
+/// `SoftToken` produces real COSE signatures over the challenges this server
+/// issued, so these tests exercise the actual verification path. It cannot hold
+/// *discoverable* credentials — see `df-auth`'s `tests/passkeys.rs` for the full
+/// note — so [`soften`] and [`offer`] adjust what is handed to it. Only what
+/// the fake authenticator sees is adjusted; every server-side step is the
+/// production one.
+pub type Authenticator = WebauthnAuthenticator<SoftToken>;
+
+pub fn authenticator() -> Authenticator {
+    WebauthnAuthenticator::new(SoftToken::new(true).unwrap().0)
+}
+
+/// Drop the resident-key requirement before handing a challenge to SoftToken.
+fn soften(mut challenge: Value) -> Value {
+    if let Some(sel) = challenge
+        .get_mut("publicKey")
+        .and_then(|pk| pk.get_mut("authenticatorSelection"))
+    {
+        sel["requireResidentKey"] = Value::Bool(false);
+        sel["residentKey"] = Value::Null;
+    }
+    challenge
+}
+
+/// Name a credential in `allowCredentials`, so a token holding no discoverable
+/// credentials can find the right key. Production sends this list empty.
+fn offer(mut challenge: Value, credential_id: &str) -> Value {
+    challenge["publicKey"]["allowCredentials"] = serde_json::json!([
+        { "type": "public-key", "id": credential_id }
+    ]);
+    challenge
+}
+
+/// Create an account the way a person does: register a passkey, get a session.
+///
+/// Deliberately not a shortcut that inserts rows. The point of most of these
+/// tests is that the sequence works end to end, and a fixture that skipped it
+/// would test a state the product cannot reach.
 pub async fn onboard(h: &Harness, email: &str) -> Account {
-    let started = Call::post("/api/auth/signup")
-        .json(serde_json::json!({ "email": email, "name": "Test User" }))
-        .send(&h.router)
-        .await;
+    let mut auth = authenticator();
+
+    let started = Call::post("/api/auth/signup/start").send(&h.router).await;
     started.expect(StatusCode::OK);
+    assert!(
+        started.session_cookie().is_none(),
+        "a challenge must not open a session"
+    );
 
-    let (totp, recovery_codes) = generator_from(&started.body, email);
+    let ceremony_id = started.body["ceremonyId"].as_str().unwrap().to_string();
+    let challenge: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(soften(started.body["challenge"].clone())).unwrap();
 
-    // The *previous* step, so the current one stays unconsumed and is still
-    // available to log in with. Using one step for both is a replay, which is
-    // exactly what the credential refuses.
-    let previous_step = chrono::Utc::now().timestamp() as u64 - 30;
-    let confirmed = Call::post("/api/auth/signup/confirm")
+    let credential = auth
+        .do_registration(
+            webauthn_rs::prelude::Url::parse(PUBLIC_URL).unwrap(),
+            challenge,
+        )
+        .expect("the authenticator refused the registration challenge");
+
+    let finished = Call::post("/api/auth/signup/finish")
         .json(serde_json::json!({
-            "email": email,
-            "code": totp.generate(previous_step),
+            "ceremonyId": ceremony_id,
+            "credential": credential,
+            "nickname": "test key",
         }))
         .send(&h.router)
         .await;
-    confirmed.expect(StatusCode::OK);
+    finished.expect(StatusCode::OK);
 
-    let session = confirmed
+    let session = finished
         .session_cookie()
-        .expect("confirming signup must open the account's first session");
+        .expect("finishing signup must open the account's first session");
 
-    let user = h.db.get_user_by_email(email).await.unwrap().unwrap().id;
+    let user: UserId = finished.body["user"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Every test that predates passkeys assumes an addressable account, and an
+    // invitation names an address — so set one here rather than in each test.
+    Call::patch("/api/me")
+        .with_session(&session)
+        .json(serde_json::json!({ "email": email, "name": "Test User" }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
+
+    let credential_id = credential_id_of(h, user).await;
 
     Account {
         user,
         email: email.to_string(),
         session,
-        totp,
-        recovery_codes,
+        auth,
+        credential_id,
     }
 }
 
-/// Build a TOTP generator from an enrollment response body.
-fn generator_from(body: &Value, email: &str) -> (totp_rs::TOTP, Vec<String>) {
-    let manual_key = body["manualKey"].as_str().unwrap().to_string();
-    let codes: Vec<String> = body["recoveryCodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c.as_str().unwrap().to_string())
-        .collect();
-
-    let secret = totp_rs::Secret::Encoded(manual_key).to_bytes().unwrap();
-    let generator = totp_rs::TOTP::new(
-        totp_rs::Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret,
-        Some(ISSUER.to_string()),
-        email.to_string(),
+/// The base64url credential id of an account's first passkey, for `offer`.
+async fn credential_id_of(h: &Harness, user: UserId) -> String {
+    use base64::Engine;
+    let raw: Vec<u8> = sqlx::query_scalar(
+        "SELECT credential_id FROM passkeys WHERE user_id = $1 ORDER BY created_at LIMIT 1",
     )
+    .bind(user)
+    .fetch_one(h.db.pool())
+    .await
     .unwrap();
-
-    (generator, codes)
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
-/// Enrol an authenticator through the API and confirm it.
-///
-/// Confirmation uses the *previous* step's code so the current step stays
-/// unconsumed and available to log in with — using one step for both is a
-/// replay, which is exactly what the credential refuses.
-pub async fn enroll(h: &Harness, session: &str, email: &str) -> (totp_rs::TOTP, Vec<String>) {
-    let started = Call::post("/api/me/totp")
-        .with_session(session)
-        .send(&h.router)
-        .await;
-    started.expect(StatusCode::OK);
+/// Drive a registration ceremony to a `…/finish` endpoint, merging any extra
+/// fields the endpoint needs (a claim code, for instance).
+pub async fn finish_registration(
+    h: &Harness,
+    auth: &mut Authenticator,
+    finish_path: &str,
+    started: &Value,
+    extra: Value,
+) -> Reply {
+    let ceremony_id = started["ceremonyId"].as_str().unwrap().to_string();
+    let challenge: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(soften(started["challenge"].clone())).unwrap();
 
-    let (generator, codes) = generator_from(&started.body, email);
+    let credential = auth
+        .do_registration(
+            webauthn_rs::prelude::Url::parse(PUBLIC_URL).unwrap(),
+            challenge,
+        )
+        .expect("the authenticator refused the registration challenge");
 
-    let previous_step = chrono::Utc::now().timestamp() as u64 - 30;
-    Call::post("/api/me/totp/confirm")
-        .with_session(session)
-        .json(serde_json::json!({ "code": generator.generate(previous_step) }))
+    let mut body = serde_json::json!({
+        "ceremonyId": ceremony_id,
+        "credential": credential,
+    });
+    if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            b.insert(k.clone(), v.clone());
+        }
+    }
+
+    Call::post(finish_path.to_string())
+        .json(body)
         .send(&h.router)
         .await
-        .expect(StatusCode::NO_CONTENT);
-
-    (generator, codes)
 }
 
-pub fn now_code(generator: &totp_rs::TOTP) -> String {
-    generator.generate(chrono::Utc::now().timestamp() as u64)
-}
+/// Sign in again with an account's own authenticator.
+pub async fn sign_in(h: &Harness, account: &mut Account) -> Reply {
+    let started = Call::post("/api/auth/login/start").send(&h.router).await;
+    started.expect(StatusCode::OK);
 
+    let ceremony_id = started.body["ceremonyId"].as_str().unwrap().to_string();
+    let challenge: webauthn_rs::prelude::RequestChallengeResponse = serde_json::from_value(offer(
+        started.body["challenge"].clone(),
+        &account.credential_id,
+    ))
+    .unwrap();
+
+    let credential = account
+        .auth
+        .do_authentication(
+            webauthn_rs::prelude::Url::parse(PUBLIC_URL).unwrap(),
+            challenge,
+        )
+        .expect("the authenticator refused the sign-in challenge");
+
+    Call::post("/api/auth/login/finish")
+        .json(serde_json::json!({ "ceremonyId": ceremony_id, "credential": credential }))
+        .send(&h.router)
+        .await
+}
 /// An org with `owner` as its owner.
 pub async fn org_with_owner(h: &Harness, slug: &str, owner: &Account) -> OrgId {
     let created = Call::post("/api/orgs")

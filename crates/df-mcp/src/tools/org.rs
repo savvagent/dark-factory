@@ -57,7 +57,7 @@ impl Factory {
         Ok(Json(out::WhoAmI {
             user: out::UserOut {
                 id: caller.user_id,
-                email: user.as_ref().map(|u| u.email.clone()),
+                email: user.as_ref().and_then(|u| u.email.clone()),
                 name: user.as_ref().and_then(|u| u.name.clone()),
             },
             org: out::OrgOut {

@@ -233,7 +233,7 @@ pub async fn authorize_page(
         &params,
         &scopes,
         &orgs,
-        &caller.user.email,
+        caller.user.email.as_deref().unwrap_or("this account"),
     ))
     .into_response()
 }

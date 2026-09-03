@@ -20,7 +20,7 @@
 //! that check, a forwarded invitation mail is a way into someone else's org for
 //! whoever reads it first.
 
-use crate::db::Tx;
+use crate::db::{Db, Tx};
 use crate::error::{Error, Result};
 use crate::ids::{OrgId, UserId};
 use crate::orgs::Role;
@@ -235,5 +235,78 @@ impl Tx<'_> {
         .await?
         .rows_affected();
         Ok(n)
+    }
+}
+
+// ---------------------------------------------------------------- claim codes
+
+impl Db {
+    /// Issue a one-time code that lets an account register a passkey again.
+    ///
+    /// Minted whenever an admin clears somebody's authenticators, in the same
+    /// operation. An account with no passkeys and no outstanding claim is
+    /// claimable by whoever reaches registration first — the code is what makes
+    /// the account re-registrable only by whoever the admin hands it to.
+    ///
+    /// Supersedes any live claim for the same account, for the same reason one
+    /// live invite per address: an admin who resets twice because the first
+    /// code went astray should end up with one code that works.
+    pub async fn create_account_claim(
+        &self,
+        user: UserId,
+        token_hash: &[u8],
+        issued_by: Option<UserId>,
+    ) -> Result<()> {
+        let mut tx = self.begin_unpinned().await?;
+
+        sqlx::query("DELETE FROM account_claims WHERE user_id = $1 AND consumed_at IS NULL")
+            .bind(user)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO account_claims (user_id, token_hash, issued_by, expires_at) \
+             VALUES ($1, $2, $3, now() + make_interval(days => 14))",
+        )
+        .bind(user)
+        .bind(token_hash)
+        .bind(issued_by)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read a claim without spending it, to start a ceremony against it.
+    ///
+    /// Deliberately non-consuming: a ceremony that is interrupted between the
+    /// challenge and the signature must not burn somebody's only way back into
+    /// their account.
+    pub async fn peek_account_claim(&self, token_hash: &[u8]) -> Result<UserId> {
+        let user: Option<UserId> = sqlx::query_scalar(
+            "SELECT user_id FROM account_claims \
+             WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()",
+        )
+        .bind(token_hash)
+        .fetch_optional(self.pool())
+        .await?;
+
+        user.ok_or(Error::InviteInvalid)
+    }
+
+    /// Spend a claim. One statement, so two requests racing the same code
+    /// cannot both win.
+    pub async fn consume_account_claim(&self, token_hash: &[u8]) -> Result<UserId> {
+        let user: Option<UserId> = sqlx::query_scalar(
+            "UPDATE account_claims SET consumed_at = now() \
+             WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now() \
+             RETURNING user_id",
+        )
+        .bind(token_hash)
+        .fetch_optional(self.pool())
+        .await?;
+
+        user.ok_or(Error::InviteInvalid)
     }
 }

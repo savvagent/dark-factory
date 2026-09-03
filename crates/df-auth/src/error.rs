@@ -18,19 +18,31 @@ pub enum AuthError {
     #[error("no such user")]
     UnknownUser,
 
-    #[error("user has no confirmed TOTP credential")]
-    NoTotp,
+    #[error("account has no registered passkey")]
+    NoPasskey,
 
-    #[error("TOTP code did not match any accepted step")]
-    BadTotpCode,
+    /// Every WebAuthn failure collapses here. The library distinguishes "wrong
+    /// origin" from "user verification not performed" from "bad signature", and
+    /// all of that is useful in a log and none of it is safe to hand back — it
+    /// tells an attacker which part of a forgery to fix next.
+    #[error("the authenticator's response was not accepted")]
+    InvalidCredentials,
 
-    /// The code was valid but already used. Accepting it would defeat the whole
-    /// point of recording consumed steps.
-    #[error("TOTP code was already used")]
-    TotpReplay,
+    /// The challenge is gone: expired, already spent, or never issued by this
+    /// server. Single-use is what stops a captured ceremony being replayed.
+    #[error("that sign-in attempt has expired; start again")]
+    CeremonyExpired,
 
-    #[error("recovery code did not match")]
-    BadRecoveryCode,
+    #[error("that authenticator is already registered")]
+    CredentialAlreadyRegistered,
+
+    #[error("no such passkey on this account")]
+    UnknownCredential,
+
+    /// Removing the last passkey would lock the account out permanently: there
+    /// is no email to recover through, and the click looks like tidying up.
+    #[error("that is the only passkey on this account — register another before removing it")]
+    LastPasskey,
 
     #[error("account is disabled")]
     Disabled,
@@ -99,11 +111,19 @@ impl AuthError {
     pub fn public(&self) -> &'static str {
         match self {
             AuthError::UnknownUser
-            | AuthError::NoTotp
-            | AuthError::BadTotpCode
-            | AuthError::TotpReplay
-            | AuthError::BadRecoveryCode
+            | AuthError::NoPasskey
+            | AuthError::InvalidCredentials
             | AuthError::Disabled => "invalid credentials",
+
+            // Not folded into "invalid credentials": these say *what to do*
+            // rather than whether an account exists, and a user who has to
+            // start the ceremony again needs to be told so.
+            AuthError::CeremonyExpired => "that sign-in attempt expired; try again",
+            AuthError::CredentialAlreadyRegistered => "that authenticator is already registered",
+            AuthError::UnknownCredential => "no such passkey",
+            AuthError::LastPasskey => {
+                "that is the only passkey on this account — register another first"
+            }
 
             AuthError::Expired | AuthError::AlreadyConsumed | AuthError::Revoked => {
                 "credential is no longer valid"

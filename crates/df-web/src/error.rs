@@ -224,11 +224,17 @@ impl From<df_billing::BillingError> for ApiError {
 fn auth_code(e: &AuthError) -> &'static str {
     match e {
         AuthError::UnknownUser
-        | AuthError::NoTotp
-        | AuthError::BadTotpCode
-        | AuthError::TotpReplay
-        | AuthError::BadRecoveryCode
+        | AuthError::NoPasskey
+        | AuthError::InvalidCredentials
         | AuthError::Disabled => "invalid_credentials",
+
+        // Separate codes, because these say *what to do* rather than whether an
+        // account exists: start the ceremony again, use a different
+        // authenticator, register another key first.
+        AuthError::CeremonyExpired => "ceremony_expired",
+        AuthError::CredentialAlreadyRegistered => "credential_already_registered",
+        AuthError::UnknownCredential => "unknown_credential",
+        AuthError::LastPasskey => "last_passkey",
 
         AuthError::Expired | AuthError::AlreadyConsumed | AuthError::Revoked => {
             "credential_expired"
@@ -275,14 +281,18 @@ mod tests {
     }
 
     /// Every credential failure must be indistinguishable from the outside.
+    ///
+    /// Narrower than it was, and for a good reason: with a discoverable
+    /// credential there is no address to leak, so sign-in has far less to hide.
+    /// It still hides it — an unknown credential, a bad signature, and a
+    /// disabled account are one answer, because the differences would tell an
+    /// attacker holding a stolen device which part to work on.
     #[test]
     fn credential_failures_are_one_answer() {
         let seen: Vec<(u16, &str, String)> = [
             AuthError::UnknownUser,
-            AuthError::NoTotp,
-            AuthError::BadTotpCode,
-            AuthError::TotpReplay,
-            AuthError::BadRecoveryCode,
+            AuthError::NoPasskey,
+            AuthError::InvalidCredentials,
             AuthError::Disabled,
         ]
         .into_iter()
