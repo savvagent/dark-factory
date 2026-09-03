@@ -97,6 +97,12 @@ pub enum Error {
     },
 
     #[error("{0}")]
+    Config(String),
+
+    #[error("{0}")]
+    Crypto(String),
+
+    #[error("{0}")]
     Invalid(String),
 
     /// The database cannot enforce tenant isolation as configured. Raised only
@@ -138,6 +144,8 @@ impl Error {
             Error::AlreadyAMember { .. } => "already_a_member",
             Error::InviteInvalid => "invite_invalid",
             Error::InviteWrongAccount { .. } => "invite_wrong_account",
+            Error::Config(_) => "internal_error",
+            Error::Crypto(_) => "internal_error",
             Error::Invalid(_) => "invalid_argument",
             Error::IsolationNotEnforced { .. } => "isolation_not_enforced",
             Error::Db(_) => "internal_error",

@@ -20,6 +20,7 @@ use df_core::jobs::JobFilter;
 use df_core::messages::{InboxQuery, NewMessage};
 use df_core::orgs::Role;
 use df_core::repos::{RepoPatch, RepoRef};
+use df_core::trackers::{resolve_binding, upsert_binding, upsert_connection, Provider};
 use sqlx::PgPool;
 
 #[sqlx::test]
@@ -443,6 +444,137 @@ async fn rls_scopes_an_unscoped_update(pool: PgPool) {
         .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(titles, vec!["globex work".to_string()]);
+}
+
+#[sqlx::test]
+async fn rls_scopes_tracker_connections(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let connection = upsert_connection(
+        &mut tx,
+        a.org,
+        Provider::Github,
+        "installation-1",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin_unpinned().await.unwrap();
+    sqlx::query("SET LOCAL ROLE df_app")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('app.org_id', $1, true)")
+        .bind(b.org.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    let seen: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM tracker_connections WHERE provider = 'github'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    let updated = sqlx::query("UPDATE tracker_connections SET external_id = 'pwned'")
+        .execute(&mut *tx)
+        .await
+        .unwrap()
+        .rows_affected();
+    let deleted = sqlx::query("DELETE FROM tracker_connections")
+        .execute(&mut *tx)
+        .await
+        .unwrap()
+        .rows_affected();
+    tx.commit().await.unwrap();
+
+    assert_eq!(seen, 0, "org B saw org A's tracker connection");
+    assert_eq!(updated, 0, "org B updated org A's tracker connection");
+    assert_eq!(deleted, 0, "org B deleted org A's tracker connection");
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let after = df_core::trackers::get_connection(&mut tx, a.org, Provider::Github)
+        .await
+        .unwrap()
+        .expect("connection survived");
+    tx.commit().await.unwrap();
+    assert_eq!(after.id, connection.id);
+    assert_eq!(after.external_id, "installation-1");
+}
+
+#[sqlx::test]
+async fn rls_scopes_tracker_bindings(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let connection = upsert_connection(
+        &mut tx,
+        a.org,
+        Provider::Github,
+        "installation-1",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let binding = upsert_binding(
+        &mut tx,
+        a.org,
+        a.repo,
+        Some(connection.id),
+        Provider::Github,
+        "acme/api",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin_unpinned().await.unwrap();
+    sqlx::query("SET LOCAL ROLE df_app")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('app.org_id', $1, true)")
+        .bind(b.org.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM tracker_bindings")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let updated = sqlx::query("UPDATE tracker_bindings SET external_ref = 'pwned'")
+        .execute(&mut *tx)
+        .await
+        .unwrap()
+        .rows_affected();
+    let deleted = sqlx::query("DELETE FROM tracker_bindings")
+        .execute(&mut *tx)
+        .await
+        .unwrap()
+        .rows_affected();
+    tx.commit().await.unwrap();
+
+    assert_eq!(seen, 0, "org B saw org A's tracker binding");
+    assert_eq!(updated, 0, "org B updated org A's tracker binding");
+    assert_eq!(deleted, 0, "org B deleted org A's tracker binding");
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let after = resolve_binding(&mut tx, a.org, a.repo, Provider::Github)
+        .await
+        .unwrap()
+        .expect("binding survived");
+    tx.commit().await.unwrap();
+    assert_eq!(after.id, binding.id);
+    assert_eq!(after.external_ref, "acme/api");
 }
 
 // ---------------------------------------------------------------------------

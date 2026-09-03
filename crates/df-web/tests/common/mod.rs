@@ -11,7 +11,7 @@
 use axum::body::Body;
 use axum::Router;
 use base64::Engine;
-use df_auth::crypto::Cipher;
+use df_core::crypto::Cipher;
 use df_core::ids::{OrgId, UserId};
 use df_core::orgs::Role;
 use df_core::Db;

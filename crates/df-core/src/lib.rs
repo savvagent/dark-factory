@@ -17,6 +17,7 @@
 //!    one of the two is genuinely in force. See [`isolation`].
 
 pub mod audit;
+pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod ids;
@@ -28,6 +29,7 @@ pub mod messages;
 pub mod orgs;
 pub mod repos;
 pub mod teams;
+pub mod trackers;
 pub mod usage;
 pub mod watch;
 

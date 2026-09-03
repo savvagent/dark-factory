@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     // construction is infallible from here on, and a bad key is a startup
     // error naming the variable rather than a panic on the first TOTP enrolment
     // hours later.
-    df_auth::crypto::Cipher::from_base64_key(&config.encryption_key)
+    df_core::crypto::Cipher::from_base64_key(&config.encryption_key)
         .context("DF_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
     let db = Db::connect(&config.database_url)

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use df_auth::crypto::Cipher;
+use df_core::crypto::Cipher;
 use df_core::Db;
 
 /// Deployment-dependent settings.

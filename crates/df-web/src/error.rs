@@ -126,7 +126,9 @@ impl From<CoreError> for ApiError {
         // handed.
         match &e {
             Db(inner) => return ApiError::internal("df-core", inner),
-            IsolationNotEnforced { .. } => return ApiError::internal("df-core", &e),
+            IsolationNotEnforced { .. } | Config(_) | Crypto(_) => {
+                return ApiError::internal("df-core", &e)
+            }
             _ => {}
         }
 
@@ -156,7 +158,9 @@ impl From<CoreError> for ApiError {
                 StatusCode::BAD_REQUEST
             }
 
-            Db(_) | IsolationNotEnforced { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Db(_) | IsolationNotEnforced { .. } | Config(_) | Crypto(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
 
         ApiError::new(status, e.code(), e.to_string())
