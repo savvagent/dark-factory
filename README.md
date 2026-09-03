@@ -188,7 +188,7 @@ looking.**
 
 ## Relationship to dark-agent
 
-[`dark-agent`](../dark-agent) is the single-organization ancestor — a TUI hosting a `claude`
+`dark-agent` is the single-organization ancestor — a TUI hosting a `claude`
 PTY plus a queue server authenticated by AWS SigV4 with an IAM-ARN allowlist. dark-factory
 takes the server's ideas (job lifecycle, atomic claim, dependency graph, `LISTEN`/`NOTIFY`
 watch, message channel, repo registry), re-tenants them, and drops the rest. It is not a fork

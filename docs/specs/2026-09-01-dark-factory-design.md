@@ -46,7 +46,7 @@ incomplete (see *Client compatibility*).
 
 ## Relationship to dark-agent
 
-[`dark-agent`](../../../dark-agent) is the single-organization ancestor: a ratatui TUI
+`dark-agent` is the single-organization ancestor: a ratatui TUI
 hosting a `claude` PTY, plus a queue server (`manager-mcp`) authenticated by AWS SigV4
 with an IAM-ARN allowlist, serving one shared queue for one team inside one AWS account.
 
