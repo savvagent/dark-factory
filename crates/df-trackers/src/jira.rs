@@ -90,7 +90,7 @@ impl JiraClient {
             self.http
                 .get(format!(
                     "{}/oauth/token/accessible-resources",
-                    self.auth_base
+                    self.api_base
                 ))
                 .header(reqwest::header::USER_AGENT, USER_AGENT)
                 .bearer_auth(access_token),
