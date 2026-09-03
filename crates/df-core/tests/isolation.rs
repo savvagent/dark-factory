@@ -444,3 +444,280 @@ async fn rls_scopes_an_unscoped_update(pool: PgPool) {
     tx.commit().await.unwrap();
     assert_eq!(titles, vec!["globex work".to_string()]);
 }
+
+// ---------------------------------------------------------------------------
+// The guard on the guard.
+//
+// Everything above proves isolation holds *in this test database*. These prove
+// the server can tell whether it holds in some *other* database — which is a
+// different question, and the one a deployment gets wrong. Row-level security
+// is the guard the environment can switch off: identical migrations isolate
+// under one connecting role and not at all under another.
+// ---------------------------------------------------------------------------
+
+/// The happy path, and the reason it is not trivial: `#[sqlx::test]` connects as
+/// the role Postgres was initialised with, which is a superuser. Isolation here
+/// is real only because `SET LOCAL ROLE df_app` drops out of it, so a passing
+/// assertion is evidence the role was genuinely assumed.
+#[sqlx::test]
+async fn isolation_verifies_on_a_healthy_database(pool: PgPool) {
+    let db = db(pool);
+    let report = db
+        .verify_tenant_isolation()
+        .await
+        .expect("a freshly migrated database must enforce isolation");
+
+    assert!(
+        report.tenant_role_assumed,
+        "the test database can create df_app, so it must have been assumed — \
+         a false here means begin() is no longer dropping out of the superuser"
+    );
+    assert_eq!(report.effective_role, "df_app");
+    assert!(!report.role_is_superuser && !report.role_bypasses_rls);
+    assert!(
+        report.tables.len() >= 13,
+        "expected every tenant table from 0007_rls.sql, got {:?}",
+        report.tables.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+    assert!(
+        report.tables.iter().all(|t| t.rls_forced),
+        "every tenant table must be FORCE ROW LEVEL SECURITY — that is what \
+         carries isolation on a deployment that cannot create df_app"
+    );
+}
+
+/// Turning RLS off on one table must fail the check, naming that table. This is
+/// the shape of a future migration that adds a tenant table and forgets the
+/// `ENABLE ROW LEVEL SECURITY` half.
+#[sqlx::test]
+async fn isolation_refuses_a_table_with_row_level_security_disabled(pool: PgPool) {
+    sqlx::query("ALTER TABLE jobs DISABLE ROW LEVEL SECURITY")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let db = db(pool);
+    let err = db
+        .verify_tenant_isolation()
+        .await
+        .expect_err("a tenant table with RLS off is not isolated");
+
+    let message = err.to_string();
+    assert!(message.contains("jobs"), "{message}");
+    assert!(message.contains("not enabled"), "{message}");
+    assert_eq!(err.code(), "isolation_not_enforced");
+}
+
+/// A database that never ran `0007_rls.sql` must not read as healthy. Dropping
+/// every policy is the same end state, and it is what a partially-applied
+/// migration leaves behind.
+#[sqlx::test]
+async fn isolation_refuses_a_database_with_no_policies(pool: PgPool) {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' \
+           AND EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid)",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for t in &tables {
+        sqlx::query(&format!("DROP POLICY {t}_tenant_isolation ON {t}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let db = db(pool);
+    let err = db
+        .verify_tenant_isolation()
+        .await
+        .expect_err("a database with no tenant policies is not isolated");
+    assert!(err.to_string().contains("0007_rls.sql"), "{err}");
+}
+
+/// The verification must not leave the session pinned to `df_app`, or the
+/// control plane — which runs unpinned, as the connecting role — would silently
+/// lose the privileges it needs on the very next checkout from the pool.
+#[sqlx::test]
+async fn verifying_isolation_does_not_poison_the_pool(pool: PgPool) {
+    let db = db(pool);
+    db.verify_tenant_isolation().await.unwrap();
+
+    let mut tx = db.begin_unpinned().await.unwrap();
+    let role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert_ne!(role, "df_app", "verification leaked SET ROLE into the pool");
+
+    // And the ordinary path still isolates afterwards.
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+    let mut tx = db.begin(a.org).await.unwrap();
+    assert_eq!(tx.list_repos(true).await.unwrap().len(), 1);
+    tx.commit().await.unwrap();
+    let mut tx = db.begin(b.org).await.unwrap();
+    assert_eq!(tx.list_repos(true).await.unwrap().len(), 1);
+    tx.commit().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The audit trail under row-level security.
+//
+// These tests all issue `SET LOCAL ROLE df_app` by hand, which is not how the
+// rest of the suite works and is the point: `#[sqlx::test]` connects as the
+// superuser Postgres was initialised with, and a superuser bypasses row-level
+// security even on a FORCE'd table. A test of an audit *policy* written the
+// ordinary way would pass against no policy at all.
+//
+// Dropping to `df_app` makes the policies apply, which is the same thing that
+// happens on a deployment connecting as a non-superuser schema owner — the
+// shape where `audit_events` previously rejected every login's audit row.
+// ---------------------------------------------------------------------------
+
+const AUDIT_INSERT: &str = "INSERT INTO audit_events (org_id, actor_label, action, detail) \
+                            VALUES ($1, 'someone', 'auth.login.succeeded', '{}')";
+
+/// `Db::audit_global` writes with a NULL org from no transaction at all. Under
+/// FORCE RLS that is a row the tenant policy cannot describe, so the append
+/// policy has to admit the unpinned case explicitly — or every login, TOTP
+/// enrolment and email verification fails to leave a trace.
+#[sqlx::test]
+async fn the_control_plane_can_append_audit_rows_with_no_org(pool: PgPool) {
+    let db = db(pool);
+    let mut tx = db.begin_unpinned().await.unwrap();
+    sqlx::query("SET LOCAL ROLE df_app")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    sqlx::query(AUDIT_INSERT)
+        .bind(Option::<OrgId>::None)
+        .execute(&mut *tx)
+        .await
+        .expect("the control plane must be able to record a login");
+    tx.commit().await.unwrap();
+}
+
+/// The same, for an org-scoped event written before a tenant transaction exists
+/// — `Db::audit_for_org`, which signup uses.
+#[sqlx::test]
+async fn the_control_plane_can_append_an_org_scoped_audit_row(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin_unpinned().await.unwrap();
+    sqlx::query("SET LOCAL ROLE df_app")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(AUDIT_INSERT)
+        .bind(a.org)
+        .execute(&mut *tx)
+        .await
+        .expect("signup must be able to record an org event");
+    tx.commit().await.unwrap();
+}
+
+/// A pinned transaction may not forge a row for a different org. This is the
+/// half the unpinned carve-out must not have opened up.
+#[sqlx::test]
+async fn a_pinned_transaction_cannot_forge_another_orgs_audit_row(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let err = sqlx::query(AUDIT_INSERT)
+        .bind(b.org)
+        .execute(tx.conn())
+        .await
+        .expect_err("a pinned transaction wrote another org's audit row");
+    assert!(
+        err.to_string().contains("row-level security"),
+        "expected an RLS refusal, got: {err}"
+    );
+}
+
+/// **Append-only.** Nothing may rewrite an audit row — not the tenant role, not
+/// the control plane, not the table's owner. Expressed as the absence of an
+/// UPDATE policy, so a command that matches no policy touches no rows.
+#[sqlx::test]
+async fn audit_rows_cannot_be_rewritten(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin_unpinned().await.unwrap();
+    sqlx::query("SET LOCAL ROLE df_app")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(AUDIT_INSERT)
+        .bind(a.org)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // From inside the org that owns the row, which is the strongest position a
+    // request can reach.
+    let mut tx = db.begin(a.org).await.unwrap();
+    let rewritten = sqlx::query("UPDATE audit_events SET action = 'tampered'")
+        .execute(tx.conn())
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+    tx.commit().await.unwrap();
+    assert_eq!(rewritten, 0, "an audit row was rewritten");
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events")
+        .fetch_all(tx.conn())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        actions.iter().all(|a| a != "tampered"),
+        "audit trail was modified: {actions:?}"
+    );
+}
+
+/// Erasing is likewise unreachable from a request. Retention is a control-plane
+/// job, and the policy says so by allowing DELETE only when no org is pinned.
+#[sqlx::test]
+async fn audit_rows_cannot_be_erased_from_a_request(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin_unpinned().await.unwrap();
+    sqlx::query("SET LOCAL ROLE df_app")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(AUDIT_INSERT)
+        .bind(a.org)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let erased = sqlx::query("DELETE FROM audit_events")
+        .execute(tx.conn())
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+    tx.commit().await.unwrap();
+    assert_eq!(erased, 0, "a request erased an audit row");
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+        .fetch_one(tx.conn())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(remaining, 1);
+}

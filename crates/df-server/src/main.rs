@@ -67,6 +67,18 @@ async fn main() -> Result<()> {
         tracing::warn!("DF_RUN_MIGRATIONS is off; assuming the schema is already current");
     }
 
+    // Prove tenant isolation before binding a port, never after. Row-level
+    // security is the one guard the *environment* can switch off — the same
+    // migrations isolate perfectly under one database role and not at all under
+    // another, and no amount of reading this repository tells you which one a
+    // deployment connects as. Discovering that from a customer is not a
+    // recoverable failure, so it is a startup error naming the remediation.
+    let isolation = db
+        .verify_tenant_isolation()
+        .await
+        .context("refusing to serve: tenant isolation is not enforced by this database")?;
+    tracing::info!("{}", isolation.summary());
+
     let watcher = Watcher::spawn(db.pool().clone())
         .await
         .context("could not start the change listener")?;

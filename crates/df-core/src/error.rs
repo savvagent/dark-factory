@@ -99,6 +99,18 @@ pub enum Error {
     #[error("{0}")]
     Invalid(String),
 
+    /// The database cannot enforce tenant isolation as configured. Raised only
+    /// by `Db::verify_tenant_isolation` at startup, never by a request: by the
+    /// time a tool call is in flight it is far too late to discover that one
+    /// org can read another's rows. Carries the specific findings because
+    /// "isolation is broken" without naming the table or the role is not
+    /// something an operator can act on at 3am.
+    #[error(
+        "the database cannot enforce tenant isolation, so one org could read \
+         another's data: {problems}"
+    )]
+    IsolationNotEnforced { problems: String },
+
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -127,6 +139,7 @@ impl Error {
             Error::InviteInvalid => "invite_invalid",
             Error::InviteWrongAccount { .. } => "invite_wrong_account",
             Error::Invalid(_) => "invalid_argument",
+            Error::IsolationNotEnforced { .. } => "isolation_not_enforced",
             Error::Db(_) => "internal_error",
         }
     }

@@ -14,8 +14,9 @@ serverless model would fight. See `CLAUDE.md` for why the process must stay warm
   follows the cluster's existing per-app pattern — each app gets its own database and
   role, never a shared one:
   - Database: `dark_factory`
-  - Role: `dark-factory` (`schema_admin` — owns its own schema only, cannot touch
-    `light_factory` or `fly-db`)
+  - Role: `dark-factory` (a member of `schema_admin`). It owns the `dark_factory`
+    schema — but **not** only that: see "The app's credential can reach
+    `light_factory`" below before treating this as isolation.
   - Attached via `fly mpg attach kyzl60xmdjxopj9g -a dark-factory-mcp -d dark_factory
     -u dark-factory --variable-name DATABASE_URL` — this staged `DATABASE_URL` as an app
     secret.
@@ -28,30 +29,86 @@ serverless model would fight. See `CLAUDE.md` for why the process must stay warm
   `DATABASE_URL`, `DF_ENCRYPTION_KEY`, `DF_SIGNING_KEY` (both generated with
   `openssl rand -base64 32`, per `.env.example`).
 
-## Before the first deploy: pre-provision the `df_app` role
+## Tenant isolation on managed Postgres — and what the app role can actually reach
 
-`0007_rls.sql` — the last migration, run by every `df-server` startup —
-issues `CREATE ROLE df_app NOLOGIN` and `GRANT df_app TO CURRENT_USER`. Both
-are cluster-level operations that need `CREATEROLE`, and the `dark-factory`
-role attached above is a `schema_admin`: it owns its own schema and nothing
-else, specifically so it *cannot* touch the cluster or other apps' databases.
-That means it cannot create `df_app` either, and the very first startup would
-fail before binding a port.
+Two facts about `savvagent-pg` decide how isolation works here. Both were verified
+against the live cluster rather than reasoned about, because the first one was
+wrong in an earlier draft of this document.
 
-This has to be provisioned once, out-of-band, by whoever administers the
-`savvagent-pg` cluster (a role with `CREATEROLE`, connected to the
-`dark_factory` database):
+### `df_app` cannot exist on this cluster, and does not need to
 
-```sql
-CREATE ROLE df_app NOLOGIN;
-GRANT df_app TO "dark-factory";
+`0007_rls.sql` issues `CREATE ROLE df_app NOLOGIN` and `GRANT df_app TO
+CURRENT_USER`. Both are cluster-level operations needing `CREATEROLE`. On this
+cluster the only role with it is `postgres`, and `fly mpg connect -u postgres`
+answers `cluster … or user postgres not found` — flyctl does not issue those
+credentials. `CREATE ROLE df_app NOLOGIN` as `dark-factory` fails with
+*permission denied*, and `fly mpg users create` rejects the name outright
+(`user_name must contain only lowercase letters, numbers, and dashes`).
+
+That does not weaken isolation, because `df_app` was never the only guard. Every
+tenant table is `FORCE ROW LEVEL SECURITY`, which makes the policies apply to the
+table's **owner** as well — and connecting as `dark-factory` lands in
+`schema_admin`, which owns the tables but is neither a superuser nor `BYPASSRLS`
+(`rolsuper=f`, `rolbypassrls=f`). Verified directly against `dark_factory` inside
+a rolled-back transaction: an unpinned `SELECT` over a policied table returned
+**0 rows**, and the same query pinned to one org returned that org's row only.
+
+So `Db::begin` issues `SET LOCAL ROLE df_app` **only when the role can actually be
+assumed**, and `Db::verify_tenant_isolation` re-derives the whole question from the
+catalog at startup. `df-server` refuses to bind a port unless one of two things
+holds:
+
+- the tenant role was assumed (local development, `#[sqlx::test]` — where the
+  connecting role *is* a superuser and dropping out of it is the only thing that
+  makes policies bite), or
+- the connecting role is neither a superuser nor `BYPASSRLS`, and every tenant
+  table is `FORCE`d.
+
+A healthy boot logs which one it is running under:
+
+```
+INFO df_server: tenant isolation enforced as role "dark-factory"
+                (connecting role, not exempt from RLS); 14 tenant tables, 14 forced
 ```
 
-`df-server` recognizes a permission-denied failure at this step and fails
-startup with this same remediation rather than a bare Postgres error;
-migrations are safe to re-run once the grant exists. This is a one-time step
-per cluster — a role, once created, is not migration state and is not undone
-by anything in this repo.
+The combination those two hide between them — no `df_app` *and* an exempt
+connecting role — is a startup error naming the remediation. Nothing about that
+check is optional or best-effort: a deployment that cannot prove isolation does
+not serve.
+
+> An earlier version of this section said df-server "recognizes a permission-denied
+> failure at this step and fails startup with this same remediation". It did not —
+> `main.rs` wrapped the failure in a bare `.context("migrations failed")`, and the
+> migration aborted before any RLS was applied at all.
+
+### The app's credential can reach `light_factory`
+
+`docs` previously claimed the `dark-factory` role "owns its own schema only,
+cannot touch `light_factory` or `fly-db`". **That is not true**, and it matters
+because `nels-api` runs on `light_factory`:
+
+```
+$ fly mpg connect kyzl60xmdjxopj9g -d light_factory -u dark-factory
+ current_database | current_user | session_user
+------------------+--------------+--------------
+ light_factory    | schema_admin | dark-factory
+```
+
+`pg_database.datacl` grants `CONNECT` on all three databases to `schema_admin`,
+`writer` and `reader`, and `schema_admin` is a member of `pg_read_all_data` and
+`pg_write_all_data` — which are **cluster-wide** attributes, not per-database
+ones. So the `DATABASE_URL` staged for this app can read and write nels'
+production database.
+
+Nothing in this repository caused that and nothing here should fix it: revoking
+`CONNECT` from `schema_admin` or `writer` would alter roles another production app
+depends on. It is recorded here because it is the real blast radius of leaking
+this app's `DATABASE_URL`, and because the same reasoning rules out
+`fly mpg users create -r writer` as a way to get a "least-privilege" app role —
+on this cluster a `writer` is not least-privilege in the way the name suggests.
+
+Whoever administers `savvagent-pg` should decide whether per-database isolation is
+wanted; until then, treat `DATABASE_URL` as a credential to nels' database too.
 
 ## What's scaffolded
 
@@ -85,34 +142,33 @@ by anything in this repo.
 6. A background sweep loop for the auth tables that would otherwise grow
    without bound (`auth_attempts` is the hot-path one — see
    `df_server::spawn_sweeper`'s doc comment).
+7. `Db::verify_tenant_isolation` runs after the migrations and **before the port
+   is bound**, so a database that cannot enforce tenant isolation stops the
+   process instead of serving. See the section above for the two configurations
+   that pass.
 
-## What a deploy today would and would not be able to do
+## What a deploy can and cannot do
 
-`/readyz` will pass and the API will work end to end for an MCP client — sign
-up via the API, register a client, complete the OAuth code flow, call tools —
-but **no browser page exists yet to reach any of it through**. `df-server`
-mounts only `/mcp`, the console's JSON API, `/oauth/*`, and the health routes;
-nothing serves HTML or static assets, because `web/` (task 11, the SvelteKit
-console) is still an empty directory. Concretely:
+`/readyz` passes, the API works end to end for an MCP client, and the console is
+served: `web/` (task 11) landed, and the `Dockerfile`'s console stage bakes the
+built SPA into `/srv/console`, which `DF_STATIC_DIR` points at. Sign-up, the
+emailed verification link, TOTP enrolment, org creation and PAT minting are all
+reachable through a browser.
 
-- `authorize_page`'s redirect for a signed-out visitor goes to
-  `/login?next=…`, which 404s.
-- Every verification, recovery, and invitation email links to `/verify`,
-  `/recover`, or `/invite/{org}`, which all 404.
-- There is nothing for a human to click "sign up" on at all.
-- Every email — verification, recovery, invitation — is only logged
-  (recipient + subject; see `crates/df-web/src/mail.rs`), not delivered, since
-  no real mail-provider integration exists yet. A human still cannot get
-  through onboarding even by API, because the link they need to click is
-  never sent anywhere real. `df-server` requires `DF_ALLOW_LOG_MAILER=1` to
-  start at all with this in place, precisely to keep the gap from being
-  silent.
+The one thing a deploy still cannot do is **onboard anybody**, because no mail
+provider is configured. Every verification, recovery, and invitation email is
+written to this process's log rather than sent (recipient and subject only; see
+`crates/df-web/src/mail.rs`), so the link a new user needs never reaches them.
+`df-server` refuses to start without `DF_ALLOW_LOG_MAILER=1` precisely so this
+gap cannot be silent, and the log says so on every send:
 
-None of that blocks getting the server itself live and reachable — which is
-what makes it worth doing before task 11 rather than after — but it does mean
-a deploy today is only usable by something that speaks the API directly (a
-coding agent completing OAuth, or a script hitting the console's REST
-endpoints), not by a person in a browser, until task 11 lands.
+```
+WARN df_web::mail: MAIL NOT SENT — no mail provider is configured
+                   to=… subject=Confirm your email for dark-factory
+```
+
+Until a real mailer lands, an operator can complete a sign-up by reading the link
+out of the logs (`df_web=debug`), and an agent can use the API directly.
 
 Confirming `DF_PUBLIC_URL` / `DF_RESOURCE_URI` in `fly.toml` against the final
 hostname (Fly default `https://dark-factory-mcp.fly.dev` or a custom domain) and
