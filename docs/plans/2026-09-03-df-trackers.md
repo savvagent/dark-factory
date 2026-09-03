@@ -12,8 +12,7 @@ no AI attribution, forward-only migrations) intact.
 
 ## Status — 2026-09-03
 
-Task 1 ✅ shipped (PR #18). Tasks 2–6 ⬜, not started — they depend on Task 1's schema and
-the promoted `df-core::crypto` primitive.
+Task 1 ✅ shipped (PR #18). Task 2 ✅ shipped (PR #20). Tasks 3–6 ⬜, not started.
 
 ## Global Constraints
 
@@ -168,7 +167,7 @@ to consume. Consumes nothing new (no dependency edges added).
 
 ---
 
-## Task 2 — GitHub App + JIRA OAuth clients ⬜
+## Task 2 — GitHub App + JIRA OAuth clients ✅ (PR #20)
 
 **Files:** `crates/df-trackers/src/github.rs`, `crates/df-trackers/src/jira.rs`,
 `crates/df-trackers/src/lib.rs`, `crates/df-trackers/Cargo.toml` (add `jsonwebtoken` for

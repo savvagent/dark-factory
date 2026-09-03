@@ -1,7 +1,7 @@
 # df-trackers design — Milestone 2: GitHub App + JIRA two-way sync
 
-> **Status:** DRAFT — schema foundation implemented; GitHub App, JIRA, webhook ingest,
-> outbound sync, and the `link_ticket`/`sync_ticket` MCP tools remain.
+> **Status:** DRAFT — schema foundation and GitHub App/JIRA clients implemented; webhook
+> ingest, outbound sync, and the `link_ticket`/`sync_ticket` MCP tools remain.
 > **Implements:** the "Tracker integration (two-way)" and "Trackers — `link_ticket`,
 > `sync_ticket`" sections of `docs/specs/2026-09-01-dark-factory-design.md`.
 > **Depends on:** Milestone 1 (auth, queue, console skeleton) — merged.
