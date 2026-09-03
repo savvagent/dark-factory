@@ -383,3 +383,17 @@ UI) are recorded in `docs/plans/2026-09-03-df-trackers.md` and build on this fou
   needs two GitHub App installations in one org (e.g. two different GitHub orgs), this
   schema needs revisiting. Not raised in the design doc or the task brief; flagged here
   rather than solved speculatively.
+- **The JIRA webhook path has a timing side-channel that reveals whether a `?site=<cloud-id>`
+  is registered, independent of the shared secret.** An unregistered site returns 404 after
+  a single indexed `SELECT` against `tracker_connection_index`; a registered site with the
+  wrong secret additionally opens a `Tx` and decrypts the stored secret before returning the
+  same 404 — strictly more work, and therefore measurably slower. Both responses are
+  byte-identical (status + body), so this is a timing-only signal, not a content leak.
+  Accepted rather than engineered around, for the same reason GitHub's installation id is
+  treated as non-sensitive elsewhere in this design: a JIRA cloud site id is not a secret an
+  org relies on for access control (the shared secret is), and confirming a site is
+  *registered to some org on the platform* — without learning which org, or gaining any
+  access — is a materially smaller leak than the credential-enumeration oracles this
+  codebase actively defends against elsewhere (`CLAUDE.md`'s account-enumeration and
+  redirect-URI-matching sections). Revisit only if a future threat model treats "is this
+  JIRA site connected to dark-factory" as itself sensitive.
