@@ -264,6 +264,90 @@ small private helpers in `crates/df-core/src/trackers.rs` (`encode_sealed`/
 so a future caller that does have two columns available is not forced through this
 concatenation.
 
+## §5a Webhook org resolution (Task 3 premise correction)
+
+Task 3's checklist in the plan says "resolve org via installation id / site id →
+`tracker_connections`" as if this were an ordinary tenant-scoped read. It is not, and the
+gap is worth naming precisely: `tracker_connections` is registered under `FORCE ROW LEVEL
+SECURITY` with an `org_id = current_org()` policy (§1), and every `df-core::trackers`
+accessor takes `&mut Tx<'_>` — which cannot be constructed without an `OrgId` already
+known. A webhook delivers only a provider-native identifier (GitHub's installation id,
+JIRA's site id); the org is exactly the thing being looked up. There is no `OrgId` to pin
+a `Tx` to yet, so the normal accessors cannot answer this question at all — an unscoped
+query through the RLS-scoped path returns zero rows on any deployment where `app.org_id`
+is unset (which is every request before the org is resolved).
+
+This is the same bootstrap problem `CLAUDE.md`'s auth tables solve: "authentication has to
+resolve a principal BEFORE an org is known, so pinning them to `current_org()` would make
+login impossible" (`0007_rls.sql`'s comment on `access_tokens` et al.). `df_auth::tokens::introspect`
+resolves this by never enabling RLS on `access_tokens` at all, and querying `db.pool()`
+directly — the table is simply outside the tenant_tables array, so no policy exists to
+consult regardless of role or deployment shape.
+
+**Decision: a narrow, secret-free reverse index, not a blanket RLS exemption on
+`tracker_connections`.** Excluding all of `tracker_connections` from RLS (mirroring
+`access_tokens` exactly) would also expose `encrypted_credentials` — the sealed JIRA
+refresh token — to any unscoped query, which is a strictly larger blast radius than the
+bootstrap problem requires. Instead, a new migration
+(`crates/df-core/migrations/0012_tracker_connection_index.sql`) adds:
+
+```sql
+CREATE TABLE tracker_connection_index (
+  provider      tracker_provider NOT NULL,
+  external_id   text             NOT NULL,
+  org_id        uuid             NOT NULL REFERENCES orgs (id) ON DELETE CASCADE,
+  connection_id uuid             NOT NULL REFERENCES tracker_connections (id) ON DELETE CASCADE,
+  PRIMARY KEY (provider, external_id)
+);
+```
+
+No RLS is enabled on this table — deliberately, by the same reasoning as `access_tokens`,
+and it is never added to `0007_rls.sql`'s or `0011_trackers.sql`'s `tenant_tables` arrays.
+It holds nothing secret: a provider tag, the provider's own (non-secret) installation/site
+id, and the two ids needed to say which org and which connection row own it. `df-core`
+maintains it transactionally alongside the real row, inside the same `Tx` that writes
+`tracker_connections`, so the two can never drift:
+
+- `upsert_connection` additionally upserts the matching `tracker_connection_index` row
+  (same transaction — atomic with the connection write).
+- `delete_connection` additionally deletes the matching index row.
+
+A new function, deliberately **not** taking a `Tx` (there is no org to pin one to yet):
+
+```rust
+/// Resolve which org owns a provider connection, from the provider's own
+/// identifier alone. This is the one place a tracker lookup runs before an
+/// `OrgId` is known — analogous to `df_auth::tokens::introspect` resolving a
+/// principal before a session exists. It reads only `tracker_connection_index`
+/// (no RLS, no secret columns) and returns an `OrgId` for the caller to build
+/// a normal `Tx` from for every subsequent step. Never add a second unscoped
+/// accessor for `tracker_connections` itself — this function is the only
+/// place a tracker table is read without an org already pinned.
+pub async fn resolve_connection_org(
+    db: &Db,
+    provider: Provider,
+    external_id: &str,
+) -> Result<Option<OrgId>>
+```
+
+The webhook route in `df-web` calls this once per request to learn the org, then opens a
+normal `Tx` for that `OrgId` and uses the existing `Tx`-scoped accessors
+(`get_connection`, `resolve_binding`, …) for everything else — the unscoped path is a
+one-hop bootstrap, never a substitute for the tenant-isolated one. This keeps guard 1 and
+guard 2 both intact for every read of `encrypted_credentials`; the only table ever read
+without an org pinned is the index, and it has nothing in it worth stealing.
+
+**Cross-org expectation, tested but not RLS-enforced:** because this table is deliberately
+outside RLS (like `access_tokens`), the guarantee that org A's webhook cannot resolve to
+org B's connection rests entirely on the `(provider, external_id)` primary key and on
+`upsert_connection`/`delete_connection` being the only writers, both of which run inside a
+pinned `Tx` and write `tx.org()` — not on a policy. The test for this is a `#[sqlx::test]`
+that upserts connections for two different orgs and asserts `resolve_connection_org`
+returns each org's own id and never the other's, not a `rls_scopes_*`-style unscoped-SQL
+test (there is no policy to probe). This is the same distinction `CLAUDE.md` draws between
+guard-1-only tests and true RLS tests — name it in the test's own comment so a future
+reader does not mistake the missing RLS test for an oversight.
+
 ## §5 What Task 1 does NOT wire up yet
 
 No `df-trackers` dependency is added to `df-web` or `df-mcp` in this task — `df-core` gains

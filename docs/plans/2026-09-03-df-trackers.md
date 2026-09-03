@@ -204,10 +204,41 @@ vars, additive, documented in `.env.example` with the *why*).
 
 ## Task 3 — Webhook ingest ⬜
 
-**Files:** `crates/df-trackers/src/webhook.rs` (signature verification + event parsing),
+**Spec:** see §5a ("Webhook org resolution") in `docs/specs/2026-09-03-df-trackers-design.md`
+— read it first. It resolves a real gap the earlier checklist glossed over: every
+`df-core::trackers` accessor takes a `Tx` pinned to an already-known `OrgId`, but a webhook
+arrives with only a provider-native id (GitHub installation id / JIRA site id) — the org
+is exactly what's being looked up, so the normal RLS-scoped path cannot answer it (an
+unscoped query against `tracker_connections`, which is `FORCE ROW LEVEL SECURITY`, returns
+zero rows with no `app.org_id` set). §5a adds a narrow, secret-free reverse-index table
+(`tracker_connection_index`, deliberately outside RLS, mirroring `access_tokens`'s
+bootstrap exemption) and one new unscoped resolver function,
+`df_core::trackers::resolve_connection_org`, that the webhook route calls once per request
+before opening a normal `Tx` for everything else.
+
+**Files:** `crates/df-core/migrations/0012_tracker_connection_index.sql` (new, additive),
+`crates/df-core/src/trackers.rs` (add `tracker_connection_index` maintenance to
+`upsert_connection`/`delete_connection`, add `resolve_connection_org`),
+`crates/df-trackers/src/webhook.rs` (new — signature verification + event parsing),
 a new route added to `df-web`'s `catalog.rs` (`/webhooks/{provider}`, unauthenticated by
 design — verified by signature instead of a session/token) plus its handler module.
 
+- [ ] Migration: add `tracker_connection_index` (provider, external_id, org_id,
+      connection_id — PK `(provider, external_id)`), no RLS enabled, never added to any
+      `tenant_tables` array. Confirm a fresh cluster applies cleanly
+      (`podman compose down -v && podman compose up -d`, `cargo test -p df-core`).
+- [ ] `df-core::trackers::upsert_connection` additionally upserts the matching
+      `tracker_connection_index` row in the same `Tx`; `delete_connection` additionally
+      deletes it. Both stay atomic with the real write — no separate transaction.
+- [ ] `df-core::trackers::resolve_connection_org(db: &Db, provider, external_id) ->
+      Result<Option<OrgId>>` — deliberately takes `&Db`, not `&mut Tx`, and reads only
+      `tracker_connection_index`. Doc-comment states it is the one place a tracker table is
+      read without an org already pinned, and that a second such accessor must not be added.
+- [ ] Cross-org test (not an `rls_scopes_*`-style unscoped-SQL test — there is no policy to
+      probe, by design): upsert connections for two different orgs, assert
+      `resolve_connection_org` returns each org's own id and never the other's. Comment the
+      test explaining why this isn't an RLS test, so a future reader doesn't mistake the
+      absence of one for an oversight.
 - [ ] GitHub: HMAC-SHA256 verification of `X-Hub-Signature-256` against
       `DF_GITHUB_APP_WEBHOOK_SECRET`, constant-time compare.
 - [ ] JIRA: shared-secret verification per Automation webhook's configured header/query
@@ -215,13 +246,16 @@ design — verified by signature instead of a session/token) plus its handler mo
       time — the spec left this as a Task-3 decision).
 - [ ] Parse `issues`/`issue_comment` (GitHub) and Automation payloads (JIRA) into a
       provider-neutral event type `df-trackers` exposes.
-- [ ] Resolve org via installation id / site id → `tracker_connections`, then repo via
-      `tracker_bindings`.
+- [ ] Webhook route: verify signature → parse event → extract provider id (installation id
+      / site id) → `resolve_connection_org` → open a `Tx` for that `OrgId` → `get_connection`
+      / `resolve_binding` for everything else. An id that resolves to no org is a `404`-shaped
+      response with no detail (never confirm/deny which ids are registered to an attacker
+      probing the endpoint), logged for operator visibility.
 - [ ] `catalog.rs` entry with summary/description; confirm route is reachable and add to
       `the_whole_router_assembles`-style startup coverage if `df-server` needs updating.
 - [ ] Recorded-fixture tests for signature verification (valid, tampered, replayed) and
       event parsing.
-- [ ] `cargo test -p df-trackers`, `cargo test -p df-web`, clippy, fmt.
+- [ ] `cargo test -p df-core`, `cargo test -p df-trackers`, `cargo test -p df-web`, clippy, fmt.
 - [ ] Commit.
 
 ## Task 4 — Two-way sync engine ⬜
