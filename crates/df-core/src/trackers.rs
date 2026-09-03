@@ -34,6 +34,18 @@ pub enum Provider {
     Jira,
 }
 
+impl std::fmt::Display for Provider {
+    /// Matches the wire casing (`lowercase`, per the `serde`/`sqlx` attributes
+    /// above) rather than `{:?}`'s `Github`/`Jira`, so an error message names
+    /// the provider the same way the API and the database do.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Provider::Github => write!(f, "github"),
+            Provider::Jira => write!(f, "jira"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, FromRow, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackerConnection {
@@ -143,7 +155,7 @@ async fn require_connection_in_org(
         Ok(())
     } else {
         Err(Error::Invalid(format!(
-            "tracker connection {connection_id} not found in this org for provider {provider:?}"
+            "tracker connection {connection_id} not found in this org for provider {provider}"
         )))
     }
 }
