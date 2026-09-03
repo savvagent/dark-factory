@@ -116,14 +116,16 @@ impl From<CoreError> for ApiError {
     fn from(e: CoreError) -> Self {
         use CoreError::*;
 
-        // These two never reach the caller. Everything else in `df-core::Error`
-        // was written to be read by whoever hit it.
+        // `Db` and the three internal-only variants below never reach the
+        // caller. Everything else in `df-core::Error` was written to be read
+        // by whoever hit it.
         //
         // `IsolationNotEnforced` is a startup assertion, so arriving here at all
         // would mean a server that promised to refuse to serve is serving. It is
         // logged in full and answered vaguely: its message names database roles
         // and tables, which is infrastructure detail no HTTP client should be
-        // handed.
+        // handed. `Config`/`Crypto` carry the same shape of risk — key-material
+        // and ciphertext diagnostics, never an HTTP client's business.
         match &e {
             Db(inner) => return ApiError::internal("df-core", inner),
             IsolationNotEnforced { .. } | Config(_) | Crypto(_) => {
