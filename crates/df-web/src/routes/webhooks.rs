@@ -30,7 +30,14 @@ pub async fn receive(
     })?;
 
     let raw_body = body.as_ref();
-    let (parsed, org_id) = match provider {
+
+    // Both branches converge on the same shape: resolve which org owns the
+    // provider-native id (the one unscoped lookup, per spec §5a), then open a
+    // single org-pinned `Tx` and do everything else — including, for JIRA,
+    // verifying the shared secret — through that one transaction. Never split
+    // this into a bootstrap `Tx` plus a second one for the rest; the two
+    // reads must observe the same connection row.
+    let (mut tx, connection, parsed) = match provider {
         Provider::Github => {
             let secret = state
                 .config
@@ -53,11 +60,29 @@ pub async fn receive(
                 tracing::warn!(provider = %provider, error = %error, "webhook rejected");
                 webhook_not_found()
             })?;
+
             let external_id = parsed.connection_external_id().to_string();
             let org_id = resolve_connection_org(&state.db, provider, &external_id)
                 .await
-                .map_err(ApiError::from)?;
-            (parsed, org_id)
+                .map_err(ApiError::from)?
+                .ok_or_else(|| {
+                    tracing::warn!(provider = %provider, external_id = %external_id, "webhook did not match a registered connection");
+                    webhook_not_found()
+                })?;
+
+            let mut tx = state.db.begin(org_id).await.map_err(ApiError::from)?;
+            let connection = get_connection(&mut tx, provider)
+                .await
+                .map_err(ApiError::from)?
+                .ok_or_else(|| {
+                    ApiError::internal(
+                        "load resolved tracker connection",
+                        format!(
+                            "tracker_connection_index resolved org {org_id}, but org has no {provider} connection"
+                        ),
+                    )
+                })?;
+            (tx, connection, parsed)
         }
         Provider::Jira => {
             let site_id = jira_site_id(query.as_deref()).map_err(|error| {
@@ -66,11 +91,11 @@ pub async fn receive(
             })?;
             let org_id = resolve_connection_org(&state.db, provider, &site_id)
                 .await
-                .map_err(ApiError::from)?;
-            let Some(org_id) = org_id else {
-                tracing::warn!(provider = %provider, external_id = %site_id, "webhook did not match a registered connection");
-                return Err(webhook_not_found());
-            };
+                .map_err(ApiError::from)?
+                .ok_or_else(|| {
+                    tracing::warn!(provider = %provider, external_id = %site_id, "webhook did not match a registered connection");
+                    webhook_not_found()
+                })?;
 
             let mut tx = state.db.begin(org_id).await.map_err(ApiError::from)?;
             let connection = get_connection(&mut tx, provider)
@@ -110,32 +135,11 @@ pub async fn receive(
                 );
                 webhook_not_found()
             })?;
-            drop(tx);
-            (parsed, Some(org_id))
+            (tx, connection, parsed)
         }
     };
 
-    let Some(org_id) = org_id else {
-        tracing::warn!(
-            provider = %provider,
-            external_id = %parsed.connection_external_id(),
-            "webhook did not match a registered connection"
-        );
-        return Err(webhook_not_found());
-    };
-
-    let mut tx = state.db.begin(org_id).await.map_err(ApiError::from)?;
-    let connection = get_connection(&mut tx, provider)
-        .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| {
-            ApiError::internal(
-                "load resolved tracker connection",
-                format!(
-                    "tracker_connection_index resolved org {org_id}, but org has no {provider} connection"
-                ),
-            )
-        })?;
+    let org_id = connection.org_id;
 
     match &parsed {
         ParsedWebhook::Event(event) => {

@@ -11,7 +11,7 @@ use df_core::trackers::{decode_stored_secret, Provider};
 use hmac::{Hmac, Mac};
 use http::HeaderMap;
 use serde::Deserialize;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::{Error, Result};
@@ -160,7 +160,20 @@ fn verify_jira_secret(headers: &HeaderMap, cipher: &Cipher, encoded_secret: &str
     let presented = header_str(headers, JIRA_WEBHOOK_SECRET_HEADER)?;
     let sealed = decode_stored_secret(encoded_secret)?;
     let expected = cipher.open(&sealed.ciphertext, &sealed.nonce)?;
-    if expected.as_slice().ct_eq(presented.as_bytes()).unwrap_u8() == 1 {
+    // Hash both sides to a fixed-length digest before comparing. `subtle`'s
+    // slice `ConstantTimeEq` short-circuits (non-constant-time) when the two
+    // slices differ in length, which would otherwise leak the stored secret's
+    // byte length through response timing. Comparing two 32-byte SHA-256
+    // digests instead means the lengths always match, so the comparison never
+    // takes the early-return path.
+    let expected_digest = Sha256::digest(&expected);
+    let presented_digest = Sha256::digest(presented.as_bytes());
+    if expected_digest
+        .as_slice()
+        .ct_eq(presented_digest.as_slice())
+        .unwrap_u8()
+        == 1
+    {
         Ok(())
     } else {
         Err(Error::InvalidWebhook(
@@ -513,7 +526,19 @@ mod tests {
         assert_eq!(event.connection_external_id, "cloud-123");
         assert_eq!(event.binding_external_ref, "DF");
         assert_eq!(event.kind, WebhookEventKind::IssueComment);
+        assert_eq!(event.action, "comment_created");
+        assert_eq!(event.issue.id, "10001");
         assert_eq!(event.issue.reference, "DF-9");
+        assert_eq!(event.issue.title, "Implement webhook ingest");
+        assert_eq!(
+            event.issue.body.as_deref(),
+            Some("Verify signatures before syncing.")
+        );
+        assert_eq!(event.issue.state, "In Progress");
+        assert_eq!(event.issue.labels, vec!["trackers", "webhooks"]);
+        let comment = event.issue.comment.as_ref().expect("comment present");
+        assert_eq!(comment.id, "20002");
+        assert_eq!(comment.body, "Sync this change into dark-factory.");
     }
 
     #[test]

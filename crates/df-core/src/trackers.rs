@@ -399,19 +399,38 @@ pub async fn resolve_binding(
     Ok(binding)
 }
 
+/// Resolve the one repo binding a webhook's external reference points at.
+///
+/// The schema only guarantees `UNIQUE (repo_id, provider)` — nothing stops two
+/// repos in the same org from being bound to the same external project/repo
+/// (e.g. two dark-factory repos both mapped to one JIRA project). If that
+/// happens, there is no principled way to pick a "right" one, so this
+/// deliberately fails loudly rather than returning an arbitrary match — a
+/// caller (Task 4's sync engine) that silently picked one would risk creating
+/// or updating a job against the wrong repo. Never widen this to
+/// `fetch_optional`-and-hope; an ambiguous binding is a configuration error
+/// for an operator to resolve, not something to guess through.
 pub async fn find_binding_by_external_ref(
     tx: &mut Tx<'_>,
     provider: Provider,
     external_ref: &str,
 ) -> Result<Option<TrackerBinding>> {
-    let binding = sqlx::query_as(&format!(
+    let mut bindings: Vec<TrackerBinding> = sqlx::query_as(&format!(
         "SELECT {BINDING_COLS} FROM tracker_bindings \
          WHERE org_id = $1 AND provider = $2 AND external_ref = $3"
     ))
     .bind(tx.org())
     .bind(provider)
     .bind(external_ref)
-    .fetch_optional(tx.conn())
+    .fetch_all(tx.conn())
     .await?;
-    Ok(binding)
+
+    match bindings.len() {
+        0 => Ok(None),
+        1 => Ok(Some(bindings.remove(0))),
+        _ => Err(Error::Invalid(format!(
+            "{provider} external ref {external_ref:?} matches more than one repo binding in this \
+             org; an operator must remove the duplicate binding before this event can be routed"
+        ))),
+    }
 }
