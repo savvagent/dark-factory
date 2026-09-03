@@ -52,15 +52,55 @@ CREATE INDEX audit_events_action_idx ON audit_events (action, created_at DESC);
 ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_events FORCE ROW LEVEL SECURITY;
 
--- Read policy, matching every other tenant table.
+-- Read policy, matching every other tenant table. The `<table>_tenant_isolation`
+-- name is load-bearing: `Db::verify_tenant_isolation` discovers tenant tables by
+-- that convention rather than from a list it would have to be told about.
 CREATE POLICY audit_events_tenant_isolation ON audit_events
-  USING (org_id = current_org())
-  WITH CHECK (org_id = current_org());
+  FOR SELECT USING (org_id = current_org());
 
--- **Append-only.** An audit trail an attacker can edit is not an audit trail.
--- The tenant role may write and read; it may not rewrite or erase. Deleting old
--- events is a retention job run by the control plane, not something reachable
--- from a request.
-REVOKE UPDATE, DELETE ON audit_events FROM df_app;
-GRANT SELECT, INSERT ON audit_events TO df_app;
-GRANT USAGE, SELECT ON SEQUENCE audit_events_id_seq TO df_app;
+-- Appends. Two writers are legitimate, and they differ by whether a tenant
+-- transaction is open:
+--
+--   * a pinned transaction (`Tx::audit`) may write only its own org's rows;
+--   * the control plane runs unpinned — `Db::audit_global` records what happens
+--     before any org context exists (logins, TOTP enrollment, email
+--     verification), and `Db::audit_for_org` records org events made during
+--     signup, before a tenant transaction is available.
+--
+-- Writing this as a policy rather than relying on a grant is what makes it
+-- survive a deployment with no `df_app`. Under FORCE ROW LEVEL SECURITY the
+-- owner is subject to policies too, so on managed Postgres — where the
+-- application connects as the schema owner precisely because the role cannot be
+-- created — a `WITH CHECK (org_id = current_org())` that did not allow the
+-- unpinned case rejected every login's audit row. That is not theoretical: it
+-- was reproduced against a non-superuser owner, and it failed closed on the one
+-- table whose whole job is to record what happened.
+CREATE POLICY audit_events_append ON audit_events
+  FOR INSERT WITH CHECK (current_org() IS NULL OR org_id = current_org());
+
+-- **Append-only**, expressed as the deliberate *absence* of a policy. An audit
+-- trail an attacker can edit is not an audit trail.
+--
+-- A command with no matching policy affects zero rows, so under FORCE there is
+-- no UPDATE path for anyone — not the tenant role, not the control plane, not
+-- the table's owner. That is stronger than the grant this replaced, which left
+-- the owner free to rewrite history.
+--
+-- DELETE is reachable only unpinned, which is the retention job the control
+-- plane would run. A tenant transaction always has an org pinned, so nothing
+-- reachable from a request can erase a row.
+CREATE POLICY audit_events_retention ON audit_events
+  FOR DELETE USING (current_org() IS NULL);
+
+-- Privileges as well as policies wherever `df_app` exists: a policy decides
+-- which rows a statement may touch, a grant decides whether it may run at all,
+-- and this table is worth both. Conditional because a managed deployment has no
+-- such role — see 0007_rls.sql.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'df_app') THEN
+    EXECUTE 'REVOKE UPDATE, DELETE ON audit_events FROM df_app';
+    EXECUTE 'GRANT SELECT, INSERT ON audit_events TO df_app';
+    EXECUTE 'GRANT USAGE, SELECT ON SEQUENCE audit_events_id_seq TO df_app';
+  END IF;
+END $$;

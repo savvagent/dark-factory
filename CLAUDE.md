@@ -41,9 +41,31 @@ required for any new tenant table:
    the `SET LOCAL ROLE` the policies do nothing at all**. This was verified empirically,
    not assumed.
 
+   The role is issued *only when it can be assumed*, because `CREATE ROLE` needs a
+   cluster-level privilege that managed Postgres does not hand out — on Fly's managed
+   cluster `df_app` cannot be created at all. There, every tenant table being
+   `FORCE ROW LEVEL SECURITY` carries the same guarantee: FORCE applies the policies to
+   the table's owner, and the connecting role is neither a superuser nor `BYPASSRLS`.
+   **Nothing assumes which of the two shapes it is in.** `Db::verify_tenant_isolation`
+   reads it back out of the catalog as the role a tenant transaction actually runs as,
+   and `df-server` refuses to bind a port unless one of them holds. Guard 2 is the one
+   guard the *environment* can switch off, so it is the one guard that gets checked at
+   startup rather than trusted.
+
 When you add a tenant table: give it a `NOT NULL org_id`, add it to the `tenant_tables`
 array in `0007_rls.sql`, and add a cross-org negative test. A tenant-scoped function
-without a cross-org negative test is not done.
+without a cross-org negative test is not done. The policy must be named
+`<table>_tenant_isolation` — `verify_tenant_isolation` discovers tenant tables by that
+convention rather than from a list it would have to be told about, so a differently named
+policy is a table the startup check will not vouch for.
+
+**A privilege granted to `df_app` is not a protection.** `df_app` does not exist on
+managed Postgres, so `REVOKE … FROM df_app` protects nothing there. Express the rule as a
+policy instead: `audit_events` is append-only because it has no `UPDATE` policy, which
+under FORCE binds the table's owner too — strictly stronger than the grant it replaced,
+and it survives both deployment shapes. `#[sqlx::test]` connects as a superuser and
+bypasses RLS, so a test of such a policy **must** `SET LOCAL ROLE df_app` explicitly or it
+passes against no policy at all.
 
 Note that ordinary cross-org tests pass on the strength of guard 1 alone. The tests that
 actually exercise RLS are the `rls_scopes_*` ones in `tests/isolation.rs`, which issue

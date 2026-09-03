@@ -28,28 +28,64 @@
 -- Roles are cluster-scoped while migrations are database-scoped, so this is
 -- idempotent: `#[sqlx::test]` runs these migrations against many throwaway
 -- databases in one cluster, and a bare CREATE ROLE would fail on the second.
+--
+-- That same cluster/database split is why the whole block tolerates
+-- `insufficient_privilege`. CREATE ROLE and GRANT <role> TO ... are cluster-level
+-- operations needing CREATEROLE, and a managed Postgres deployment routinely
+-- hands the application a database-scoped role that has none — Fly's managed
+-- Postgres is the case this was written against, where the only role with
+-- CREATEROLE is one the provider does not issue credentials for.
+--
+-- Failing the migration there would be wrong, because `df_app` is not the only
+-- thing standing between two tenants: FORCE ROW LEVEL SECURITY below makes the
+-- policies apply to the table owner as well, which covers exactly the deployment
+-- that cannot create the role. What would be wrong is *assuming* that without
+-- checking, so nothing here decides the question — `Db::verify_tenant_isolation`
+-- re-derives it from the catalog at startup and refuses to serve if isolation is
+-- not actually in force. See the NOTICEs below and that function's doc comment.
 DO $$
+DECLARE
+  have_role boolean;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'df_app') THEN
-    CREATE ROLE df_app NOLOGIN;
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'df_app') THEN
+      CREATE ROLE df_app NOLOGIN;
+    END IF;
+  EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE
+      'could not CREATE ROLE df_app (no CREATEROLE). Tenant transactions will '
+      'run as the connecting role and rely on FORCE ROW LEVEL SECURITY, which '
+      'holds only while that role is neither a superuser nor BYPASSRLS. '
+      'df-server verifies this at startup and refuses to serve otherwise.';
+  END;
+
+  have_role := EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'df_app');
+
+  IF have_role THEN
+    -- `SET LOCAL ROLE df_app` requires the connecting role to be a member of
+    -- df_app (a superuser may assume any role, but the application should not
+    -- connect as one). Granting to CURRENT_USER covers both the migrating role
+    -- in tests and a single-role deployment; a deployment that connects as a
+    -- separate least-privilege user must also `GRANT df_app TO <that user>`.
+    BEGIN
+      EXECUTE 'GRANT df_app TO CURRENT_USER';
+    EXCEPTION WHEN insufficient_privilege THEN
+      RAISE NOTICE
+        'df_app exists but could not be granted to the migrating role. Tenant '
+        'transactions will fall back to FORCE ROW LEVEL SECURITY; df-server '
+        'verifies that at startup.';
+    END;
+
+    EXECUTE 'GRANT USAGE ON SCHEMA public TO df_app';
+    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO df_app';
+    EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO df_app';
+    EXECUTE 'GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO df_app';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public '
+            'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO df_app';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public '
+            'GRANT USAGE, SELECT ON SEQUENCES TO df_app';
   END IF;
 END $$;
-
--- `SET LOCAL ROLE df_app` requires the connecting role to be a member of df_app
--- (a superuser may assume any role, but the application should not connect as
--- one). Granting to CURRENT_USER covers both the migrating role in tests and a
--- single-role deployment; a deployment that connects as a separate least-
--- privilege user must also `GRANT df_app TO <that user>`.
-GRANT df_app TO CURRENT_USER;
-
-GRANT USAGE ON SCHEMA public TO df_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO df_app;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO df_app;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO df_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO df_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT USAGE, SELECT ON SEQUENCES TO df_app;
 
 -- Returns the org pinned to the current transaction, or NULL when unset.
 --

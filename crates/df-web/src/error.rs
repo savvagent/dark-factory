@@ -116,10 +116,18 @@ impl From<CoreError> for ApiError {
     fn from(e: CoreError) -> Self {
         use CoreError::*;
 
-        // The database variant never reaches the caller. Everything else in
-        // `df-core::Error` was written to be read by whoever hit it.
-        if let Db(inner) = &e {
-            return ApiError::internal("df-core", inner);
+        // These two never reach the caller. Everything else in `df-core::Error`
+        // was written to be read by whoever hit it.
+        //
+        // `IsolationNotEnforced` is a startup assertion, so arriving here at all
+        // would mean a server that promised to refuse to serve is serving. It is
+        // logged in full and answered vaguely: its message names database roles
+        // and tables, which is infrastructure detail no HTTP client should be
+        // handed.
+        match &e {
+            Db(inner) => return ApiError::internal("df-core", inner),
+            IsolationNotEnforced { .. } => return ApiError::internal("df-core", &e),
+            _ => {}
         }
 
         let status = match &e {
@@ -148,7 +156,7 @@ impl From<CoreError> for ApiError {
                 StatusCode::BAD_REQUEST
             }
 
-            Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Db(_) | IsolationNotEnforced { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         ApiError::new(status, e.code(), e.to_string())
