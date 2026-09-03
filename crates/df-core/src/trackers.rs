@@ -69,11 +69,14 @@ struct TrackerConnectionRow {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-fn encode_sealed(sealed: &Sealed) -> String {
+fn encode_sealed(sealed: &Sealed) -> Result<String> {
+    if sealed.nonce.len() != NONCE_BYTES {
+        return Err(Error::Crypto("stored nonce has the wrong length".into()));
+    }
     let mut combined = Vec::with_capacity(sealed.nonce.len() + sealed.ciphertext.len());
     combined.extend_from_slice(&sealed.nonce);
     combined.extend_from_slice(&sealed.ciphertext);
-    B64.encode(combined)
+    Ok(B64.encode(combined))
 }
 
 fn decode_sealed(encoded: &str) -> Result<Sealed> {
@@ -122,12 +125,15 @@ async fn require_connection_in_org(
     tx: &mut Tx<'_>,
     org_id: OrgId,
     connection_id: uuid::Uuid,
+    provider: Provider,
 ) -> Result<()> {
     let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM tracker_connections WHERE org_id = $1 AND id = $2)",
+        "SELECT EXISTS (SELECT 1 FROM tracker_connections \
+         WHERE org_id = $1 AND id = $2 AND provider = $3)",
     )
     .bind(org_id)
     .bind(connection_id)
+    .bind(provider)
     .fetch_one(tx.conn())
     .await?;
 
@@ -135,7 +141,7 @@ async fn require_connection_in_org(
         Ok(())
     } else {
         Err(Error::Invalid(format!(
-            "tracker connection {connection_id} not found in this org"
+            "tracker connection {connection_id} not found in this org for provider {provider:?}"
         )))
     }
 }
@@ -148,6 +154,9 @@ pub async fn upsert_connection(
     encrypted_credentials: Option<&Sealed>,
     encrypted_webhook_secret: Option<&Sealed>,
 ) -> Result<TrackerConnection> {
+    let encrypted_credentials = encrypted_credentials.map(encode_sealed).transpose()?;
+    let encrypted_webhook_secret = encrypted_webhook_secret.map(encode_sealed).transpose()?;
+
     let row: TrackerConnectionRow = sqlx::query_as(&format!(
         "INSERT INTO tracker_connections \
          (org_id, provider, external_id, encrypted_credentials, encrypted_webhook_secret) \
@@ -162,8 +171,8 @@ pub async fn upsert_connection(
     .bind(org_id)
     .bind(provider)
     .bind(external_id)
-    .bind(encrypted_credentials.map(encode_sealed))
-    .bind(encrypted_webhook_secret.map(encode_sealed))
+    .bind(encrypted_credentials)
+    .bind(encrypted_webhook_secret)
     .fetch_one(tx.conn())
     .await?;
 
@@ -205,7 +214,7 @@ pub async fn upsert_binding(
 ) -> Result<TrackerBinding> {
     require_repo_in_org(tx, repo_id).await?;
     if let Some(connection_id) = connection_id {
-        require_connection_in_org(tx, org_id, connection_id).await?;
+        require_connection_in_org(tx, org_id, connection_id, provider).await?;
     }
 
     let binding = sqlx::query_as(&format!(
