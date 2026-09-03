@@ -6,6 +6,26 @@
 > `sync_ticket`" sections of `docs/specs/2026-09-01-dark-factory-design.md`.
 > **Depends on:** Milestone 1 (auth, queue, console skeleton) — merged.
 
+## Goal & Success Criteria
+
+Give Milestone 2 a schema foundation for two-way tracker sync that a later task can build
+GitHub App and JIRA clients, a webhook route, and the `link_ticket`/`sync_ticket` MCP
+tools on top of, without any of those later tasks needing a second migration for a
+missing column or a second crypto implementation. Success for Task 1 specifically:
+
+- `tracker_connections` and `tracker_bindings` exist, are `NOT NULL org_id`, are
+  registered under `FORCE ROW LEVEL SECURITY` with `<table>_tenant_isolation` policies,
+  and `Db::verify_tenant_isolation` vouches for both at startup with no code change.
+- A cross-org negative test exists for each new table and fails before the RLS policy is
+  added (proving it isn't a false positive).
+- `df-core::trackers` CRUD compiles and is exercised by `#[sqlx::test]` integration tests
+  with no mocks, matching `repos.rs`'s existing test shape.
+- `Cipher`/`Sealed` live in `df-core::crypto`; `df-auth` no longer defines them; every
+  existing `df-auth` test that exercised them (moved, not deleted) still passes from its
+  new location.
+- `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`, and
+  `cargo fmt --all --check` are green.
+
 ## Premise corrections
 
 - `docs/plans/2026-09-01-milestone-1.md` and `CLAUDE.md` both describe `df-trackers` as a
@@ -129,9 +149,14 @@ spec draft right now):**
 - **Provider is an enum shared with `repos.provider`'s spirit but scoped to trackers.**
   `github` | `jira` — not `gitlab`/`bitbucket`/`other`, because only GitHub and JIRA are
   in scope (Scope §Out).
-- **No webhook signature secret is stored in `tracker_connections` in plaintext.** GitHub
-  App webhook secrets and JIRA Automation shared secrets are encrypted at rest with the
-  same primitive as OAuth credentials.
+- **If a webhook secret is ever stored in `tracker_connections`, it is never plaintext.**
+  For Task 1 this is vacuous — GitHub's webhook HMAC secret lives only in
+  `DF_GITHUB_APP_WEBHOOK_SECRET` and is never written to `encrypted_webhook_secret` at
+  all (that column stays `NULL` for `github` rows). The column exists for a later task's
+  JIRA Automation secret, which — if that design ends up needing one — would go through
+  the same `Cipher::seal` primitive as `encrypted_credentials`, never plaintext. This
+  bullet is the encryption invariant for the column's future use, not a claim that
+  anything writes to it today.
 
 ## §1 Schema
 
@@ -150,7 +175,9 @@ CREATE TABLE tracker_connections (
     -- JIRA: the cloud site id (from the 3LO accessible-resources response).
     -- Opaque to df-core; df-trackers interprets it.
     external_id         TEXT NOT NULL,
-    -- AES-256-GCM ciphertext (nonce || ciphertext, base64), never plaintext.
+    -- AES-256-GCM ciphertext, canonically base64(nonce || ciphertext) — see §4
+    -- for the encode/decode contract between this single column and
+    -- Cipher::Sealed's two-field shape. Never plaintext.
     -- NULL for GitHub (nothing per-org to encrypt: installation id above is
     -- not a secret). Holds the JIRA OAuth refresh token for `jira`.
     encrypted_credentials TEXT,
@@ -224,6 +251,17 @@ not duplicated) and keeps everything genuinely auth-domain: `generate`, `hash`, 
 `prefix::*`. `df-trackers` depends on `df-core` already (see Cargo.toml) and calls
 `df_core::crypto::Cipher` directly — no new inter-domain dependency, no duplicate
 implementation.
+
+**Canonical storage encoding (resolves a §1/§4 inconsistency from the first draft).**
+`Cipher::seal` returns a `Sealed { ciphertext: Vec<u8>, nonce: Vec<u8> }` — two values,
+by design, so a caller free to use two database columns can. The `TEXT` columns in §1
+are single-column, so `df-core::trackers`'s CRUD functions (not `Cipher` itself) own the
+encoding contract: `base64(nonce || ciphertext)` on write, split at the fixed 12-byte
+nonce prefix and re-assemble into `Sealed` on read. This encode/decode pair lives as two
+small private helpers in `crates/df-core/src/trackers.rs` (`encode_sealed`/
+`decode_sealed`), not in `df-core::crypto` itself — `Cipher`/`Sealed` stay storage-agnostic
+so a future caller that does have two columns available is not forced through this
+concatenation.
 
 ## §5 What Task 1 does NOT wire up yet
 
