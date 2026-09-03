@@ -12,8 +12,8 @@ no AI attribution, forward-only migrations) intact.
 
 ## Status — 2026-09-03
 
-Task 1 in progress. Tasks 2–6 ⬜, not started — they depend on Task 1's schema and the
-promoted `df-core::crypto` primitive.
+Task 1 ✅ shipped (PR #18). Tasks 2–6 ⬜, not started — they depend on Task 1's schema and
+the promoted `df-core::crypto` primitive.
 
 ## Global Constraints
 
@@ -80,7 +80,7 @@ whatever the server-side tasks exposed.
 
 ---
 
-## Task 1 — Schema foundation: `tracker_connections`, `tracker_bindings`, promoted crypto 🚧
+## Task 1 — Schema foundation: `tracker_connections`, `tracker_bindings`, promoted crypto ✅ (PR #18)
 
 **Files:** `crates/df-core/migrations/0011_trackers.sql`, `crates/df-core/src/crypto.rs`,
 `crates/df-core/src/trackers.rs`, `crates/df-core/src/error.rs`, `crates/df-core/src/lib.rs`,
