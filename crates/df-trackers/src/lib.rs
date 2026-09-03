@@ -7,6 +7,7 @@
 mod error;
 pub mod github;
 pub mod jira;
+pub mod webhook;
 
 pub use error::{Error, Result};
 

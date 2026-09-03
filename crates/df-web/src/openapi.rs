@@ -155,6 +155,8 @@ fn param_description(name: &str) -> &'static str {
 fn tag_for(path: &str) -> &'static str {
     if path.starts_with("/oauth") || path.starts_with("/.well-known") {
         "oauth"
+    } else if path.starts_with("/webhooks") {
+        "trackers"
     } else if path.starts_with("/api/auth") {
         "auth"
     } else if path.starts_with("/api/me") {

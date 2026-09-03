@@ -100,6 +100,7 @@ fn web_state(db: Db, config: &Config) -> Result<df_web::AppState> {
 fn web_config(config: &Config) -> df_web::Config {
     let mut web = df_web::Config::new(&config.public_url, &config.resource_uri);
     web.totp_issuer = config.totp_issuer.clone();
+    web.github_app_webhook_secret = config.github_app_webhook_secret.clone();
     web.client_ip_header = config.client_ip_header.clone();
     // The console reports this as `enforced` on the usage endpoint. It has to be
     // the same value `df-mcp` is refusing calls with, or a customer whose agent
@@ -174,12 +175,17 @@ mod tests {
     fn every_deployment_setting_reaches_df_web() {
         let mut config = Config::for_test();
         config.totp_issuer = "acme-factory".into();
+        config.github_app_webhook_secret = Some("webhook-secret".into());
         config.client_ip_header = Some("cf-connecting-ip".into());
         config.enforce_quotas = true;
 
         let web = web_config(&config);
 
         assert_eq!(web.totp_issuer, "acme-factory");
+        assert_eq!(
+            web.github_app_webhook_secret.as_deref(),
+            Some("webhook-secret")
+        );
         assert_eq!(web.client_ip_header.as_deref(), Some("cf-connecting-ip"));
         assert!(
             web.enforce_quotas,

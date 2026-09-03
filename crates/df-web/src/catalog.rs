@@ -21,7 +21,7 @@
 
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 
-use crate::routes::{auth, jobs, orgs, repos, teams, tokens, usage};
+use crate::routes::{auth, jobs, orgs, repos, teams, tokens, usage, webhooks};
 use crate::state::AppState;
 use crate::{oauth, openapi};
 
@@ -247,6 +247,16 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::Public)
             .summary("This document")
             .describe("The OpenAPI description of everything below."),
+        Endpoint::post("/webhooks/{provider}", webhooks::receive)
+            .auth(Auth::Public)
+            .summary("Receive tracker webhooks")
+            .describe(
+                "Public by necessity: GitHub App deliveries are authenticated by \
+                 `X-Hub-Signature-256`, and JIRA Automation deliveries by the \
+                 org's own `X-DF-Webhook-Secret` plus a `?site=<cloud-id>` URL \
+                 parameter. This endpoint only verifies, parses, and resolves the \
+                 owning org today; Task 4 turns accepted events into sync work.",
+            ),
         // ----------------------------------------------------------- oauth
         Endpoint::post("/oauth/register", oauth::register_client)
             .auth(Auth::Public)

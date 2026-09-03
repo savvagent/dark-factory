@@ -1,0 +1,16 @@
+{
+  "action": "opened",
+  "installation": { "id": 123456 },
+  "repository": { "full_name": "acme/api" },
+  "issue": {
+    "id": 7001,
+    "number": 17,
+    "title": "Implement webhook ingest",
+    "body": "Wire webhook verification into the tracker sync flow.",
+    "state": "open",
+    "labels": [
+      { "name": "bug" },
+      { "name": "trackers" }
+    ]
+  }
+}
