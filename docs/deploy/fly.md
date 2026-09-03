@@ -149,26 +149,19 @@ wanted; until then, treat `DATABASE_URL` as a credential to nels' database too.
 
 ## What a deploy can and cannot do
 
-`/readyz` passes, the API works end to end for an MCP client, and the console is
-served: `web/` (task 11) landed, and the `Dockerfile`'s console stage bakes the
-built SPA into `/srv/console`, which `DF_STATIC_DIR` points at. Sign-up, the
-emailed verification link, TOTP enrolment, org creation and PAT minting are all
-reachable through a browser.
+Everything. `/readyz` passes, the API works end to end for an MCP client, and the
+console is served — `web/` is built into `/srv/console` by the Dockerfile's console
+stage, which `DF_STATIC_DIR` points at.
 
-The one thing a deploy still cannot do is **onboard anybody**, because no mail
-provider is configured. Every verification, recovery, and invitation email is
-written to this process's log rather than sent (recipient and subject only; see
-`crates/df-web/src/mail.rs`), so the link a new user needs never reaches them.
-`df-server` refuses to start without `DF_ALLOW_LOG_MAILER=1` precisely so this
-gap cannot be silent, and the log says so on every send:
+Onboarding is self-contained, which it was not before: **the product sends no email**.
+Signing up hands back the TOTP enrollment in its own response, so an account is created,
+enrolled, and signed in during a single visit to `/signup`, with no mail provider in the
+loop and nothing to configure. Recovery is recovery codes, or an org admin clearing a
+member's authenticator. Invitations are one-time codes the admin copies out of the
+console and delivers themselves.
 
-```
-WARN df_web::mail: MAIL NOT SENT — no mail provider is configured
-                   to=… subject=Confirm your email for dark-factory
-```
-
-Until a real mailer lands, an operator can complete a sign-up by reading the link
-out of the logs (`df_web=debug`), and an agent can use the API directly.
+There is consequently no `DF_ALLOW_LOG_MAILER`, no `Mailer`, and no deployment state in
+which links go to a log instead of a mailbox.
 
 Confirming `DF_PUBLIC_URL` / `DF_RESOURCE_URI` in `fly.toml` against the final
 hostname (Fly default `https://dark-factory-mcp.fly.dev` or a custom domain) and

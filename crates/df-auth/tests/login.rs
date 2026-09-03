@@ -12,7 +12,6 @@
 
 use df_auth::crypto::Cipher;
 use df_auth::error::AuthError;
-use df_auth::magic::{self, Purpose};
 use df_auth::{login, sessions, totp};
 use df_core::ids::UserId;
 use df_core::orgs::Role;
@@ -81,159 +80,7 @@ async fn audit_count(db: &Db, action: &str) -> i64 {
 }
 
 // ------------------------------------------------------------ email verification
-
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn a_verification_link_marks_the_address_and_then_stops_working(pool: PgPool) {
-    let (db, user) = fixture(pool).await;
-
-    let before = db.get_user(user).await.unwrap().unwrap();
-    assert!(
-        before.email_verified_at.is_none(),
-        "a fresh user starts unverified"
-    );
-
-    let link = magic::issue(&db, EMAIL, Purpose::VerifyEmail)
-        .await
-        .unwrap();
-    assert_eq!(login::verify_email(&db, &link.token).await.unwrap(), user);
-
-    let after = db.get_user(user).await.unwrap().unwrap();
-    assert!(after.email_verified_at.is_some());
-    assert_eq!(audit_count(&db, "auth.email.verified").await, 1);
-
-    // Single use. A link sitting in an inbox is not a spare key.
-    let err = login::verify_email(&db, &link.token).await.unwrap_err();
-    assert!(matches!(err, AuthError::AlreadyConsumed), "got {err:?}");
-    assert_eq!(
-        audit_count(&db, "auth.email.verified").await,
-        1,
-        "a replayed link must not write a second verification event"
-    );
-}
-
-/// The interesting attack on a shared token table: an email-verification link
-/// is far easier to obtain than a recovery one, so it must not open the
-/// recovery door — and must survive the attempt, since the legitimate user has
-/// not used it yet.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn a_verification_link_cannot_be_spent_on_recovery(pool: PgPool) {
-    let (db, user) = fixture(pool).await;
-
-    let link = magic::issue(&db, EMAIL, Purpose::VerifyEmail)
-        .await
-        .unwrap();
-
-    let err = login::recover_with_magic_link(&db, &link.token, None)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, AuthError::AlreadyConsumed), "got {err:?}");
-
-    assert_eq!(
-        login::verify_email(&db, &link.token).await.unwrap(),
-        user,
-        "the failed cross-purpose attempt must not have burned the link"
-    );
-}
-
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn resending_retires_the_previous_link(pool: PgPool) {
-    let (db, _user) = fixture(pool).await;
-
-    let first = magic::issue(&db, EMAIL, Purpose::VerifyEmail)
-        .await
-        .unwrap();
-    let second = magic::issue(&db, EMAIL, Purpose::VerifyEmail)
-        .await
-        .unwrap();
-
-    let err = login::verify_email(&db, &first.token).await.unwrap_err();
-    assert!(
-        matches!(err, AuthError::AlreadyConsumed),
-        "the superseded link must be dead, got {err:?}"
-    );
-    assert!(login::verify_email(&db, &second.token).await.is_ok());
-}
-
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn an_expired_link_is_refused(pool: PgPool) {
-    let (db, _user) = fixture(pool).await;
-    let link = magic::issue(&db, EMAIL, Purpose::VerifyEmail)
-        .await
-        .unwrap();
-
-    sqlx::query("UPDATE magic_links SET expires_at = now() - interval '1 minute'")
-        .execute(db.pool())
-        .await
-        .unwrap();
-
-    let err = login::verify_email(&db, &link.token).await.unwrap_err();
-    assert!(matches!(err, AuthError::Expired), "got {err:?}");
-}
-
-/// Issuance is what an attacker can reach without any credential at all, and
-/// what it costs is somebody else's inbox.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn link_issuance_is_throttled(pool: PgPool) {
-    let (db, _user) = fixture(pool).await;
-
-    for i in 0..5 {
-        magic::issue(&db, EMAIL, Purpose::RecoverTotp)
-            .await
-            .unwrap_or_else(|e| panic!("send {i} should be allowed: {e:?}"));
-    }
-
-    let err = magic::issue(&db, EMAIL, Purpose::RecoverTotp)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, AuthError::RateLimited { .. }), "got {err:?}");
-
-    // Per address, not global: one victim being mail-bombed must not stop
-    // everyone else from signing in.
-    assert!(magic::issue(&db, "someone@else.test", Purpose::RecoverTotp)
-        .await
-        .is_ok());
-}
-
 // ------------------------------------------------------------------- recovery
-
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn a_recovery_link_signs_the_user_in_and_clears_their_second_factor(pool: PgPool) {
-    let (db, user) = fixture(pool).await;
-    let c = cipher();
-    let (gen, _codes) = enrolled(&db, &c, user).await;
-
-    let link = magic::issue(&db, EMAIL, Purpose::RecoverTotp)
-        .await
-        .unwrap();
-    let out = login::recover_with_magic_link(&db, &link.token, Some("203.0.113.7"))
-        .await
-        .unwrap();
-
-    assert_eq!(out.user, user);
-    assert_eq!(out.method, login::Method::MagicLink);
-    assert!(
-        out.must_enroll_totp,
-        "the premise of this flow is that the authenticator is gone"
-    );
-    assert!(!totp::has_confirmed_credential(&db, user).await.unwrap());
-    assert_eq!(
-        totp::remaining_recovery_codes(&db, user).await.unwrap(),
-        0,
-        "codes printed alongside the discarded secret go with it"
-    );
-    assert_eq!(audit_count(&db, "auth.totp.reset").await, 1);
-
-    // The old authenticator is dead, so the old login path is too.
-    let err = login::with_totp(&db, &c, EMAIL, &now_code(&gen), ISSUER, None)
-        .await
-        .unwrap_err();
-    assert_eq!(err.public(), "invalid credentials");
-
-    // The session it opened is real.
-    let session = sessions::resolve(&db, &out.session_token).await.unwrap();
-    assert_eq!(session.user_id, user);
-}
-
 /// A recovery *code* is not a recovery *link*: the user still holds their
 /// secret, they just cannot reach it right now. Destroying it would force a
 /// re-enrollment nobody asked for.
@@ -350,14 +197,6 @@ async fn a_disabled_account_is_indistinguishable_from_an_absent_one(pool: PgPool
 
     // Every other door too, not just the front one.
     let err = login::with_recovery_code(&db, EMAIL, &codes[0], None)
-        .await
-        .unwrap_err();
-    assert_eq!(err.public(), "invalid credentials");
-
-    let link = magic::issue(&db, EMAIL, Purpose::RecoverTotp)
-        .await
-        .unwrap();
-    let err = login::recover_with_magic_link(&db, &link.token, None)
         .await
         .unwrap_err();
     assert_eq!(err.public(), "invalid credentials");

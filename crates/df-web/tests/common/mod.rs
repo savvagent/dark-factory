@@ -8,8 +8,6 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::Router;
 use base64::Engine;
@@ -17,7 +15,6 @@ use df_auth::crypto::Cipher;
 use df_core::ids::{OrgId, UserId};
 use df_core::orgs::Role;
 use df_core::Db;
-use df_web::mail::{CapturingMailer, Mail};
 use df_web::{AppState, Config};
 use http::{Request, Response, StatusCode};
 use serde_json::Value;
@@ -31,24 +28,16 @@ pub const ISSUER: &str = "dark-factory";
 pub struct Harness {
     pub db: Db,
     pub router: Router,
-    pub mailer: Arc<CapturingMailer>,
     pub cipher: Cipher,
 }
 
 pub fn harness(pool: PgPool) -> Harness {
     let db = Db::from_pool(pool);
-    let mailer = CapturingMailer::new();
-    let state = AppState::new(
-        db.clone(),
-        cipher(),
-        mailer.clone(),
-        Config::new(PUBLIC_URL, RESOURCE),
-    );
+    let state = AppState::new(db.clone(), cipher(), Config::new(PUBLIC_URL, RESOURCE));
 
     Harness {
         db,
         router: df_web::router(state),
-        mailer,
         cipher: cipher(),
     }
 }
@@ -221,33 +210,39 @@ pub struct Account {
     pub recovery_codes: Vec<String>,
 }
 
-/// Take an address through signup → verification → enrollment, exactly as a
+/// Take an address through signup → enrollment → confirmation, exactly as a
 /// person would, and hand back a live session.
 ///
 /// Deliberately not a shortcut that inserts rows: the point of most of these
 /// tests is that the sequence works end to end, and a fixture that skips it
 /// would test a state the product cannot actually reach.
 pub async fn onboard(h: &Harness, email: &str) -> Account {
-    Call::post("/api/auth/signup")
+    let started = Call::post("/api/auth/signup")
         .json(serde_json::json!({ "email": email, "name": "Test User" }))
         .send(&h.router)
-        .await
-        .expect(StatusCode::ACCEPTED);
+        .await;
+    started.expect(StatusCode::OK);
 
-    let token = link_token(&h.mailer.last().expect("no verification mail"));
+    let (totp, recovery_codes) = generator_from(&started.body, email);
 
-    let verified = Call::post("/api/auth/verify")
-        .json(serde_json::json!({ "token": token }))
+    // The *previous* step, so the current one stays unconsumed and is still
+    // available to log in with. Using one step for both is a replay, which is
+    // exactly what the credential refuses.
+    let previous_step = chrono::Utc::now().timestamp() as u64 - 30;
+    let confirmed = Call::post("/api/auth/signup/confirm")
+        .json(serde_json::json!({
+            "email": email,
+            "code": totp.generate(previous_step),
+        }))
         .send(&h.router)
         .await;
-    verified.expect(StatusCode::OK);
+    confirmed.expect(StatusCode::OK);
 
-    let session = verified
+    let session = confirmed
         .session_cookie()
-        .expect("verification of a fresh account must open a session");
+        .expect("confirming signup must open the account's first session");
 
     let user = h.db.get_user_by_email(email).await.unwrap().unwrap().id;
-    let (totp, recovery_codes) = enroll(h, &session, email).await;
 
     Account {
         user,
@@ -258,20 +253,10 @@ pub async fn onboard(h: &Harness, email: &str) -> Account {
     }
 }
 
-/// Enrol an authenticator through the API and confirm it.
-///
-/// Confirmation uses the *previous* step's code so the current step stays
-/// unconsumed and available to log in with — using one step for both is a
-/// replay, which is exactly what the credential refuses.
-pub async fn enroll(h: &Harness, session: &str, email: &str) -> (totp_rs::TOTP, Vec<String>) {
-    let started = Call::post("/api/me/totp")
-        .with_session(session)
-        .send(&h.router)
-        .await;
-    started.expect(StatusCode::OK);
-
-    let manual_key = started.body["manualKey"].as_str().unwrap().to_string();
-    let codes: Vec<String> = started.body["recoveryCodes"]
+/// Build a TOTP generator from an enrollment response body.
+fn generator_from(body: &Value, email: &str) -> (totp_rs::TOTP, Vec<String>) {
+    let manual_key = body["manualKey"].as_str().unwrap().to_string();
+    let codes: Vec<String> = body["recoveryCodes"]
         .as_array()
         .unwrap()
         .iter()
@@ -289,6 +274,23 @@ pub async fn enroll(h: &Harness, session: &str, email: &str) -> (totp_rs::TOTP, 
         email.to_string(),
     )
     .unwrap();
+
+    (generator, codes)
+}
+
+/// Enrol an authenticator through the API and confirm it.
+///
+/// Confirmation uses the *previous* step's code so the current step stays
+/// unconsumed and available to log in with — using one step for both is a
+/// replay, which is exactly what the credential refuses.
+pub async fn enroll(h: &Harness, session: &str, email: &str) -> (totp_rs::TOTP, Vec<String>) {
+    let started = Call::post("/api/me/totp")
+        .with_session(session)
+        .send(&h.router)
+        .await;
+    started.expect(StatusCode::OK);
+
+    let (generator, codes) = generator_from(&started.body, email);
 
     let previous_step = chrono::Utc::now().timestamp() as u64 - 30;
     Call::post("/api/me/totp/confirm")
@@ -320,18 +322,4 @@ pub async fn org_with_owner(h: &Harness, slug: &str, owner: &Account) -> OrgId {
 /// than about how someone got it.
 pub async fn add_member(h: &Harness, org: OrgId, user: UserId, role: Role) {
     h.db.add_member(org, user, role).await.unwrap();
-}
-
-/// Pull the `token=` query parameter out of the link in a message.
-pub fn link_token(mail: &Mail) -> String {
-    let start = mail
-        .text
-        .find("token=")
-        .unwrap_or_else(|| panic!("no token in mail:\n{}", mail.text))
-        + "token=".len();
-    mail.text[start..]
-        .split(|c: char| c.is_whitespace())
-        .next()
-        .unwrap()
-        .to_string()
 }

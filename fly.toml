@@ -38,15 +38,6 @@ primary_region = "iad"
   # docs/deploy/cloudflare.md — neither is optional and neither fails loudly.
   DF_CLIENT_IP_HEADER = "fly-client-ip"
 
-  # No SMTP or mail-provider integration exists yet (milestone 1 scope), and
-  # df-server refuses to start without this explicit opt-in rather than run a
-  # mailer that delivers nothing. With it set, verification, recovery, and
-  # invitation emails are written to this process's log instead of being sent:
-  # at this RUST_LOG level LogMailer records only recipient and subject, so the
-  # links themselves are neither delivered nor visible here. A deploy in this
-  # state is API-usable and cannot onboard anybody.
-  DF_ALLOW_LOG_MAILER = "1"
-
 [http_service]
   internal_port = 8080
   # The session cookie carries the __Host- prefix, which browsers refuse to

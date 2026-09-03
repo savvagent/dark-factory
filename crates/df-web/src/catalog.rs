@@ -292,43 +292,25 @@ pub fn catalog() -> Vec<Endpoint> {
         Endpoint::post("/api/auth/signup", auth::signup)
             .auth(Auth::Public)
             .takes("SignupRequest")
-            .returns("Accepted")
-            .status(202)
-            .summary("Create an account")
+            .returns("Enrollment")
+            .summary("Create an account and start enrolling an authenticator")
             .describe(
-                "Creates the user and mails a verification link. Answers identically \
-                 whether or not the address is already registered.",
+                "Returns the provisioning URI for a QR code, the manual key, and ten \
+                 recovery codes. No session is opened and no credential is confirmed \
+                 until /api/auth/signup/confirm. Answers 409 account_exists for an \
+                 address that already has an authenticator — there is no mailbox to \
+                 send a secret to, so the secret comes back here and cannot be handed \
+                 to whoever types someone else's address.",
             ),
-        Endpoint::post("/api/auth/link", auth::request_link)
+        Endpoint::post("/api/auth/signup/confirm", auth::confirm_signup)
             .auth(Auth::Public)
-            .takes("LinkRequest")
-            .returns("Accepted")
-            .status(202)
-            .summary("Mail a verification or recovery link")
-            .describe(
-                "For someone whose verification mail never arrived, or whose \
-                 authenticator is gone. Throttled per address — what is being \
-                 protected is the recipient's mailbox.",
-            ),
-        Endpoint::post("/api/auth/verify", auth::verify)
-            .auth(Auth::Public)
-            .takes("TokenRequest")
-            .returns("Verified")
-            .summary("Spend a verification link")
-            .describe(
-                "POST, never GET: mail scanners follow every link they see, and a \
-                 single-use GET is spent before the human clicks it. Opens a session \
-                 only for an account that has no confirmed authenticator yet — which \
-                 is what makes first enrollment reachable.",
-            ),
-        Endpoint::post("/api/auth/recover", auth::recover)
-            .auth(Auth::Public)
-            .takes("TokenRequest")
+            .takes("ConfirmSignupRequest")
             .returns("SessionOpened")
-            .summary("Spend a recovery link")
+            .summary("Finish signup with a code from the authenticator")
             .describe(
-                "Removes the current authenticator and opens a session so a new one \
-                 can be enrolled. POST, for the same reason as verification.",
+                "Confirms the pending secret and opens the account's first session. \
+                 Takes the address rather than a session because there is no session \
+                 yet; the code is the proof.",
             ),
         Endpoint::post("/api/auth/login", auth::login_totp)
             .auth(Auth::Public)
@@ -413,6 +395,20 @@ pub fn catalog() -> Vec<Endpoint> {
                 "Only an owner may create or demote another owner, and the last owner \
                  cannot be demoted.",
             ),
+        Endpoint::post(
+            "/api/orgs/{org}/members/{user}/reset-authenticator",
+            orgs::reset_member_authenticator,
+        )
+        .auth(Auth::OrgAdmin)
+        .status(204)
+        .summary("Clear a member's authenticator so they can enrol a new one")
+        .describe(
+            "The only assisted account recovery there is — nothing is emailed, so a \
+             member who has lost both their authenticator and their recovery codes \
+             has no other route. Opens no session and grants nothing: the member \
+             enrols again themselves. Ends all of their sessions. Only an owner may \
+             reset an owner.",
+        ),
         Endpoint::delete("/api/orgs/{org}/members/{user}", orgs::remove_member)
             .auth(Auth::OrgAdmin)
             .status(204)
@@ -437,12 +433,16 @@ pub fn catalog() -> Vec<Endpoint> {
         Endpoint::post("/api/orgs/{org}/invites", orgs::create_invite)
             .auth(Auth::OrgAdmin)
             .takes("InviteRequest")
-            .returns("Invite")
+            .returns("CreatedInvite")
             .status(201)
-            .summary("Invite someone by email")
+            .summary("Invite someone by email address")
             .describe(
-                "Mails a single-use link, good for 14 days. Supersedes any live \
-                 invitation for the same address. Only an owner may invite an owner.",
+                "Returns a single-use code, good for 14 days, which the admin \
+                 delivers however they like — nothing is emailed. The code is shown \
+                 only in this response and cannot be read back; only its hash is \
+                 stored. Supersedes any live invitation for the same address. Only an \
+                 owner may invite an owner. Redeemable only by someone signed in as \
+                 the address invited, so a leaked code is not a free seat.",
             ),
         Endpoint::delete("/api/orgs/{org}/invites/{id}", orgs::revoke_invite)
             .auth(Auth::OrgAdmin)

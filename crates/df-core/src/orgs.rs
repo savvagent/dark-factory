@@ -73,7 +73,6 @@ pub struct User {
     pub id: UserId,
     pub email: String,
     pub name: Option<String>,
-    pub email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -97,7 +96,6 @@ pub struct OrgMember {
     pub id: UserId,
     pub email: String,
     pub name: Option<String>,
-    pub email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub role: Role,
@@ -105,7 +103,7 @@ pub struct OrgMember {
 }
 
 const ORG_COLS: &str = "id, slug, name, plan, enforce_sso, created_at";
-const USER_COLS: &str = "id, email, name, email_verified_at, created_at, disabled_at";
+const USER_COLS: &str = "id, email, name, created_at, disabled_at";
 
 /// An org is addressed by its slug as one URL path segment for the rest of its
 /// life (`/api/orgs/{org}/...`), so the same character/length discipline team
@@ -256,23 +254,6 @@ impl Db {
         Ok(user)
     }
 
-    /// Record that this user has proved control of their email address.
-    ///
-    /// Idempotent, and it reports which call did the work: a user who clicks the
-    /// same verification link twice has done nothing wrong, but only the first
-    /// click is worth an audit event.
-    pub async fn mark_email_verified(&self, user: UserId) -> Result<bool> {
-        let n = sqlx::query(
-            "UPDATE users SET email_verified_at = now() \
-             WHERE id = $1 AND email_verified_at IS NULL",
-        )
-        .bind(user)
-        .execute(self.pool())
-        .await?
-        .rows_affected();
-        Ok(n > 0)
-    }
-
     pub async fn add_member(&self, org: OrgId, user: UserId, role: Role) -> Result<()> {
         sqlx::query(
             "INSERT INTO org_members (org_id, user_id, role) VALUES ($1,$2,$3) \
@@ -346,7 +327,7 @@ impl Db {
 
     pub async fn list_org_members(&self, org: OrgId) -> Result<Vec<OrgMember>> {
         let rows = sqlx::query_as(
-            "SELECT u.id, u.email, u.name, u.email_verified_at, u.created_at, u.disabled_at, \
+            "SELECT u.id, u.email, u.name, u.created_at, u.disabled_at, \
                     m.role, m.created_at AS joined_at \
              FROM org_members m JOIN users u ON u.id = m.user_id \
              WHERE m.org_id = $1 ORDER BY u.email",

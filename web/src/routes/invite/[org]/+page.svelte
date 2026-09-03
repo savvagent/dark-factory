@@ -11,10 +11,11 @@
    * What an invitation link opens.
    *
    * Behind the sign-in guard in the root layout, deliberately. The server
-   * requires a session whose *verified* address matches the one invited —
-   * otherwise a forwarded invitation mail is a way into someone else's org —
-   * and a page that redeemed on load would burn the token for whoever the
-   * browser happened to be signed in as.
+   * requires a session whose address matches the one invited — otherwise a code
+   * forwarded to the wrong person is a way into someone else's org — and a page
+   * that redeemed on load would burn the token for whoever the browser happened
+   * to be signed in as. Codes now travel through chat, which unfurls links just
+   * as eagerly as a mail scanner did.
    *
    * The mismatch case (`invite_wrong_account`, `403`) gets its own message,
    * because the fix is "sign in as the invited address", which is not something

@@ -23,7 +23,6 @@ export interface User {
   id: string;
   email: string;
   name: string | null;
-  emailVerifiedAt: string | null;
   createdAt: string;
   disabledAt: string | null;
 }
@@ -64,18 +63,6 @@ export interface SessionOpened {
   mustEnrollTotp: boolean;
 }
 
-export interface Verified {
-  emailVerified: boolean;
-  mustEnrollTotp: boolean;
-  /** Whether a session cookie came with the response. */
-  signedIn: boolean;
-}
-
-export interface Accepted {
-  sent: boolean;
-  message: string;
-}
-
 /** Shown exactly once. Only hashes are stored. */
 export interface Enrollment {
   provisioningUri: string;
@@ -89,7 +76,6 @@ export interface OrgMember {
   name: string | null;
   role: Role;
   joinedAt: string;
-  emailVerifiedAt: string | null;
   disabledAt: string | null;
 }
 
@@ -102,6 +88,18 @@ export interface Invite {
   expiresAt: string;
   acceptedAt: string | null;
   createdAt: string;
+}
+
+/**
+ * The response from minting an invitation: the invite, plus the one-time code.
+ *
+ * `code` and `link` are the same secret twice and are returned **only** here —
+ * nothing is emailed, and only the hash is stored, so an admin who loses the
+ * code re-invites rather than looking it up.
+ */
+export interface CreatedInvite extends Invite {
+  code: string;
+  link: string;
 }
 
 export interface Team {

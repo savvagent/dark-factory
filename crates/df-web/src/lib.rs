@@ -33,7 +33,6 @@
 
 pub mod catalog;
 pub mod error;
-pub mod mail;
 pub mod oauth;
 pub mod openapi;
 pub mod routes;
@@ -43,7 +42,6 @@ pub mod state;
 use axum::Router;
 
 pub use error::{ApiError, ApiResult};
-pub use mail::{LogMailer, Mailer};
 pub use state::{AppState, Config};
 
 /// Build the console surface, ready to be merged into `df-server`'s router.
@@ -98,7 +96,6 @@ mod tests {
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             )
             .expect("test key"),
-            std::sync::Arc::new(LogMailer),
             Config::new("https://console.test", "https://mcp.test/mcp"),
         );
 

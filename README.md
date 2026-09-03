@@ -158,7 +158,7 @@ Two settings are deployment-specific and easy to get subtly wrong:
   **not** `x-forwarded-for`: fly-proxy *appends* to `X-Forwarded-For`, so a caller sending
   its own value arrives left-most, and a rate limiter keyed on that is worse than none
   because it looks like it is working. `fly.toml` sets it.
-- **`DF_PUBLIC_URL`** is the audience every token is bound to and the origin every emailed
+- **`DF_PUBLIC_URL`** is the audience every token is bound to and the origin every issued
   link points at. It is not derived from the `Host` header on purpose — that header is
   attacker-controlled, and an audience derived from one is not an audience check.
 

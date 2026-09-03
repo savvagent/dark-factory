@@ -39,11 +39,11 @@ the session and no CORS header could rescue it.
 
 ## What holds across the app
 
-**No credential is spent on a `GET`.** Verification, recovery, and invitation mails point
+**No credential is spent on a `GET`.** Invitation links point
 at pages here — `/verify`, `/recover`, `/invite/{org}` — which render a button that
 `POST`s the token. Mail scanners and link-preview fetchers follow every URL in every
 message, and a single-use `GET` is burned before the human clicks it. `df-web`'s
-`every_single_use_redemption_is_a_post` and `the_emailed_urls_are_pages_not_endpoints`
+`every_single_use_redemption_is_a_post` and `redeemable_urls_are_pages_not_endpoints`
 assert the server's half of the same bargain.
 
 **An org you are not in renders as "no such organization".** The API answers `404` for both
@@ -80,7 +80,7 @@ points at production.
 
 Org pages live under `/o/[org]` rather than `/[org]` so that no org slug can ever collide
 with a page name. The routes the _server_ names — `/login`, `/verify`, `/recover`,
-`/invite/{org}`, `/settings/billing` — are fixed by what goes in email and in
+`/invite/{org}`, `/settings/billing` — are fixed by what the server puts in an invitation link and in
 `df-billing`'s upgrade prompt, and must not be renamed here alone.
 
 ## Deploying to Cloudflare

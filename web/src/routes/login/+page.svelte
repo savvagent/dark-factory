@@ -28,7 +28,6 @@
   let mode = $state<Mode>('totp');
   let pending = $state(false);
   let error = $state<string | undefined>(undefined);
-  let notice = $state<string | undefined>(undefined);
 
   const next = $derived(safeNext(page.url.searchParams.get('next')));
 
@@ -36,7 +35,6 @@
     event.preventDefault();
     pending = true;
     error = undefined;
-    notice = undefined;
 
     try {
       const opened =
@@ -65,23 +63,6 @@
     } catch (e) {
       error = e instanceof ApiError ? e.message : 'Sign-in failed.';
       code = '';
-    } finally {
-      pending = false;
-    }
-  }
-
-  async function sendLink(purpose: 'verify' | 'recover') {
-    if (!email.trim()) {
-      error = 'Enter your email address first.';
-      return;
-    }
-    pending = true;
-    error = undefined;
-    try {
-      const accepted = await api.sendLink(email.trim(), purpose);
-      notice = accepted.message;
-    } catch (e) {
-      error = e instanceof ApiError ? e.message : 'Could not send that link.';
     } finally {
       pending = false;
     }
@@ -132,7 +113,6 @@
     </Field>
 
     {#if error}<Alert>{error}</Alert>{/if}
-    {#if notice}<Alert tone="ok">{notice}</Alert>{/if}
 
     <Button type="submit" {pending}>Sign in</Button>
   </form>
@@ -151,16 +131,9 @@
       </button>
     </p>
     <p>
-      Lost your authenticator?
-      <button class="text-muted underline hover:text-ink" onclick={() => sendLink('recover')}>
-        Email me a recovery link
-      </button>
-    </p>
-    <p>
-      Never got the confirmation email?
-      <button class="text-muted underline hover:text-ink" onclick={() => sendLink('verify')}>
-        Send it again
-      </button>
+      Lost your authenticator? Use a recovery code above. We send no email, so there is no recovery
+      link — if the codes are gone too, an admin of an organization you belong to can clear your
+      authenticator so you can enrol a new one.
     </p>
     <p class="pt-2">
       No account? <a class="text-muted underline hover:text-ink" href="/signup">Create one</a>.

@@ -127,8 +127,9 @@
     </div>
 
     <p class="mt-3 text-xs text-faint">
-      Each code works once. If you lose both your authenticator and these codes, the only way back
-      in is a recovery link emailed to your address.
+      Each code works once. We send no email, so there is no recovery link — if you lose both your
+      authenticator and these codes, an admin of an organization you belong to is the only way back
+      in, and for the last owner of an organization there is none.
     </p>
 
     <label class="mt-5 flex items-start gap-2 text-sm text-muted">

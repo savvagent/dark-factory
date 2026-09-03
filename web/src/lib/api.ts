@@ -3,8 +3,8 @@
  *
  * Three things hold here, and each of them is a rule the server also keeps.
  *
- * **No credential is ever spent on a GET.** Verification, recovery, and
- * invitation links point at *pages* in this app; the page renders a button and
+ * **No credential is ever spent on a GET.** An invitation link points at a
+ * *page* in this app; the page renders a button and
  * the button calls one of the `post` helpers below. A mail scanner that follows
  * the link loads a page and burns nothing. `df-web`'s
  * `every_single_use_redemption_is_a_post` asserts the other half.
@@ -23,11 +23,11 @@
  */
 
 import type {
-  Accepted,
   AuditEvent,
   BrowserSession,
   Enrollment,
   Invite,
+  CreatedInvite,
   Job,
   JobDetail,
   JobStatus,
@@ -46,8 +46,7 @@ import type {
   Team,
   TeamMember,
   TokenSummary,
-  UsageStatus,
-  Verified
+  UsageStatus
 } from './types';
 
 /**
@@ -148,15 +147,19 @@ const seg = (value: string) => encodeURIComponent(value);
 
 export const api = {
   // ----------------------------------------------------------------- auth
+  /**
+   * Create the account and start enrolling an authenticator.
+   *
+   * Returns the enrollment itself — there is no mailbox to send it to — so the
+   * caller must render the QR and recovery codes immediately. No session
+   * exists until `confirmSignup`.
+   */
   signup: (email: string, name?: string) =>
-    post<Accepted>('/api/auth/signup', { email, name: name || null }),
+    post<Enrollment>('/api/auth/signup', { email, name: name || null }),
 
-  /** Re-send a verification link, or ask for a recovery one. */
-  sendLink: (email: string, purpose: 'verify' | 'recover') =>
-    post<Accepted>('/api/auth/link', { email, purpose }),
-
-  verify: (token: string) => post<Verified>('/api/auth/verify', { token }),
-  recover: (token: string) => post<SessionOpened>('/api/auth/recover', { token }),
+  /** Finish signup with a code from the authenticator. Opens the first session. */
+  confirmSignup: (email: string, code: string) =>
+    post<SessionOpened>('/api/auth/signup/confirm', { email, code }),
 
   login: (email: string, code: string) => post<SessionOpened>('/api/auth/login', { email, code }),
   loginWithRecoveryCode: (email: string, code: string) =>
@@ -187,8 +190,11 @@ export const api = {
     post<void>(`/api/orgs/${seg(org)}/members/${seg(user)}/logout`),
 
   invites: (org: string) => get<Invite[]>(`/api/orgs/${seg(org)}/invites`),
+  /** Returns the one-time code, shown once — the admin delivers it themselves. */
   invite: (org: string, email: string, role: Role) =>
-    post<Invite>(`/api/orgs/${seg(org)}/invites`, { email, role }),
+    post<CreatedInvite>(`/api/orgs/${seg(org)}/invites`, { email, role }),
+  resetMemberAuthenticator: (org: string, user: string) =>
+    post<void>(`/api/orgs/${seg(org)}/members/${seg(user)}/reset-authenticator`),
   revokeInvite: (org: string, id: string) => del<void>(`/api/orgs/${seg(org)}/invites/${seg(id)}`),
   acceptInvite: (org: string, token: string) =>
     post<Joined>(`/api/orgs/${seg(org)}/invites/accept`, { token }),
