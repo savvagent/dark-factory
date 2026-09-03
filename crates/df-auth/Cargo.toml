@@ -24,7 +24,6 @@ rand.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 subtle.workspace = true
-aes-gcm.workspace = true
 totp-rs.workspace = true
 webauthn-rs = { version = "0.5.4", features = ["danger-allow-state-serialisation", "resident-key-support", "conditional-ui"] }
 webauthn-rs-proto = "0.5.5"

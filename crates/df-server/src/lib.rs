@@ -77,7 +77,7 @@ pub fn router(db: Db, watcher: Arc<Watcher>, config: &Config) -> Result<Router> 
 
 /// `df-web`'s state, with the settings that are this deployment's to decide.
 fn web_state(db: Db, config: &Config) -> Result<df_web::AppState> {
-    let cipher = df_auth::crypto::Cipher::from_base64_key(&config.encryption_key)
+    let cipher = df_core::crypto::Cipher::from_base64_key(&config.encryption_key)
         .context("DF_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 
     let web_config = web_config(config);

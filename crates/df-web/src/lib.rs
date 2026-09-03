@@ -112,7 +112,7 @@ mod tests {
         let config = Config::new("https://console.test", "https://mcp.test/mcp");
         let state = AppState::new(
             db,
-            df_auth::crypto::Cipher::from_base64_key(
+            df_core::crypto::Cipher::from_base64_key(
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             )
             .expect("test key"),
