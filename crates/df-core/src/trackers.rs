@@ -3,7 +3,10 @@
 //! A connection is org-scoped provider access; a binding is the per-repo map to
 //! an external tracker project or repository. Both are tenant data, so every
 //! query carries an explicit `org_id = $1` predicate even though row-level
-//! security would also scope it.
+//! security would also scope it — bound from `tx.org()`, the same pinned org
+//! `repos.rs` and `jobs.rs` use, so there is exactly one source of truth for
+//! which org a call runs as rather than a caller-supplied value that could
+//! drift from it.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -123,7 +126,6 @@ async fn require_repo_in_org(tx: &mut Tx<'_>, repo_id: RepoId) -> Result<()> {
 
 async fn require_connection_in_org(
     tx: &mut Tx<'_>,
-    org_id: OrgId,
     connection_id: uuid::Uuid,
     provider: Provider,
 ) -> Result<()> {
@@ -131,7 +133,7 @@ async fn require_connection_in_org(
         "SELECT EXISTS (SELECT 1 FROM tracker_connections \
          WHERE org_id = $1 AND id = $2 AND provider = $3)",
     )
-    .bind(org_id)
+    .bind(tx.org())
     .bind(connection_id)
     .bind(provider)
     .fetch_one(tx.conn())
@@ -148,12 +150,12 @@ async fn require_connection_in_org(
 
 pub async fn upsert_connection(
     tx: &mut Tx<'_>,
-    org_id: OrgId,
     provider: Provider,
     external_id: &str,
     encrypted_credentials: Option<&Sealed>,
     encrypted_webhook_secret: Option<&Sealed>,
 ) -> Result<TrackerConnection> {
+    let org_id = tx.org();
     let encrypted_credentials = encrypted_credentials.map(encode_sealed).transpose()?;
     let encrypted_webhook_secret = encrypted_webhook_secret.map(encode_sealed).transpose()?;
 
@@ -181,13 +183,12 @@ pub async fn upsert_connection(
 
 pub async fn get_connection(
     tx: &mut Tx<'_>,
-    org_id: OrgId,
     provider: Provider,
 ) -> Result<Option<TrackerConnection>> {
     let row: Option<TrackerConnectionRow> = sqlx::query_as(&format!(
         "SELECT {CONNECTION_COLS} FROM tracker_connections WHERE org_id = $1 AND provider = $2"
     ))
-    .bind(org_id)
+    .bind(tx.org())
     .bind(provider)
     .fetch_optional(tx.conn())
     .await?;
@@ -195,9 +196,9 @@ pub async fn get_connection(
     row.map(validate_connection).transpose()
 }
 
-pub async fn delete_connection(tx: &mut Tx<'_>, org_id: OrgId, provider: Provider) -> Result<()> {
+pub async fn delete_connection(tx: &mut Tx<'_>, provider: Provider) -> Result<()> {
     sqlx::query("DELETE FROM tracker_connections WHERE org_id = $1 AND provider = $2")
-        .bind(org_id)
+        .bind(tx.org())
         .bind(provider)
         .execute(tx.conn())
         .await?;
@@ -206,15 +207,15 @@ pub async fn delete_connection(tx: &mut Tx<'_>, org_id: OrgId, provider: Provide
 
 pub async fn upsert_binding(
     tx: &mut Tx<'_>,
-    org_id: OrgId,
     repo_id: RepoId,
     connection_id: Option<uuid::Uuid>,
     provider: Provider,
     external_ref: &str,
 ) -> Result<TrackerBinding> {
+    let org_id = tx.org();
     require_repo_in_org(tx, repo_id).await?;
     if let Some(connection_id) = connection_id {
-        require_connection_in_org(tx, org_id, connection_id, provider).await?;
+        require_connection_in_org(tx, connection_id, provider).await?;
     }
 
     let binding = sqlx::query_as(&format!(
@@ -239,22 +240,21 @@ pub async fn upsert_binding(
 
 pub async fn get_binding(
     tx: &mut Tx<'_>,
-    org_id: OrgId,
     binding_id: uuid::Uuid,
 ) -> Result<Option<TrackerBinding>> {
     let binding = sqlx::query_as(&format!(
         "SELECT {BINDING_COLS} FROM tracker_bindings WHERE org_id = $1 AND id = $2"
     ))
-    .bind(org_id)
+    .bind(tx.org())
     .bind(binding_id)
     .fetch_optional(tx.conn())
     .await?;
     Ok(binding)
 }
 
-pub async fn delete_binding(tx: &mut Tx<'_>, org_id: OrgId, binding_id: uuid::Uuid) -> Result<()> {
+pub async fn delete_binding(tx: &mut Tx<'_>, binding_id: uuid::Uuid) -> Result<()> {
     sqlx::query("DELETE FROM tracker_bindings WHERE org_id = $1 AND id = $2")
-        .bind(org_id)
+        .bind(tx.org())
         .bind(binding_id)
         .execute(tx.conn())
         .await?;
@@ -263,7 +263,6 @@ pub async fn delete_binding(tx: &mut Tx<'_>, org_id: OrgId, binding_id: uuid::Uu
 
 pub async fn resolve_binding(
     tx: &mut Tx<'_>,
-    org_id: OrgId,
     repo_id: RepoId,
     provider: Provider,
 ) -> Result<Option<TrackerBinding>> {
@@ -271,7 +270,7 @@ pub async fn resolve_binding(
         "SELECT {BINDING_COLS} FROM tracker_bindings \
          WHERE org_id = $1 AND repo_id = $2 AND provider = $3"
     ))
-    .bind(org_id)
+    .bind(tx.org())
     .bind(repo_id)
     .bind(provider)
     .fetch_optional(tx.conn())

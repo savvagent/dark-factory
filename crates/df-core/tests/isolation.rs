@@ -453,16 +453,9 @@ async fn rls_scopes_tracker_connections(pool: PgPool) {
     let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
 
     let mut tx = db.begin(a.org).await.unwrap();
-    let connection = upsert_connection(
-        &mut tx,
-        a.org,
-        Provider::Github,
-        "installation-1",
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let connection = upsert_connection(&mut tx, Provider::Github, "installation-1", None, None)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let mut tx = db.begin_unpinned().await.unwrap();
@@ -498,7 +491,7 @@ async fn rls_scopes_tracker_connections(pool: PgPool) {
     assert_eq!(deleted, 0, "org B deleted org A's tracker connection");
 
     let mut tx = db.begin(a.org).await.unwrap();
-    let after = df_core::trackers::get_connection(&mut tx, a.org, Provider::Github)
+    let after = df_core::trackers::get_connection(&mut tx, Provider::Github)
         .await
         .unwrap()
         .expect("connection survived");
@@ -514,19 +507,11 @@ async fn rls_scopes_tracker_bindings(pool: PgPool) {
     let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
 
     let mut tx = db.begin(a.org).await.unwrap();
-    let connection = upsert_connection(
-        &mut tx,
-        a.org,
-        Provider::Github,
-        "installation-1",
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let connection = upsert_connection(&mut tx, Provider::Github, "installation-1", None, None)
+        .await
+        .unwrap();
     let binding = upsert_binding(
         &mut tx,
-        a.org,
         a.repo,
         Some(connection.id),
         Provider::Github,
@@ -568,7 +553,7 @@ async fn rls_scopes_tracker_bindings(pool: PgPool) {
     assert_eq!(deleted, 0, "org B deleted org A's tracker binding");
 
     let mut tx = db.begin(a.org).await.unwrap();
-    let after = resolve_binding(&mut tx, a.org, a.repo, Provider::Github)
+    let after = resolve_binding(&mut tx, a.repo, Provider::Github)
         .await
         .unwrap()
         .expect("binding survived");
