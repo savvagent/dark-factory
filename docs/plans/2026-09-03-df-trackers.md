@@ -12,7 +12,8 @@ no AI attribution, forward-only migrations) intact.
 
 ## Status — 2026-09-03
 
-Task 1 ✅ shipped (PR #18). Task 2 ✅ shipped (PR #20). Tasks 3–6 ⬜, not started.
+Task 1 ✅ shipped (PR #18). Task 2 ✅ shipped (PR #20). Task 3 ✅ shipped (PR #22).
+Tasks 4–6 ⬜, not started.
 
 ## Global Constraints
 
@@ -202,7 +203,7 @@ vars, additive, documented in `.env.example` with the *why*).
 - [x] `cargo test -p df-trackers`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all`.
 - [x] Commit.
 
-## Task 3 — Webhook ingest ⬜
+## Task 3 — Webhook ingest ✅ (PR #22)
 
 **Spec:** see §5a ("Webhook org resolution") in `docs/specs/2026-09-03-df-trackers-design.md`
 — read it first. It resolves a real gap the earlier checklist glossed over: every
