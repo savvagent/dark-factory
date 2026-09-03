@@ -92,3 +92,15 @@ export async function copy(text: string): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * How to write someone's name when the account may not have set one.
+ *
+ * An account exists from the moment a passkey is registered, so there is a real
+ * window — and, for anyone who never bothers, a permanent state — where there
+ * is no address and no name. Rendering `null` into a member list is the kind of
+ * thing nobody notices until a customer screenshots it.
+ */
+export function person(name: string | null, email: string | null): string {
+  return name ?? email ?? 'Unnamed account';
+}

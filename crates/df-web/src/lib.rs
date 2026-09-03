@@ -44,6 +44,25 @@ use axum::Router;
 pub use error::{ApiError, ApiResult};
 pub use state::{AppState, Config};
 
+/// Build the WebAuthn relying party this deployment signs with.
+///
+/// Fails loudly at startup rather than at somebody's first sign-in: an rp_id
+/// that is not a registrable suffix of the origin produces ceremonies that no
+/// browser will complete, and the error a user sees for that looks like their
+/// device is broken.
+pub fn relying_party(
+    config: &Config,
+) -> anyhow::Result<std::sync::Arc<df_auth::passkeys::Webauthn>> {
+    let rp_id = config.rp_id().ok_or_else(|| {
+        anyhow::anyhow!(
+            "DF_PUBLIC_URL ({}) has no host, so there is nothing to bind passkeys to",
+            config.public_url
+        )
+    })?;
+    let webauthn = df_auth::passkeys::relying_party(&rp_id, &config.public_url)?;
+    Ok(std::sync::Arc::new(webauthn))
+}
+
 /// Build the console surface, ready to be merged into `df-server`'s router.
 ///
 /// Every route comes from [`catalog::catalog`]. Grouping by path before
@@ -90,13 +109,15 @@ mod tests {
                 .expect("lazy pool"),
         );
 
+        let config = Config::new("https://console.test", "https://mcp.test/mcp");
         let state = AppState::new(
             db,
             df_auth::crypto::Cipher::from_base64_key(
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             )
             .expect("test key"),
-            Config::new("https://console.test", "https://mcp.test/mcp"),
+            relying_party(&config).expect("test relying party"),
+            config,
         );
 
         let _router = router(state);

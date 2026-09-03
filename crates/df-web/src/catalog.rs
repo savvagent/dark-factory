@@ -289,48 +289,56 @@ pub fn catalog() -> Vec<Endpoint> {
             .summary("Revoke a token")
             .describe("RFC 7009. Always 200, even for a token that never existed."),
         // ------------------------------------------------------------ auth
-        Endpoint::post("/api/auth/signup", auth::signup)
+        Endpoint::post("/api/auth/signup/start", auth::signup_start)
             .auth(Auth::Public)
-            .takes("SignupRequest")
-            .returns("Enrollment")
-            .summary("Create an account and start enrolling an authenticator")
+            .returns("RegistrationChallenge")
+            .summary("Create an account and get a passkey challenge")
             .describe(
-                "Returns the provisioning URI for a QR code, the manual key, and ten \
-                 recovery codes. No session is opened and no credential is confirmed \
-                 until /api/auth/signup/confirm. Answers 409 account_exists for an \
-                 address that already has an authenticator — there is no mailbox to \
-                 send a secret to, so the secret comes back here and cannot be handed \
-                 to whoever types someone else's address.",
+                "Takes no body — there is no identifier to give. Creates an account \
+                 with no address and returns a WebAuthn creation challenge; it \
+                 becomes usable only when a credential is registered against it at \
+                 /api/auth/signup/finish. Because nothing is submitted, nothing here \
+                 can reveal whether an address or account already exists.",
             ),
-        Endpoint::post("/api/auth/signup/confirm", auth::confirm_signup)
+        Endpoint::post("/api/auth/signup/finish", auth::signup_finish)
             .auth(Auth::Public)
-            .takes("ConfirmSignupRequest")
+            .takes("FinishRegistration")
             .returns("SessionOpened")
-            .summary("Finish signup with a code from the authenticator")
-            .describe(
-                "Confirms the pending secret and opens the account's first session. \
-                 Takes the address rather than a session because there is no session \
-                 yet; the code is the proof.",
-            ),
-        Endpoint::post("/api/auth/login", auth::login_totp)
+            .summary("Register the passkey and open the first session"),
+        Endpoint::post("/api/auth/login/start", auth::login_start)
             .auth(Auth::Public)
-            .takes("LoginRequest")
-            .returns("SessionOpened")
-            .summary("Sign in with an authenticator code")
+            .returns("AuthenticationChallenge")
+            .summary("Get a sign-in challenge")
             .describe(
-                "Email plus a six-digit code. Failures are constant-shape: unknown \
-                 address, disabled account, wrong code, and replayed code are one \
-                 answer.",
+                "Takes no identifier: the credential the browser picks is what says \
+                 who is signing in. allowCredentials is empty, so only discoverable \
+                 passkeys answer it.",
             ),
-        Endpoint::post("/api/auth/login/recovery", auth::login_recovery_code)
+        Endpoint::post("/api/auth/login/finish", auth::login_finish)
             .auth(Auth::Public)
-            .takes("LoginRequest")
+            .takes("FinishAuthentication")
             .returns("SessionOpened")
-            .summary("Sign in with a recovery code")
+            .summary("Present the signature and sign in")
             .describe(
-                "Uses one of the codes issued at enrollment. Leaves TOTP intact — the \
-                 user still holds the secret, they just cannot reach it right now.",
+                "Failures are one answer whatever went wrong — unknown credential, \
+                 bad signature, wrong origin, disabled account.",
             ),
+        Endpoint::post("/api/auth/claim/start", auth::claim_start)
+            .auth(Auth::Public)
+            .takes("ClaimRequest")
+            .returns("RegistrationChallenge")
+            .summary("Begin re-registering with an admin-issued claim code")
+            .describe(
+                "For an account whose passkeys an admin cleared. The code is not \
+                 spent here, so an interrupted ceremony does not burn somebody's \
+                 only way back in.",
+            ),
+        Endpoint::post("/api/auth/claim/finish", auth::claim_finish)
+            .auth(Auth::Public)
+            .takes("FinishClaim")
+            .returns("SessionOpened")
+            .summary("Register the new passkey and sign in")
+            .describe("Spends the claim code."),
         Endpoint::post("/api/auth/logout", auth::logout)
             .auth(Auth::Public)
             .status(204)
@@ -350,23 +358,41 @@ pub fn catalog() -> Vec<Endpoint> {
                 "Ends every browser session, including this one. Leaves access tokens \
                  alone — those are a separate credential with their own revocation.",
             ),
-        Endpoint::post("/api/me/totp", auth::begin_totp)
-            .returns("Enrollment")
-            .summary("Start enrolling an authenticator")
+        Endpoint::post("/api/me/passkeys/start", auth::add_passkey_start)
+            .returns("RegistrationChallenge")
+            .summary("Challenge to add another authenticator")
             .describe(
-                "Returns a provisioning URI for a QR code, a manual key, and ten \
-                 single-use recovery codes. The recovery codes are shown once and \
-                 stored only as hashes.",
+                "One passkey is one device, and there is no email to recover \
+                 through. A second is the recovery story.",
             ),
-        Endpoint::post("/api/me/totp/confirm", auth::confirm_totp)
-            .takes("ConfirmTotpRequest")
+        Endpoint::post("/api/me/passkeys/finish", auth::add_passkey_finish)
+            .takes("FinishRegistration")
             .status(204)
-            .summary("Finish enrollment")
-            .describe("Proves possession. Until this succeeds the credential cannot sign in."),
-        Endpoint::post("/api/me/recovery-codes", auth::reissue_recovery_codes)
-            .returns("RecoveryCodes")
-            .summary("Issue a fresh set of recovery codes")
-            .describe("Invalidates the previous set. Shown once."),
+            .summary("Register the additional authenticator"),
+        Endpoint::get("/api/me/passkeys", auth::list_passkeys)
+            .returns("PasskeyList")
+            .summary("Authenticators registered to this account"),
+        Endpoint::delete("/api/me/passkeys/{id}", auth::remove_passkey)
+            .status(204)
+            .summary("Remove an authenticator")
+            .describe(
+                "Refuses to remove the last one: that would lock the account out \
+                 permanently, and the click looks like tidying up.",
+            ),
+        Endpoint::patch("/api/me/passkeys/{id}", auth::rename_passkey)
+            .takes("RenameKeyRequest")
+            .status(204)
+            .summary("Name an authenticator"),
+        Endpoint::patch("/api/me", auth::set_profile)
+            .takes("ProfileRequest")
+            .returns("User")
+            .summary("Set the address and display name")
+            .describe(
+                "The one endpoint that will say an address is already in use. It \
+                 needs a session, which makes that answer attributable and \
+                 rate-limited rather than something a stranger can walk a list \
+                 against — which is why the address is set here and not at signup.",
+            ),
         // ------------------------------------------------------------ orgs
         Endpoint::get("/api/orgs", orgs::list_orgs)
             .returns("MembershipList")
@@ -376,7 +402,7 @@ pub fn catalog() -> Vec<Endpoint> {
             .returns("Org")
             .status(201)
             .summary("Create an org")
-            .describe("The creator becomes its owner. Requires a verified email address."),
+            .describe("The creator becomes its owner. Requires a registered passkey."),
         Endpoint::get("/api/orgs/{org}", orgs::get_org)
             .auth(Auth::OrgMember)
             .returns("Joined")
@@ -396,18 +422,18 @@ pub fn catalog() -> Vec<Endpoint> {
                  cannot be demoted.",
             ),
         Endpoint::post(
-            "/api/orgs/{org}/members/{user}/reset-authenticator",
-            orgs::reset_member_authenticator,
+            "/api/orgs/{org}/members/{user}/reset-passkeys",
+            orgs::reset_member_passkeys,
         )
         .auth(Auth::OrgAdmin)
-        .status(204)
-        .summary("Clear a member's authenticator so they can enrol a new one")
+        .returns("ClaimCode")
+        .status(201)
+        .summary("Clear a member's passkeys and issue a re-registration code")
         .describe(
-            "The only assisted account recovery there is — nothing is emailed, so a \
-             member who has lost both their authenticator and their recovery codes \
-             has no other route. Opens no session and grants nothing: the member \
-             enrols again themselves. Ends all of their sessions. Only an owner may \
-             reset an owner.",
+            "The only assisted account recovery there is. Clears every passkey, ends \
+             every session, and returns a one-time code the admin hands over — the \
+             code is what stops the account being claimable by whoever reaches \
+             registration first. Only an owner may reset an owner.",
         ),
         Endpoint::delete("/api/orgs/{org}/members/{user}", orgs::remove_member)
             .auth(Auth::OrgAdmin)

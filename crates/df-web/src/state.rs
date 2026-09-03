@@ -70,6 +70,29 @@ impl Config {
         }
     }
 
+    /// The WebAuthn relying party id: the **host** of the public URL.
+    ///
+    /// Derived rather than configured separately, because the two must agree —
+    /// a passkey is bound to this string, and an rp_id that is not a registrable
+    /// suffix of the origin makes every ceremony fail with an error that reads
+    /// like a browser bug. Deriving it means one value can be wrong instead of
+    /// two, and `relying_party` refuses at startup rather than at first login.
+    ///
+    /// **Changing the public URL's host invalidates every passkey ever
+    /// registered.** Nothing here can soften that; it is what binding a
+    /// credential to an origin means.
+    pub fn rp_id(&self) -> Option<String> {
+        self.public_url
+            .split("://")
+            .nth(1)?
+            .split('/')
+            .next()?
+            .split(':')
+            .next()
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+    }
+
     /// Join a path onto the public URL. Every link handed to a human goes
     /// through here so there is one place a trailing slash can be got wrong.
     pub fn url(&self, path: &str) -> String {
@@ -80,6 +103,13 @@ impl Config {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
+    /// The WebAuthn relying party.
+    ///
+    /// Built once at startup from `public_url`, because its `rp_id` is what
+    /// every passkey is cryptographically bound to — deriving it per request
+    /// would make a configuration change silently invalidate credentials
+    /// instead of failing at boot.
+    pub webauthn: Arc<df_auth::passkeys::Webauthn>,
     /// Decrypts TOTP secrets. Held as an `Arc` because the key material is
     /// loaded once at startup and shared by every request.
     pub cipher: Arc<Cipher>,
@@ -91,13 +121,19 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: Db, cipher: Cipher, config: Config) -> Self {
+    pub fn new(
+        db: Db,
+        cipher: Cipher,
+        webauthn: Arc<df_auth::passkeys::Webauthn>,
+        config: Config,
+    ) -> Self {
         let meter = df_billing::Meter::new(
             config.enforce_quotas,
             format!("{}/settings/billing", config.public_url),
         );
         Self {
             db,
+            webauthn,
             cipher: Arc::new(cipher),
             config: Arc::new(config),
             meter,

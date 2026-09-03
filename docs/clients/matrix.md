@@ -26,9 +26,13 @@ run below is the milestone's "done means" criterion, executed rather than argued
 ## What was verified, in order
 
 1. **Sign-up through the console API**: signup → TOTP enrolment (secret, recovery codes)
-   → confirm → create org `acme` → register repo `widget`. Verified before email was
-   removed from the product; the emailed verification step in between is now gone, and
-   signup returns the enrollment directly.
+   → confirm → create org `acme` → register repo `widget`.
+
+   **This step is stale.** It predates both the removal of email and the move to passkeys.
+   Account creation now happens in a browser (`navigator.credentials.create()`), so there
+   is no scripted equivalent — re-running conformance needs a real browser or a CDP virtual
+   authenticator for the first step. Everything below it (PATs, OAuth, the queue) is
+   unaffected: those are layer 1 and never involved a human credential.
 2. **PAT path** on both clients: mint in the console, paste into the client's config, call
    tools.
 3. **OAuth path**: RFC 7591 dynamic registration, `/oauth/authorize` with PKCE S256 and an

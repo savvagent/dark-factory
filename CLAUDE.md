@@ -59,6 +59,13 @@ without a cross-org negative test is not done. The policy must be named
 convention rather than from a list it would have to be told about, so a differently named
 policy is a table the startup check will not vouch for.
 
+**Testing WebAuthn needs a real authenticator.** `webauthn-authenticator-rs`'s software
+tokens do **not** support resident keys (`SoftToken` says "These will be supported in
+future"), so `tests/passkeys.rs` softens the challenge it hands the fake authenticator and
+names the credential in `allowCredentials`. Only what the fake sees is softened; every
+server step is the production one. What that cannot cover — a browser finding a credential
+unprompted — needs a CDP virtual authenticator, which is how the flow was actually verified.
+
 **A privilege granted to `df_app` is not a protection.** `df_app` does not exist on
 managed Postgres, so `REVOKE … FROM df_app` protects nothing there. Express the rule as a
 policy instead: `audit_events` is append-only because it has no `UPDATE` policy, which
@@ -276,10 +283,22 @@ Two layers that must not be conflated:
   registration, RFC 8707 resource indicators enforced), plus personal access tokens for
   clients with incomplete OAuth support. Tokens are opaque and stored only as SHA-256
   hashes. A token's org is fixed at issuance and cannot be pivoted.
-- **Layer 2 — who the human is**: passwordless TOTP for individuals, enterprise OIDC
+- **Layer 2 — who the human is**: **passkeys** (WebAuthn) for individuals, enterprise OIDC
   federation for orgs that bind an IdP. No password is ever accepted or stored, and **no
-  email is ever sent** — signup hands back the enrollment directly and the account exists
-  the moment a code from it is accepted.
+  email is ever sent**.
+
+  A passkey creates the account: `POST /api/auth/signup/start` takes **no body at all**,
+  and the address is a profile field set afterwards by someone already holding the key.
+  That ordering is what finally closed the account-enumeration oracle — a password leaks
+  through "already registered", and TOTP leaked because the secret had to come back in the
+  response and so had to be refused for an address that already had one. Nothing is
+  submitted before a ceremony, so there is nothing to answer differently about. The one
+  place the product says "that address is taken" is `PATCH /api/me`, which needs a session.
+
+  Sign-in is **usernameless**: credentials are discoverable, `allowCredentials` is empty,
+  and the browser resolves the account from the key it offers. Verified in a real browser
+  with a CDP virtual authenticator — `isResidentCredential: true`, and the login page has
+  zero input fields.
 
 Redirect URI matching is exact, with one carve-out: `http://127.0.0.1`, `http://[::1]` and
 `http://localhost` ignore the port (RFC 8252 §7.3) and match on everything else. Do not
@@ -288,21 +307,32 @@ once excluded on sound-sounding reasoning, and it silently removed the OAuth pat
 Code, which registers `http://localhost:<port>/callback`. `docs/clients/matrix.md` records
 what each client actually sends.
 
-TOTP without recovery is not shippable, and with no email the recovery story is entirely
-in-band: **recovery codes** (issued at enrollment, shown once) and an **org admin clearing a
-member's credential**. Both are part of the feature, not a follow-up. The consequence to
-keep in view is that an org's last owner has nobody above them — their recovery codes are
-the end of the line, and the console says so when it issues them.
+**Recovery is a second passkey, and there is no static secret anywhere.** Recovery codes
+were dropped rather than carried over: a code that bypasses a phishing-resistant credential
+is the weakest link, and keeping one would undo the reason for passkeys. The console pushes
+for a second key from the moment there is one (`shouldAddPasskey`), and `passkeys::remove`
+refuses to delete the last one — that click looks like tidying up and is a permanent
+lockout.
 
-**Signup is an account-enumeration oracle, deliberately.** The TOTP secret has to come back
-in signup's own response because there is no mailbox to send it to, and it must be refused
-for an address that already has a confirmed authenticator or typing someone's address would
-take over their account. No response shaping hides that difference. The constant-shape
-machinery that used to guard signup was removed rather than left in place looking like it
-still worked; `login_totp` and `login_recovery_code` remain indistinguishable across unknown
-address, disabled account, wrong code and replayed code, because those hand nothing back.
-`signup_refuses_an_address_that_already_has_an_authenticator` pins the tradeoff so it stays
-a decision somebody made.
+The assisted path is `POST /api/orgs/{org}/members/{user}/reset-passkeys`. **It clears the
+keys and issues a claim code in the same operation, and that coupling is the point.** An
+account with no passkeys and no outstanding claim is claimable by whoever reaches
+registration first — which is exactly the takeover an earlier draft of this endpoint opened,
+where a stranger who knew the address could win the race against the member. Assisted
+recovery always means the assistant *could* impersonate; the honest mitigations are that it
+is auditable, single-use, and expiring. An org's last owner has nobody above them, and the
+console says so.
+
+**Two places `df-auth::passkeys` overrides webauthn-rs, both on the challenge and never on
+the verification state.** `start_passkey_registration` sets `require_resident_key(false)`,
+which would produce credentials that cannot be found without naming the account first;
+`start_discoverable_authentication` forces `mediation: conditional`, which is the autofill
+flow and shows no prompt. Removing either override silently breaks usernameless sign-in.
+
+**Account resolution is by credential ID, not the user handle.** webauthn-rs offers
+`identify_discoverable_authentication`, which reads the handle — the one field an
+authenticator may omit, and every software authenticator does. Neither is evidence; the
+signature is.
 
 ## Metering
 

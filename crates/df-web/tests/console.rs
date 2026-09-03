@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{add_member, harness, now_code, onboard, org_with_owner, Call};
+use common::{add_member, harness, onboard, org_with_owner, sign_in, Call};
 use df_core::orgs::Role;
 use http::StatusCode;
 use sqlx::PgPool;
@@ -29,8 +29,11 @@ async fn a_new_user_signs_up_enrols_and_registers_a_repo(pool: PgPool) {
         .await;
     me.expect(StatusCode::OK);
     assert_eq!(me.body["user"]["email"], "rob@acme.test");
-    assert_eq!(me.body["mustEnrollTotp"], false, "enrollment was confirmed");
-    assert_eq!(me.body["recoveryCodesRemaining"], 10);
+    assert_eq!(me.body["passkeyCount"], 1);
+    assert_eq!(
+        me.body["shouldAddPasskey"], true,
+        "one passkey is one device — the console has to ask for a second"
+    );
     assert!(me.body["orgs"].as_array().unwrap().is_empty());
 
     org_with_owner(&h, "acme", &rob).await;
@@ -60,12 +63,9 @@ async fn a_new_user_signs_up_enrols_and_registers_a_repo(pool: PgPool) {
 #[sqlx::test(migrations = "../df-core/migrations")]
 async fn signing_in_and_out_works_and_a_dead_cookie_is_refused(pool: PgPool) {
     let h = harness(pool);
-    let rob = onboard(&h, "rob@acme.test").await;
+    let mut rob = onboard(&h, "rob@acme.test").await;
 
-    let signed_in = Call::post("/api/auth/login")
-        .json(serde_json::json!({ "email": "rob@acme.test", "code": now_code(&rob.totp) }))
-        .send(&h.router)
-        .await;
+    let signed_in = sign_in(&h, &mut rob).await;
     signed_in.expect(StatusCode::OK);
     let session = signed_in.session_cookie().unwrap();
 
@@ -96,40 +96,12 @@ async fn signing_in_and_out_works_and_a_dead_cookie_is_refused(pool: PgPool) {
     after.expect(StatusCode::UNAUTHORIZED);
     assert_eq!(after.error_code(), Some("unauthenticated"));
 }
-
-/// Login failures must be one answer whatever actually went wrong.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn login_failures_are_indistinguishable(pool: PgPool) {
-    let h = harness(pool);
-    onboard(&h, "rob@acme.test").await;
-
-    let wrong_code = Call::post("/api/auth/login")
-        .json(serde_json::json!({ "email": "rob@acme.test", "code": "000000" }))
-        .send(&h.router)
-        .await;
-    let unknown_address = Call::post("/api/auth/login")
-        .json(serde_json::json!({ "email": "nobody@acme.test", "code": "000000" }))
-        .send(&h.router)
-        .await;
-
-    assert_eq!(wrong_code.status, unknown_address.status);
-    assert_eq!(
-        wrong_code.body, unknown_address.body,
-        "a wrong code and an unknown address must look identical"
-    );
-}
-
 #[sqlx::test(migrations = "../df-core/migrations")]
 async fn signing_out_everywhere_ends_every_session(pool: PgPool) {
     let h = harness(pool);
-    let rob = onboard(&h, "rob@acme.test").await;
+    let mut rob = onboard(&h, "rob@acme.test").await;
 
-    let second = Call::post("/api/auth/login")
-        .json(serde_json::json!({ "email": "rob@acme.test", "code": now_code(&rob.totp) }))
-        .send(&h.router)
-        .await
-        .session_cookie()
-        .unwrap();
+    let second = sign_in(&h, &mut rob).await.session_cookie().unwrap();
 
     let listed = Call::get("/api/me/sessions")
         .with_session(&rob.session)
@@ -194,42 +166,6 @@ async fn another_orgs_data_is_not_merely_forbidden_it_is_invisible(pool: PgPool)
         "the refusal leaked the other org's contents"
     );
 }
-/// Claiming a public org slug must cost more than typing an address.
-///
-/// Reachable only through the seam that signup itself cannot produce: an
-/// account with a session but no confirmed authenticator, which is what an
-/// admin-reset member looks like. The session is created directly because no
-/// endpoint hands one out in that state — which is the property, not a
-/// shortcut around it.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn creating_an_org_needs_a_confirmed_authenticator(pool: PgPool) {
-    let h = harness(pool);
-
-    Call::post("/api/auth/signup")
-        .json(serde_json::json!({ "email": "rob@acme.test" }))
-        .send(&h.router)
-        .await
-        .expect(StatusCode::OK);
-
-    let user =
-        h.db.get_user_by_email("rob@acme.test")
-            .await
-            .unwrap()
-            .unwrap();
-    let session = df_auth::sessions::create(&h.db, user.id)
-        .await
-        .unwrap()
-        .token;
-
-    let refused = Call::post("/api/orgs")
-        .with_session(&session)
-        .json(serde_json::json!({ "slug": "acme", "name": "Acme" }))
-        .send(&h.router)
-        .await;
-    refused.expect(StatusCode::FORBIDDEN);
-    assert!(refused.text.contains("enrol an authenticator"));
-}
-
 #[sqlx::test(migrations = "../df-core/migrations")]
 async fn a_member_cannot_do_what_an_admin_can(pool: PgPool) {
     let h = harness(pool);
@@ -424,82 +360,6 @@ async fn removing_a_member_revokes_their_tokens_for_that_org(pool: PgPool) {
         .await
         .expect(StatusCode::OK);
 }
-
-/// Signup hands the secret back in its own response, so it has to refuse an
-/// account that already has an authenticator — otherwise typing somebody's
-/// address re-enrols their account and takes it over.
-///
-/// This is the enumeration oracle `routes::auth` documents. It is tested so it
-/// stays a decision somebody made rather than something that drifts: if this
-/// ever starts answering 200, account takeover is one request away.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn signup_refuses_an_address_that_already_has_an_authenticator(pool: PgPool) {
-    let h = harness(pool);
-    let rob = onboard(&h, "rob@acme.test").await;
-
-    let again = Call::post("/api/auth/signup")
-        .json(serde_json::json!({ "email": "rob@acme.test" }))
-        .send(&h.router)
-        .await;
-    again.expect(StatusCode::CONFLICT);
-    assert_eq!(again.error_code(), Some("account_exists"));
-
-    // And the original credential still works — the refused signup must not
-    // have disturbed it.
-    let signed_in = Call::post("/api/auth/login")
-        .json(serde_json::json!({ "email": "rob@acme.test", "code": now_code(&rob.totp) }))
-        .send(&h.router)
-        .await;
-    signed_in.expect(StatusCode::OK);
-}
-
-/// Someone who closed the tab before scanning has to be able to start again.
-/// The abandoned secret was never confirmed and was never worth anything.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn signup_can_be_restarted_while_no_authenticator_is_confirmed(pool: PgPool) {
-    let h = harness(pool);
-
-    let first = Call::post("/api/auth/signup")
-        .json(serde_json::json!({ "email": "rob@acme.test" }))
-        .send(&h.router)
-        .await;
-    first.expect(StatusCode::OK);
-
-    let second = Call::post("/api/auth/signup")
-        .json(serde_json::json!({ "email": "rob@acme.test" }))
-        .send(&h.router)
-        .await;
-    second.expect(StatusCode::OK);
-    assert_ne!(
-        first.body["manualKey"], second.body["manualKey"],
-        "restarting signup must supersede the abandoned secret"
-    );
-}
-
-/// Until a code proves possession there is no session and no account anyone can
-/// sign into. A signup that stops halfway must leave nothing usable behind.
-#[sqlx::test(migrations = "../df-core/migrations")]
-async fn signup_opens_no_session_until_a_code_is_proved(pool: PgPool) {
-    let h = harness(pool);
-
-    let started = Call::post("/api/auth/signup")
-        .json(serde_json::json!({ "email": "rob@acme.test" }))
-        .send(&h.router)
-        .await;
-    started.expect(StatusCode::OK);
-    assert!(
-        started.session_cookie().is_none(),
-        "signup must not open a session before enrollment is confirmed"
-    );
-
-    let wrong = Call::post("/api/auth/signup/confirm")
-        .json(serde_json::json!({ "email": "rob@acme.test", "code": "000000" }))
-        .send(&h.router)
-        .await;
-    assert_ne!(wrong.status, StatusCode::OK);
-    assert!(wrong.session_cookie().is_none());
-}
-
 // ---------------------------------------------------------------- invites
 
 #[sqlx::test(migrations = "../df-core/migrations")]
@@ -1253,7 +1113,7 @@ async fn an_admin_can_reset_a_members_authenticator_but_gains_nothing_by_it(pool
     let h = harness(pool);
     let rob = onboard(&h, "rob@acme.test").await;
     org_with_owner(&h, "acme", &rob).await;
-    let bob = onboard(&h, "bob@acme.test").await;
+    let mut bob = onboard(&h, "bob@acme.test").await;
     add_member(
         &h,
         h.db.get_org_by_slug("acme").await.unwrap().unwrap().id,
@@ -1263,24 +1123,17 @@ async fn an_admin_can_reset_a_members_authenticator_but_gains_nothing_by_it(pool
     .await;
 
     let reset = Call::post(format!(
-        "/api/orgs/acme/members/{}/reset-authenticator",
+        "/api/orgs/acme/members/{}/reset-passkeys",
         bob.user
     ))
     .with_session(&rob.session)
     .send(&h.router)
     .await;
-    reset.expect(StatusCode::NO_CONTENT);
+    reset.expect(StatusCode::CREATED);
 
-    // Bob's old authenticator is gone...
-    let stale = Call::post("/api/auth/login")
-        .json(serde_json::json!({ "email": "bob@acme.test", "code": now_code(&bob.totp) }))
-        .send(&h.router)
-        .await;
-    assert_ne!(
-        stale.status,
-        StatusCode::OK,
-        "the old credential still works"
-    );
+    // Bob's old passkey is gone...
+    let stale = sign_in(&h, &mut bob).await;
+    assert_ne!(stale.status, StatusCode::OK, "the old passkey still works");
 
     // ...and so is his session, so a reset actually interrupts whoever holds
     // the account rather than leaving them running.
@@ -1290,13 +1143,83 @@ async fn an_admin_can_reset_a_members_authenticator_but_gains_nothing_by_it(pool
         .await;
     assert_eq!(dead.status, StatusCode::UNAUTHORIZED);
 
-    // The admin gained nothing: no session was handed to Rob for Bob, and Bob
-    // re-enrols himself. Signup is the door back, because he has no session.
-    let restart = Call::post("/api/auth/signup")
-        .json(serde_json::json!({ "email": "bob@acme.test" }))
+    // The admin gained nothing directly: no session was handed to Rob for Bob.
+    // What Rob holds is the claim code, and it is the *only* way back — an
+    // account with no passkeys is otherwise claimable by whoever reaches
+    // registration first, which is the takeover this endpoint exists to close.
+    let code = reset.body["code"]
+        .as_str()
+        .expect("no claim code")
+        .to_string();
+
+    let mut new_device = common::authenticator();
+    let started = Call::post("/api/auth/claim/start")
+        .json(serde_json::json!({ "code": code }))
         .send(&h.router)
         .await;
-    restart.expect(StatusCode::OK);
+    started.expect(StatusCode::OK);
+
+    let reclaimed = common::finish_registration(
+        &h,
+        &mut new_device,
+        "/api/auth/claim/finish",
+        &started.body,
+        serde_json::json!({ "code": code }),
+    )
+    .await;
+    reclaimed.expect(StatusCode::OK);
+    assert_eq!(
+        reclaimed.body["user"]["id"].as_str().unwrap(),
+        bob.user.to_string(),
+        "the claim must land on the account it was issued for"
+    );
+
+    // And the code is spent.
+    let replayed = Call::post("/api/auth/claim/start")
+        .json(serde_json::json!({ "code": code }))
+        .send(&h.router)
+        .await;
+    assert_ne!(replayed.status, StatusCode::OK, "a claim code was reusable");
+}
+
+/// Without a claim code, a reset account must not be claimable at all — that
+/// race is the takeover the code exists to prevent.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_reset_account_cannot_be_claimed_without_the_code(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+    let bob = onboard(&h, "bob@acme.test").await;
+    add_member(&h, org, bob.user, df_core::orgs::Role::Member).await;
+
+    Call::post(format!(
+        "/api/orgs/acme/members/{}/reset-passkeys",
+        bob.user
+    ))
+    .with_session(&rob.session)
+    .send(&h.router)
+    .await
+    .expect(StatusCode::CREATED);
+
+    // A stranger with a guessed code gets nowhere.
+    let guessed = Call::post("/api/auth/claim/start")
+        .json(serde_json::json!({ "code": "df_inv_not-a-real-code" }))
+        .send(&h.router)
+        .await;
+    assert_ne!(guessed.status, StatusCode::OK);
+
+    // And signing up creates a *new* account rather than claiming Bob's — there
+    // is no identifier to aim at, which is the whole point of the passkey-first
+    // signup. Bob's account keeps its membership and its address.
+    let stranger = onboard(&h, "stranger@acme.test").await;
+    assert_ne!(stranger.user, bob.user);
+    assert!(
+        h.db.member_role(org, stranger.user)
+            .await
+            .unwrap()
+            .is_none(),
+        "a stranger's new account inherited a reset member's org"
+    );
 }
 
 /// An admin must not reach through this endpoint what the role check refuses
@@ -1304,13 +1227,13 @@ async fn an_admin_can_reset_a_members_authenticator_but_gains_nothing_by_it(pool
 #[sqlx::test(migrations = "../df-core/migrations")]
 async fn an_admin_cannot_reset_an_owners_authenticator(pool: PgPool) {
     let h = harness(pool);
-    let owner = onboard(&h, "owner@acme.test").await;
+    let mut owner = onboard(&h, "owner@acme.test").await;
     let org = org_with_owner(&h, "acme", &owner).await;
     let admin = onboard(&h, "admin@acme.test").await;
     add_member(&h, org, admin.user, df_core::orgs::Role::Admin).await;
 
     let refused = Call::post(format!(
-        "/api/orgs/acme/members/{}/reset-authenticator",
+        "/api/orgs/acme/members/{}/reset-passkeys",
         owner.user
     ))
     .with_session(&admin.session)
@@ -1319,9 +1242,5 @@ async fn an_admin_cannot_reset_an_owners_authenticator(pool: PgPool) {
     refused.expect(StatusCode::FORBIDDEN);
 
     // The owner's credential is untouched.
-    Call::post("/api/auth/login")
-        .json(serde_json::json!({ "email": "owner@acme.test", "code": now_code(&owner.totp) }))
-        .send(&h.router)
-        .await
-        .expect(StatusCode::OK);
+    sign_in(&h, &mut owner).await.expect(StatusCode::OK);
 }

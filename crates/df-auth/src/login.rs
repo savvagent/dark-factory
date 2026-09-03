@@ -1,49 +1,38 @@
 //! The human login front door.
 //!
-//! [`crate::totp`] verifies a code for a user that has already been identified.
-//! This module is what sits in front of it: it takes an email address typed
-//! into a form, and it must answer *the same way* whether that address belongs
-//! to an account, belongs to a disabled account, belongs to an account that
-//! never finished enrolling, or belongs to nobody at all.
+//! Thin now, and deliberately so. [`crate::passkeys`] does the work: a sign-in
+//! is a WebAuthn ceremony that identifies the account from the credential the
+//! browser produced, so there is no address typed into a form and no lookup to
+//! answer carefully.
 //!
-//! **Why that matters more here than in most products.** dark-factory has no
-//! passwords, so there is no "forgot password" screen whose behaviour already
-//! leaks membership. The login form is the only oracle an attacker has, and the
-//! thing it would leak is which of an enterprise's employees have accounts —
-//! which is a target list for the phishing campaign that comes next.
+//! **The enumeration problem this module used to exist for is gone.** With
+//! passwords or TOTP, the login form was the only oracle an attacker had, and
+//! what it leaked was which of an enterprise's employees hold accounts — a
+//! target list for the phishing campaign that comes next. Three paragraphs of
+//! constant-shape machinery lived here to close that. A discoverable credential
+//! closes it by construction instead: nothing is submitted before the ceremony,
+//! so there is nothing to answer differently about.
 //!
-//! Three things make the answer constant:
-//!
-//! 1. **One error.** Every failure below returns a variant whose
-//!    [`AuthError::public`] is `"invalid credentials"`. Callers must render
-//!    `public()`, never the variant.
-//! 2. **Comparable work.** The unknown-address path runs the same throttle
-//!    queries, the same TOTP arithmetic ([`totp::decoy_check`]), and writes the
-//!    same audit row. It does not read a credential or record a consumed step,
-//!    so the paths are not *identical* in time — see `decoy_check` — but the
-//!    gap is small relative to the noise on any real network.
-//! 3. **The same throttle.** An unknown address is rate-limited exactly like a
-//!    known one, so an attacker cannot spray a directory faster than they can
-//!    attack one account.
+//! What remains is session issuance, the disabled-account check, and logout.
 
 use df_core::audit::{action, Entry};
 use df_core::ids::UserId;
-use df_core::orgs::User;
 use df_core::Db;
 use serde::Serialize;
 
-use crate::crypto::Cipher;
 use crate::error::{AuthError, Result};
-use crate::ratelimit;
+use crate::passkeys;
 use crate::sessions::{self, Session};
-use crate::totp;
 
 /// How the human proved who they were.
+///
+/// One variant, and it stays an enum because the audit trail records it and a
+/// bare string there is a typo waiting to happen. A second variant appearing
+/// means a second way into an account exists, which is a thing to notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Method {
-    Totp,
-    RecoveryCode,
+    Passkey,
 }
 
 /// A successful login.
@@ -53,86 +42,48 @@ pub struct LoggedIn {
     pub session_token: String,
     pub session: Session,
     pub method: Method,
-    /// The user has no usable second factor and must enrol one before they can
-    /// log in by the ordinary path again.
+    /// The account holds exactly one passkey.
     ///
-    /// Computed from the account's actual state rather than from which door
-    /// they came through, because those differ: a recovery *code* leaves TOTP
-    /// intact, a recovery *link* deliberately destroys it.
-    pub must_enroll_totp: bool,
+    /// Not a failure — it signs in perfectly well. It is the console's cue to
+    /// ask for a second one, because a single passkey is a single device, and
+    /// with no email there is no self-service way back from losing it.
+    pub should_add_passkey: bool,
 }
 
-impl std::fmt::Debug for LoggedIn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoggedIn")
-            .field("user", &self.user)
-            .field("session_token", &"<redacted>")
-            .field("session", &self.session)
-            .field("method", &self.method)
-            .field("must_enroll_totp", &self.must_enroll_totp)
-            .finish()
+/// Open a session for an account that has just completed a WebAuthn ceremony.
+///
+/// The signature was already checked by [`passkeys::finish_authentication`];
+/// what is left is the account-level question that a valid credential does not
+/// answer — whether this account is still allowed in.
+pub async fn with_passkey(db: &Db, user: UserId, ip: Option<&str>) -> Result<LoggedIn> {
+    let account = db.get_user(user).await?.ok_or(AuthError::UnknownUser)?;
+
+    // Checked *after* the ceremony rather than before, and the difference
+    // matters: a disabled account's keys still produce valid signatures, and
+    // refusing here means the refusal is attributable in the trail instead of
+    // being a silent non-answer.
+    if account.disabled_at.is_some() {
+        note_refusal(db, user, ip).await;
+        return Err(AuthError::Disabled);
     }
-}
 
-/// Log in with an authenticator code.
-pub async fn with_totp(
-    db: &Db,
-    cipher: &Cipher,
-    email: &str,
-    code: &str,
-    issuer: &str,
-    ip: Option<&str>,
-) -> Result<LoggedIn> {
-    let key = email.trim().to_lowercase();
-    guard(db, &key, ip).await?;
+    let session = sessions::create(db, user).await?;
 
-    let outcome = match resolve_account(db, &key).await? {
-        Some(user) => {
-            totp::verify(db, cipher, user.id, &user.email, issuer, code, ip).await?;
-            Ok(user.id)
-        }
-        None => {
-            // Same arithmetic, same audit row, same error. See the module docs.
-            totp::decoy_check(code);
-            note_unknown(db, &key, ip, "totp").await;
-            Err(AuthError::UnknownUser)
-        }
-    };
+    let entry = Entry::new(action::LOGIN_SUCCEEDED)
+        .actor(user)
+        .from_request(ip, None)
+        .detail(serde_json::json!({ "method": "passkey" }));
+    if let Err(e) = db.audit_global(entry).await {
+        tracing::error!(error = %e, "failed to write audit event for a sign-in");
+    }
 
-    finish(db, &key, ip, outcome, Method::Totp).await
-}
-
-/// Log in with one of the codes issued at enrollment.
-///
-/// The other half of "my phone is in a taxi", and the **only** self-service way
-/// back in: there is no emailed recovery link, because there is no email.
-///
-/// Deliberately does **not** reset TOTP — the user still holds the secret, they
-/// just cannot reach it right now, and destroying it would force a
-/// re-enrollment they did not ask for. Someone who has lost the authenticator
-/// itself needs `totp::reset`, which only an org admin can reach on their
-/// behalf.
-pub async fn with_recovery_code(
-    db: &Db,
-    email: &str,
-    code: &str,
-    ip: Option<&str>,
-) -> Result<LoggedIn> {
-    let key = email.trim().to_lowercase();
-    guard(db, &key, ip).await?;
-
-    let outcome = match resolve_account(db, &key).await? {
-        Some(user) => {
-            totp::consume_recovery_code(db, user.id, code, ip).await?;
-            Ok(user.id)
-        }
-        None => {
-            note_unknown(db, &key, ip, "recovery_code").await;
-            Err(AuthError::UnknownUser)
-        }
-    };
-
-    finish(db, &key, ip, outcome, Method::RecoveryCode).await
+    Ok(LoggedIn {
+        user,
+        session_token: session.token,
+        session: session.session,
+        method: Method::Passkey,
+        should_add_passkey: passkeys::count(db, user).await? < 2,
+    })
 }
 
 /// End a session and record it. The counterpart to every constructor above.
@@ -158,94 +109,17 @@ pub async fn logout(db: &Db, session_token: &str, ip: Option<&str>) -> Result<()
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// The shared shape
-// ---------------------------------------------------------------------------
-
-/// Throttle before touching a credential, on both the address and the source.
+/// The audit row a refused sign-in writes.
 ///
-/// Address-only would let one attacker work through a directory a few tries per
-/// account at a time; source-only would let a botnet through. Both, or neither
-/// is worth having.
-async fn guard(db: &Db, email_key: &str, ip: Option<&str>) -> Result<()> {
-    ratelimit::check(db, &format!("login:email:{email_key}")).await?;
-    if let Some(ip) = ip {
-        ratelimit::check(db, &format!("login:ip:{ip}")).await?;
-    }
-    Ok(())
-}
-
-/// The account behind an address, if it can log in at all.
-///
-/// A disabled account resolves to `None` so it takes the unknown-address path
-/// exactly: "your account was suspended" is not something a login form should
-/// be willing to confirm to whoever is typing.
-async fn resolve_account(db: &Db, email_key: &str) -> Result<Option<User>> {
-    Ok(db
-        .get_user_by_email(email_key)
-        .await?
-        .filter(|u| u.disabled_at.is_none()))
-}
-
-/// Record the attempt against both buckets, then turn a resolved user into a
-/// session. One place, so no login path can forget half of it.
-async fn finish(
-    db: &Db,
-    email_key: &str,
-    ip: Option<&str>,
-    outcome: Result<UserId>,
-    method: Method,
-) -> Result<LoggedIn> {
-    let ok = outcome.is_ok();
-    ratelimit::record(db, &format!("login:email:{email_key}"), ok).await?;
-    if let Some(ip) = ip {
-        ratelimit::record(db, &format!("login:ip:{ip}"), ok).await?;
-    }
-
-    let user = outcome?;
-    let session = sessions::create(db, user).await?;
-
-    Ok(LoggedIn {
-        user,
-        session_token: session.token,
-        session: session.session,
-        method,
-        must_enroll_totp: !totp::has_confirmed_credential(db, user).await?,
-    })
-}
-
-/// The audit row the unknown-address path writes, so the trail does not make
-/// "no such user" visible by its absence. `actor_label` rather than `actor`
-/// because there is no user id to name.
-async fn note_unknown(db: &Db, email_key: &str, ip: Option<&str>, method: &str) {
+/// Best-effort: an audit write that fails is logged, never turned into an
+/// authentication outage. The row names the account because by this point the
+/// credential has already identified it — there is no address being guessed at.
+async fn note_refusal(db: &Db, user: UserId, ip: Option<&str>) {
     let entry = Entry::new(action::LOGIN_FAILED)
-        .actor_label(email_key)
+        .actor(user)
         .from_request(ip, None)
-        .detail(serde_json::json!({ "method": method, "reason": "no such account" }));
+        .detail(serde_json::json!({ "method": "passkey", "reason": "account disabled" }));
     if let Err(e) = db.audit_global(entry).await {
-        tracing::error!(error = %e, "failed to write audit event for a login attempt");
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The enumeration defense is one string, and it is the string callers
-    /// render. If any of these ever diverge, the login form starts answering
-    /// "does this address have an account?".
-    #[test]
-    fn every_login_failure_looks_identical_to_the_caller() {
-        let expected = "invalid credentials";
-        for e in [
-            AuthError::UnknownUser,
-            AuthError::NoTotp,
-            AuthError::BadTotpCode,
-            AuthError::TotpReplay,
-            AuthError::BadRecoveryCode,
-            AuthError::Disabled,
-        ] {
-            assert_eq!(e.public(), expected, "{e:?} leaks which failure it was");
-        }
+        tracing::error!(error = %e, "failed to write audit event for a refused sign-in");
     }
 }

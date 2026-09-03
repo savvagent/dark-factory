@@ -91,9 +91,9 @@ pub async fn create_org(
     // confirmed. Not quite: `login_recovery_code` opens a session, and an admin
     // may have reset that member's credential, which leaves a signed-in account
     // with nothing enrolled. This is the check that notices.
-    if !df_auth::totp::has_confirmed_credential(&state.db, caller.user.id).await? {
+    if !df_auth::passkeys::has_credential(&state.db, caller.user.id).await? {
         return Err(ApiError::forbidden(
-            "enrol an authenticator before creating an organization",
+            "register a passkey before creating an organization",
         ));
     }
 
@@ -313,29 +313,31 @@ pub async fn force_logout(
 
 // ---------------------------------------------------------------- invites
 
-/// `POST /api/orgs/{org}/members/{user}/reset-authenticator` — clear a member's
-/// second factor so they can enrol a new one.
+/// `POST /api/orgs/{org}/members/{user}/reset-passkeys` — clear a member's
+/// authenticators and issue a one-time code to register a new one.
 ///
-/// **The only assisted way back into an account.** There is no emailed recovery
-/// link, so someone who has lost both their authenticator and their recovery
-/// codes has exactly one other route: an admin of an org they belong to.
+/// **The only assisted way back into an account.** There is no email, so
+/// someone who has lost every device they registered has exactly one other
+/// route: an admin of an org they belong to.
 ///
-/// That places a real trust boundary where an admin can be *made* to help, so
-/// the limits are deliberate:
+/// Clearing and issuing happen together, and that is the whole point. An
+/// account with no passkeys and no outstanding claim is claimable by whoever
+/// reaches registration first — which is precisely the takeover an earlier
+/// version of this endpoint opened, where a stranger who knew the address could
+/// win the race against the member. The code is what makes the account
+/// re-registrable *only* by whoever the admin hands it to.
 ///
-/// - Admin-only, and an owner's credential may be reset only by an owner —
-///   the same ordering as `remove_member`, so an admin cannot reach through
-///   this endpoint what the role check refuses elsewhere.
-/// - It grants nothing. The credential is destroyed and **no session is
-///   opened**; the member must still complete enrollment themselves, from an
-///   authenticator only they hold. An admin who resets a colleague cannot
-///   thereby sign in as them.
-/// - Every live session of theirs dies with it, so a reset cannot be used to
-///   quietly leave an existing session running.
+/// The limits are deliberate:
 ///
-/// An org's last owner has nobody above them: their recovery codes are the end
-/// of the line, which is what the console says when it issues them.
-pub async fn reset_member_authenticator(
+/// - Admin-only, and an owner's credentials may be reset only by an owner —
+///   the same ordering as `remove_member`, so this is not a way around it.
+/// - Every live session of theirs dies, so a reset interrupts whoever is
+///   currently holding the account.
+/// - It grants the admin nothing *directly*: no session is opened here. But the
+///   code is a way in until it is redeemed, so an admin who keeps it can use it
+///   — assisted recovery always means the assistant could impersonate, and the
+///   honest mitigations are that it is auditable and that it expires.
+pub async fn reset_member_passkeys(
     State(state): State<AppState>,
     ctx: OrgCtx,
     Path((_org, user)): Path<(String, Uuid)>,
@@ -355,12 +357,16 @@ pub async fn reset_member_authenticator(
     }
 
     let ip = client_ip(&parts, &state.config);
-    df_auth::totp::reset(&state.db, target, ip.as_deref()).await?;
+    df_auth::passkeys::clear(&state.db, target, ip.as_deref()).await?;
 
-    // Their sessions were opened by a credential that no longer exists.
-    // Leaving them live would mean a reset does not actually interrupt
-    // whoever is currently holding the account.
+    // Their sessions were opened by credentials that no longer exist.
     df_auth::sessions::revoke_all(&state.db, target).await?;
+
+    let token = df_auth::crypto::generate(df_auth::crypto::prefix::INVITE);
+    state
+        .db
+        .create_account_claim(target, &token.hash, Some(ctx.user.id))
+        .await?;
 
     let mut tx = state.db.begin(ctx.org.id).await?;
     tx.audit(
@@ -371,7 +377,14 @@ pub async fn reset_member_authenticator(
     .await?;
     tx.commit().await?;
 
-    Ok(http::StatusCode::NO_CONTENT.into_response())
+    let code = token.into_plaintext();
+    let link = state.config.url(&format!("/claim?code={code}"));
+
+    Ok((
+        http::StatusCode::CREATED,
+        Json(serde_json::json!({ "code": code, "link": link })),
+    )
+        .into_response())
 }
 
 /// `GET /api/orgs/{org}/invites` — invitations still outstanding.
@@ -490,9 +503,9 @@ pub async fn accept_invite(
     parts: Parts,
     Json(req): Json<AcceptInviteRequest>,
 ) -> ApiResult<Json<Joined>> {
-    if !df_auth::totp::has_confirmed_credential(&state.db, caller.user.id).await? {
+    if !df_auth::passkeys::has_credential(&state.db, caller.user.id).await? {
         return Err(ApiError::forbidden(
-            "enrol an authenticator before accepting an invitation",
+            "register a passkey before accepting an invitation",
         ));
     }
 
@@ -508,10 +521,17 @@ pub async fn accept_invite(
 
     let hash = df_auth::crypto::hash(req.token.trim());
 
+    // An account with no address cannot be the one an invitation names, and
+    // saying so plainly beats a generic refusal — the fix is to set it.
+    let Some(address) = caller.user.email.as_deref() else {
+        return Err(ApiError::forbidden(
+            "set your email address before accepting an invitation — an invitation \
+             names an address, and this account does not have one yet",
+        ));
+    };
+
     let mut tx = state.db.begin(org.id).await?;
-    let role = tx
-        .accept_invite(&hash, caller.user.id, &caller.user.email)
-        .await?;
+    let role = tx.accept_invite(&hash, caller.user.id, address).await?;
     tx.audit(
         Entry::new(action::MEMBER_JOINED)
             .actor(caller.user.id)

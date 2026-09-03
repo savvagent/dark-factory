@@ -31,10 +31,10 @@ pub mod crypto;
 pub mod error;
 pub mod login;
 pub mod oauth;
+pub mod passkeys;
 pub mod ratelimit;
 pub mod sessions;
 pub mod tokens;
-pub mod totp;
 
 pub use error::{AuthError, Result};
 pub use login::LoggedIn;

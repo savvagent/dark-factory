@@ -25,7 +25,11 @@
 import type {
   AuditEvent,
   BrowserSession,
-  Enrollment,
+  Passkey,
+  User,
+  RegistrationChallenge,
+  AuthenticationChallenge,
+  ClaimCode,
   Invite,
   CreatedInvite,
   Job,
@@ -148,22 +152,25 @@ const seg = (value: string) => encodeURIComponent(value);
 export const api = {
   // ----------------------------------------------------------------- auth
   /**
-   * Create the account and start enrolling an authenticator.
+   * Create an account and get a passkey challenge.
    *
-   * Returns the enrollment itself — there is no mailbox to send it to — so the
-   * caller must render the QR and recovery codes immediately. No session
-   * exists until `confirmSignup`.
+   * Takes no arguments, deliberately: there is no identifier to give, which is
+   * why nothing here can reveal whether an account already exists. The address
+   * is set afterwards with `setProfile`.
    */
-  signup: (email: string, name?: string) =>
-    post<Enrollment>('/api/auth/signup', { email, name: name || null }),
+  signupStart: () => post<RegistrationChallenge>('/api/auth/signup/start'),
+  signupFinish: (ceremonyId: string, credential: unknown, nickname?: string) =>
+    post<SessionOpened>('/api/auth/signup/finish', { ceremonyId, credential, nickname }),
 
-  /** Finish signup with a code from the authenticator. Opens the first session. */
-  confirmSignup: (email: string, code: string) =>
-    post<SessionOpened>('/api/auth/signup/confirm', { email, code }),
+  /** Sign in. No identifier — the passkey says who you are. */
+  loginStart: () => post<AuthenticationChallenge>('/api/auth/login/start'),
+  loginFinish: (ceremonyId: string, credential: unknown) =>
+    post<SessionOpened>('/api/auth/login/finish', { ceremonyId, credential }),
 
-  login: (email: string, code: string) => post<SessionOpened>('/api/auth/login', { email, code }),
-  loginWithRecoveryCode: (email: string, code: string) =>
-    post<SessionOpened>('/api/auth/login/recovery', { email, code }),
+  /** Re-register after an admin cleared this account's passkeys. */
+  claimStart: (code: string) => post<RegistrationChallenge>('/api/auth/claim/start', { code }),
+  claimFinish: (ceremonyId: string, code: string, credential: unknown, nickname?: string) =>
+    post<SessionOpened>('/api/auth/claim/finish', { ceremonyId, code, credential, nickname }),
 
   logout: () => post<void>('/api/auth/logout'),
 
@@ -172,9 +179,22 @@ export const api = {
   sessions: () => get<BrowserSession[]>('/api/me/sessions'),
   signOutEverywhere: () => del<{ revoked: number }>('/api/me/sessions'),
 
-  beginTotp: () => post<Enrollment>('/api/me/totp'),
-  confirmTotp: (code: string) => post<void>('/api/me/totp/confirm', { code }),
-  reissueRecoveryCodes: () => post<{ codes: string[] }>('/api/me/recovery-codes'),
+  /** Add another authenticator. One passkey is one device. */
+  addPasskeyStart: () => post<RegistrationChallenge>('/api/me/passkeys/start'),
+  addPasskeyFinish: (ceremonyId: string, credential: unknown, nickname?: string) =>
+    post<void>('/api/me/passkeys/finish', { ceremonyId, credential, nickname }),
+  passkeys: () => get<Passkey[]>('/api/me/passkeys'),
+  removePasskey: (id: string) => del<void>(`/api/me/passkeys/${seg(id)}`),
+  renamePasskey: (id: string, nickname: string) =>
+    patch<void>(`/api/me/passkeys/${seg(id)}`, { nickname }),
+
+  /**
+   * Set the address and display name.
+   *
+   * The one call that will say an address is already in use — which is safe
+   * here precisely because it needs a session.
+   */
+  setProfile: (profile: { email?: string; name?: string }) => patch<User>('/api/me', profile),
 
   // ----------------------------------------------------------------- orgs
   orgs: () => get<Membership[]>('/api/orgs'),
@@ -193,8 +213,9 @@ export const api = {
   /** Returns the one-time code, shown once — the admin delivers it themselves. */
   invite: (org: string, email: string, role: Role) =>
     post<CreatedInvite>(`/api/orgs/${seg(org)}/invites`, { email, role }),
-  resetMemberAuthenticator: (org: string, user: string) =>
-    post<void>(`/api/orgs/${seg(org)}/members/${seg(user)}/reset-authenticator`),
+  /** Clear a member's passkeys and get the one-time code they need to re-register. */
+  resetMemberPasskeys: (org: string, user: string) =>
+    post<ClaimCode>(`/api/orgs/${seg(org)}/members/${seg(user)}/reset-passkeys`),
   revokeInvite: (org: string, id: string) => del<void>(`/api/orgs/${seg(org)}/invites/${seg(id)}`),
   acceptInvite: (org: string, token: string) =>
     post<Joined>(`/api/orgs/${seg(org)}/invites/accept`, { token }),
