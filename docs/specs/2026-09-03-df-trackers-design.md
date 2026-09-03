@@ -49,9 +49,9 @@ spec draft right now):**
   cross-org negative tests.
 - `df-core::trackers` module: typed rows, CRUD functions taking `OrgId`/`RepoId` through
   `Tx`, exactly like `df-core::repos`.
-- A `df-trackers::crypto` module providing the at-rest encryption primitive for
-  connection credentials (see §4 — this is a deliberate near-duplicate of
-  `df-auth::crypto`, not a shared dependency).
+- Promoting `Cipher`/`Sealed` (AES-256-GCM secret sealing) from `df-auth::crypto` to
+  `df-core::crypto` — the primitive `tracker_connections.encrypted_credentials` needs —
+  and deleting the now-dead copy from `df-auth` (see §4).
 - No GitHub App / JIRA HTTP clients, no webhook route, no MCP tools, and no console UI
   yet — those are later tasks in the Milestone 2 plan (docs/plans/2026-09-03-df-trackers.md).
 
@@ -73,17 +73,20 @@ spec draft right now):**
 
 - **The webhook route belongs to `df-web`, not a new axum surface in `df-trackers`.**
   Rationale above (Premise corrections). `df-trackers` gains no `axum`/`tower` dependency.
-- **Credential encryption is a small duplicated primitive, not a new `df-trackers` →
-  `df-auth` dependency.** `df-auth::crypto::{encrypt, decrypt}` (AES-256-GCM, key from
-  `DF_ENCRYPTION_KEY`) is auth-domain code by its module's own doc comment ("secret
-  encryption" for TOTP-era secrets it still keeps around for passkey-adjacent bookkeeping).
-  Reusing it would mean `df-trackers` depends on `df-auth`, which the crate table does not
-  list and which would let a tracker-credential bug pull in the entire auth surface's
-  transitive dependencies. The primitive itself is ~15 lines of RustCrypto calls with no
-  auth-specific logic; duplicating it into `df-trackers::crypto` against the same
-  `DF_ENCRYPTION_KEY` env var keeps the crates independent at the cost of one small,
-  well-tested duplicate. If a third crate needs it, promoting it to `df-core` at that
-  point is the right call — not before there's a real third caller.
+- **The AES-256-GCM sealing primitive (`Cipher`/`Sealed`) moves from `df-auth::crypto` to
+  `df-core::crypto`, rather than being duplicated into `df-trackers`.** Verified against
+  the code: `df-auth::crypto::Cipher` and `Sealed` exist today but have **zero production
+  callers inside `df-auth`** — they are a leftover from the TOTP era (removed by the
+  `passkeys/webauthn` PR) and are exercised only by their own unit tests. `df-auth`
+  already depends on `df-core`, so promoting this primitive to `df-core::crypto` (adding
+  two generic `Error::Crypto` / `Error::Config` variants there) lets `df-trackers` use it
+  directly with no new inter-domain dependency, and lets `df-auth`'s copy be deleted
+  rather than kept as dead code. This corrects the original draft's plan to duplicate the
+  primitive into `df-trackers::crypto` — a second implementation of key parsing,
+  nonce handling, and ciphertext format was the wrong call once a second real caller
+  existed. `Cipher`/`Sealed` move; `df-auth::crypto`'s token generation, hashing, and
+  prefixes (`generate`, `hash`, `verify`, `prefix::*`) are genuinely auth-domain and stay
+  put.
 - **`tracker_connections` is per-org; `tracker_bindings` is per-repo.** Matches the
   design doc's own wording exactly ("Per-org `tracker_connections` hold encrypted
   credentials; per-repo `tracker_bindings` say which project or issue tracker a given
@@ -95,12 +98,34 @@ spec draft right now):**
   refuses to activate a binding with no connection.** A repo can declare "this maps to
   JIRA project ACME-123" before an admin has bound JIRA at the org level; the binding
   becomes live only once a connection exists. This mirrors the existing
-  `Repo.tracker_binding` free-form column's spirit (present since Milestone 1) without
-  removing it — Task 1 does **not** touch the existing `repos.tracker_binding` text
-  column; that column stays as the human-readable display hint on the repo row, while the
-  new `tracker_bindings` table is the structured, connection-linked source of truth the
-  sync engine reads. Reconciling/removing the older free-form column is out of scope for
+  `repos.tracker_binding` column's spirit (present since Milestone 1) without removing
+  it — Task 1 does **not** touch the existing `repos.tracker_binding` column. Verified
+  against the schema: it is `jsonb NOT NULL DEFAULT '{}'::jsonb`
+  (`crates/df-core/migrations/0002_repos.sql`), typed as `serde_json::Value` on `Repo`
+  (`crates/df-core/src/repos.rs`) — a free-form JSON blob, not plain text as an earlier
+  draft of this spec said. That column stays as the display/hint field on the repo row;
+  the new `tracker_bindings` table is the structured, connection-linked source of truth
+  the sync engine reads. Reconciling/removing the older JSON column is out of scope for
   this spec (Risks & Open Questions).
+- **GitHub App credentials are deployment config, not a per-org secret — `tracker_connections`
+  does not store the GitHub App private key or its webhook secret.** Verified against the
+  design doc's own config section: "OAuth signing key, Stripe key, GitHub App private key
+  (…) come from the environment." One GitHub App is registered once by the dark-factory
+  operator; an org's `tracker_connections` row for `github` records only the
+  **installation id** it was granted (`external_id`) — the thing that varies per org.
+  Minting an installation access token needs the single global private key
+  (`DF_GITHUB_APP_PRIVATE_KEY`, a later task's config addition) plus that installation id;
+  it never needs a per-org secret. Likewise the GitHub webhook HMAC secret is one value
+  set on the App itself (`DF_GITHUB_APP_WEBHOOK_SECRET`), not one per installation. JIRA's
+  OAuth 2 3LO flow is the opposite shape: the **refresh token is genuinely per-org**
+  (each org authorizes its own JIRA site), so `encrypted_credentials` is where it lives.
+  Both `encrypted_credentials` and `encrypted_webhook_secret` are therefore **nullable**
+  (§1) rather than `NOT NULL` as an earlier draft had them: `NULL` for GitHub (nothing
+  per-org to encrypt beyond the installation id already in `external_id`), populated for
+  JIRA. `encrypted_webhook_secret` specifically stays reserved-but-unused for both
+  providers in Task 1 — GitHub's is global env config and JIRA Automation's webhook
+  authentication shape is a later task's decision once the webhook route is being built;
+  the column exists now so the schema does not need a second migration to add it.
 - **Provider is an enum shared with `repos.provider`'s spirit but scoped to trackers.**
   `github` | `jira` — not `gitlab`/`bitbucket`/`other`, because only GitHub and JIRA are
   in scope (Scope §Out).
@@ -120,13 +145,21 @@ CREATE TABLE tracker_connections (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     org_id              UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
     provider            tracker_provider NOT NULL,
-    -- GitHub: the App installation id. JIRA: the cloud site id (from the 3LO
-    -- accessible-resources response). Opaque to df-core; df-trackers interprets it.
+    -- GitHub: the App installation id (the private key that mints tokens from
+    -- it is deployment config, DF_GITHUB_APP_PRIVATE_KEY, never stored here).
+    -- JIRA: the cloud site id (from the 3LO accessible-resources response).
+    -- Opaque to df-core; df-trackers interprets it.
     external_id         TEXT NOT NULL,
-    -- AES-256-GCM ciphertext (nonce || ciphertext || tag, base64), never plaintext.
-    encrypted_credentials TEXT NOT NULL,
-    -- Encrypted webhook signing secret (GitHub HMAC key / JIRA Automation shared secret).
-    encrypted_webhook_secret TEXT NOT NULL,
+    -- AES-256-GCM ciphertext (nonce || ciphertext, base64), never plaintext.
+    -- NULL for GitHub (nothing per-org to encrypt: installation id above is
+    -- not a secret). Holds the JIRA OAuth refresh token for `jira`.
+    encrypted_credentials TEXT,
+    -- Reserved for a per-connection webhook secret. NULL for both providers in
+    -- Task 1: GitHub's webhook HMAC secret is a single App-level value
+    -- (DF_GITHUB_APP_WEBHOOK_SECRET, deployment config); JIRA's webhook
+    -- authentication shape is decided in the task that builds the webhook
+    -- route. The column exists now so that decision does not need a migration.
+    encrypted_webhook_secret TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (org_id, provider)
@@ -179,23 +212,28 @@ the `repos` table's existing case: two orgs, a connection/binding created in org
 unscoped `SELECT`/`UPDATE`/`DELETE` issued with `SET LOCAL app.org_id` pointed at org B
 under `SET LOCAL ROLE df_app`, asserting zero rows are visible or mutable.
 
-## §4 `df-trackers::crypto`
+## §4 `df-core::crypto` (promoted from `df-auth::crypto`)
 
-`crates/df-trackers/src/crypto.rs` — AES-256-GCM `encrypt`/`decrypt` over
-`DF_ENCRYPTION_KEY` (already a required env var per `CLAUDE.md` / `Config::from_env`),
-independent implementation from `df-auth::crypto` per the Assumption above. Same
-constraints: key never logged, ciphertext format `nonce || ciphertext`, base64-encoded for
-storage in the `TEXT` columns above.
+`df-auth::crypto::Cipher`/`Sealed` (AES-256-GCM over `DF_ENCRYPTION_KEY`, already a
+required env var per `CLAUDE.md` / `Config::from_env`) move verbatim to
+`crates/df-core/src/crypto.rs`. `df-core::Error` gains two generic variants,
+`Config(String)` (bad/missing key material) and `Crypto(String)` (seal/open failure —
+tampered ciphertext or a rotated key), matching the wording `df-auth::crypto`'s tests
+already assert. `df-auth::crypto.rs` deletes `Cipher`/`Sealed` and their tests (moved,
+not duplicated) and keeps everything genuinely auth-domain: `generate`, `hash`, `verify`,
+`prefix::*`. `df-trackers` depends on `df-core` already (see Cargo.toml) and calls
+`df_core::crypto::Cipher` directly — no new inter-domain dependency, no duplicate
+implementation.
 
 ## §5 What Task 1 does NOT wire up yet
 
 No `df-trackers` dependency is added to `df-web` or `df-mcp` in this task — `df-core` gains
-the schema and typed accessors, and `df-trackers` gains the crypto primitive, but nothing
-calls either yet. This is deliberate: Task 1 is reviewable and mergeable in isolation
-(schema + tests, no behavior change to any running surface), matching this repo's
-failing-test-first, one-task-at-a-time plan discipline. Tasks 2+ (GitHub App client, JIRA
-client, webhook route, sync engine, MCP tools, console UI) are recorded in
-`docs/plans/2026-09-03-df-trackers.md` and build on this foundation.
+the schema, the typed accessors, and the promoted crypto primitive, but nothing calls the
+tracker tables yet. This is deliberate: Task 1 is reviewable and mergeable in isolation
+(schema + tests + a crate-internal crypto move, no behavior change to any running
+surface), matching this repo's failing-test-first, one-task-at-a-time plan discipline.
+Tasks 2+ (GitHub App client, JIRA client, webhook route, sync engine, MCP tools, console
+UI) are recorded in `docs/plans/2026-09-03-df-trackers.md` and build on this foundation.
 
 ## Error Handling & Edge Cases
 
