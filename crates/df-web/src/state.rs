@@ -27,6 +27,10 @@ pub struct Config {
     /// launch orphans every enrolled device, so it is set once.
     pub totp_issuer: String,
 
+    /// Shared secret for GitHub webhook signature verification. Optional
+    /// because tracker integration itself is optional per deployment.
+    pub github_app_webhook_secret: Option<String>,
+
     /// The header a trusted proxy writes the client address into, lowercase,
     /// or `None` to use the peer address of the connection.
     ///
@@ -65,6 +69,7 @@ impl Config {
             public_url: public_url.into().trim_end_matches('/').to_string(),
             resource_uri: resource_uri.into(),
             totp_issuer: "dark-factory".into(),
+            github_app_webhook_secret: None,
             client_ip_header: None,
             enforce_quotas: false,
         }

@@ -12,9 +12,10 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use std::str::FromStr;
 
 use crate::crypto::Sealed;
-use crate::db::Tx;
+use crate::db::{Db, Tx};
 use crate::error::{Error, Result};
 use crate::ids::{OrgId, RepoId};
 
@@ -48,6 +49,20 @@ impl std::fmt::Display for Provider {
         match self {
             Provider::Github => write!(f, "github"),
             Provider::Jira => write!(f, "jira"),
+        }
+    }
+}
+
+impl FromStr for Provider {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "github" => Ok(Self::Github),
+            "jira" => Ok(Self::Jira),
+            other => Err(Error::Invalid(format!(
+                "unknown tracker provider {other:?}; valid providers are \"github\" and \"jira\""
+            ))),
         }
     }
 }
@@ -100,7 +115,12 @@ fn encode_sealed(sealed: &Sealed) -> Result<String> {
     Ok(B64.encode(combined))
 }
 
-fn decode_sealed(encoded: &str) -> Result<Sealed> {
+/// Decode a tracker secret stored as `base64(nonce || ciphertext)`.
+///
+/// `tracker_connections` keeps recoverable secrets in one text column rather
+/// than two small binary columns; callers that need to open one use this to
+/// rebuild the storage-agnostic [`Sealed`] shape `Cipher` works with.
+pub fn decode_stored_secret(encoded: &str) -> Result<Sealed> {
     // A base64 or length failure here is a corrupted *stored encoding*, not a
     // failed decryption — `Cipher::open` hasn't been called yet, so the
     // caller has not learned anything about the key or the ciphertext's
@@ -123,11 +143,11 @@ fn decode_sealed(encoded: &str) -> Result<Sealed> {
 fn validate_connection(row: TrackerConnectionRow) -> Result<TrackerConnection> {
     row.encrypted_credentials
         .as_deref()
-        .map(decode_sealed)
+        .map(decode_stored_secret)
         .transpose()?;
     row.encrypted_webhook_secret
         .as_deref()
-        .map(decode_sealed)
+        .map(decode_stored_secret)
         .transpose()?;
 
     Ok(TrackerConnection {
@@ -173,6 +193,51 @@ async fn require_connection_in_org(
     }
 }
 
+async fn upsert_connection_index(tx: &mut Tx<'_>, connection: &TrackerConnection) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM tracker_connection_index \
+         WHERE connection_id = $1 AND external_id <> $2",
+    )
+    .bind(connection.id)
+    .bind(&connection.external_id)
+    .execute(tx.conn())
+    .await?;
+
+    let inserted = sqlx::query(
+        "INSERT INTO tracker_connection_index (provider, external_id, org_id, connection_id) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (provider, external_id) DO NOTHING",
+    )
+    .bind(connection.provider)
+    .bind(&connection.external_id)
+    .bind(connection.org_id)
+    .bind(connection.id)
+    .execute(tx.conn())
+    .await?
+    .rows_affected();
+
+    if inserted == 0 {
+        let existing: (OrgId, uuid::Uuid) = sqlx::query_as(
+            "SELECT org_id, connection_id FROM tracker_connection_index \
+             WHERE provider = $1 AND external_id = $2",
+        )
+        .bind(connection.provider)
+        .bind(&connection.external_id)
+        .fetch_one(tx.conn())
+        .await?;
+
+        if existing.0 != connection.org_id || existing.1 != connection.id {
+            return Err(Error::Invalid(format!(
+                "tracker connection {provider} external id {external_id:?} is already registered to another org",
+                provider = connection.provider,
+                external_id = connection.external_id,
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn upsert_connection(
     tx: &mut Tx<'_>,
     provider: Provider,
@@ -203,7 +268,9 @@ pub async fn upsert_connection(
     .fetch_one(tx.conn())
     .await?;
 
-    validate_connection(row)
+    let connection = validate_connection(row)?;
+    upsert_connection_index(tx, &connection).await?;
+    Ok(connection)
 }
 
 pub async fn get_connection(
@@ -222,12 +289,41 @@ pub async fn get_connection(
 }
 
 pub async fn delete_connection(tx: &mut Tx<'_>, provider: Provider) -> Result<()> {
+    sqlx::query("DELETE FROM tracker_connection_index WHERE org_id = $1 AND provider = $2")
+        .bind(tx.org())
+        .bind(provider)
+        .execute(tx.conn())
+        .await?;
     sqlx::query("DELETE FROM tracker_connections WHERE org_id = $1 AND provider = $2")
         .bind(tx.org())
         .bind(provider)
         .execute(tx.conn())
         .await?;
     Ok(())
+}
+
+/// Resolve which org owns a provider connection, from the provider's own
+/// identifier alone.
+///
+/// This is the one place a tracker lookup runs before an [`OrgId`] is known —
+/// analogous to `df_auth::tokens::introspect` resolving a principal before a
+/// session exists. It reads only `tracker_connection_index`, which deliberately
+/// holds no secrets and is outside RLS for this bootstrap hop. Every read of
+/// `tracker_connections` itself still goes through an org-pinned [`Tx`]. Do
+/// not add a second unscoped tracker accessor without updating spec §5a.
+pub async fn resolve_connection_org(
+    db: &Db,
+    provider: Provider,
+    external_id: &str,
+) -> Result<Option<OrgId>> {
+    let org_id = sqlx::query_scalar(
+        "SELECT org_id FROM tracker_connection_index WHERE provider = $1 AND external_id = $2",
+    )
+    .bind(provider)
+    .bind(external_id)
+    .fetch_optional(db.pool())
+    .await?;
+    Ok(org_id)
 }
 
 pub async fn upsert_binding(
@@ -301,4 +397,40 @@ pub async fn resolve_binding(
     .fetch_optional(tx.conn())
     .await?;
     Ok(binding)
+}
+
+/// Resolve the one repo binding a webhook's external reference points at.
+///
+/// The schema only guarantees `UNIQUE (repo_id, provider)` — nothing stops two
+/// repos in the same org from being bound to the same external project/repo
+/// (e.g. two dark-factory repos both mapped to one JIRA project). If that
+/// happens, there is no principled way to pick a "right" one, so this
+/// deliberately fails loudly rather than returning an arbitrary match — a
+/// caller (Task 4's sync engine) that silently picked one would risk creating
+/// or updating a job against the wrong repo. Never widen this to
+/// `fetch_optional`-and-hope; an ambiguous binding is a configuration error
+/// for an operator to resolve, not something to guess through.
+pub async fn find_binding_by_external_ref(
+    tx: &mut Tx<'_>,
+    provider: Provider,
+    external_ref: &str,
+) -> Result<Option<TrackerBinding>> {
+    let mut bindings: Vec<TrackerBinding> = sqlx::query_as(&format!(
+        "SELECT {BINDING_COLS} FROM tracker_bindings \
+         WHERE org_id = $1 AND provider = $2 AND external_ref = $3"
+    ))
+    .bind(tx.org())
+    .bind(provider)
+    .bind(external_ref)
+    .fetch_all(tx.conn())
+    .await?;
+
+    match bindings.len() {
+        0 => Ok(None),
+        1 => Ok(Some(bindings.remove(0))),
+        _ => Err(Error::Invalid(format!(
+            "{provider} external ref {external_ref:?} matches more than one repo binding in this \
+             org; an operator must remove the duplicate binding before this event can be routed"
+        ))),
+    }
 }

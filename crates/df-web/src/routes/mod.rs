@@ -12,3 +12,4 @@ pub mod repos;
 pub mod teams;
 pub mod tokens;
 pub mod usage;
+pub mod webhooks;

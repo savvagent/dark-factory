@@ -1,0 +1,16 @@
+{
+  "action": "comment_created",
+  "issue": {
+    "id": "10001",
+    "key": "DF-9",
+    "summary": "Implement webhook ingest",
+    "description": "Verify signatures before syncing.",
+    "status": "In Progress",
+    "labels": ["trackers", "webhooks"],
+    "projectKey": "DF"
+  },
+  "comment": {
+    "id": "20002",
+    "body": "Sync this change into dark-factory."
+  }
+}

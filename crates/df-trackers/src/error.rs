@@ -37,6 +37,9 @@ pub enum Error {
     InvalidJiraRefreshTokenEncoding,
 
     #[error("{0}")]
+    InvalidWebhook(String),
+
+    #[error("{0}")]
     Internal(String),
 
     #[error(transparent)]

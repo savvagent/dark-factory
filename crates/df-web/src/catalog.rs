@@ -19,9 +19,10 @@
 //! someone adds it to [`crate::openapi::components`]. The test at the bottom of
 //! `openapi.rs` catches a *missing* component, not a stale field.
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 
-use crate::routes::{auth, jobs, orgs, repos, teams, tokens, usage};
+use crate::routes::{auth, jobs, orgs, repos, teams, tokens, usage, webhooks};
 use crate::state::AppState;
 use crate::{oauth, openapi};
 
@@ -185,6 +186,20 @@ impl Endpoint {
         self
     }
 
+    /// Cap the request body this route will read into memory, in bytes.
+    ///
+    /// Only needed on `Auth::Public` routes: session/token-authenticated
+    /// endpoints already require a caller who spent a credential to reach
+    /// them, but a public route like `/webhooks/{provider}` is reachable by
+    /// anyone on the internet, and `Bytes`/`Json` extractors buffer the whole
+    /// body before a handler ever runs. Without an explicit limit, an
+    /// oversized payload is a free memory/CPU DoS against an unauthenticated
+    /// surface.
+    pub fn body_limit(mut self, bytes: usize) -> Self {
+        self.route = self.route.layer(DefaultBodyLimit::max(bytes));
+        self
+    }
+
     /// `GET /api/orgs/{org}/repos` → `getApiOrgsOrgRepos`. Stable across
     /// renames of the Rust function, which is what an OpenAPI operation id has
     /// to be — client generators turn it into a method name.
@@ -247,6 +262,21 @@ pub fn catalog() -> Vec<Endpoint> {
             .auth(Auth::Public)
             .summary("This document")
             .describe("The OpenAPI description of everything below."),
+        Endpoint::post("/webhooks/{provider}", webhooks::receive)
+            .auth(Auth::Public)
+            .body_limit(1_048_576)
+            .summary("Receive tracker webhooks")
+            .describe(
+                "Public by necessity: GitHub App deliveries are authenticated by \
+                 `X-Hub-Signature-256`, and JIRA Automation deliveries by the \
+                 org's own `X-DF-Webhook-Secret` plus a `?site=<cloud-id>` URL \
+                 parameter. This endpoint only verifies, parses, and resolves the \
+                 owning org today; Task 4 turns accepted events into sync work. \
+                 Bodies are capped at 1 MiB — far larger than any GitHub issue/\
+                 comment or JIRA Automation payload this route parses, and small \
+                 enough to bound memory/CPU spent buffering an unauthenticated \
+                 request before signature verification runs.",
+            ),
         // ----------------------------------------------------------- oauth
         Endpoint::post("/oauth/register", oauth::register_client)
             .auth(Auth::Public)

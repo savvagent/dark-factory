@@ -7,8 +7,8 @@ use base64::Engine;
 use common::{db, tenant};
 use df_core::crypto::Cipher;
 use df_core::trackers::{
-    delete_binding, delete_connection, get_binding, get_connection, resolve_binding,
-    upsert_binding, upsert_connection, Provider,
+    delete_binding, delete_connection, find_binding_by_external_ref, get_binding, get_connection,
+    resolve_binding, resolve_connection_org, upsert_binding, upsert_connection, Provider,
 };
 use sqlx::PgPool;
 
@@ -73,6 +73,22 @@ async fn tracker_connections_and_bindings_round_trip(pool: PgPool) {
     assert_eq!(rebound.external_id, "site-2");
     assert!(rebound.encrypted_credentials.is_some());
     assert!(rebound.encrypted_webhook_secret.is_none());
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        resolve_connection_org(&db, Provider::Jira, "site-1")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_connection_org(&db, Provider::Jira, "site-2")
+            .await
+            .unwrap(),
+        Some(t.org)
+    );
+
+    let mut tx = db.begin(t.org).await.unwrap();
 
     let binding = upsert_binding(
         &mut tx,
@@ -96,6 +112,11 @@ async fn tracker_connections_and_bindings_round_trip(pool: PgPool) {
         .unwrap()
         .expect("resolved github binding");
     assert_eq!(resolved, binding);
+    let by_external_ref = find_binding_by_external_ref(&mut tx, Provider::Github, "acme/api")
+        .await
+        .unwrap()
+        .expect("binding by external ref");
+    assert_eq!(by_external_ref, binding);
 
     delete_connection(&mut tx, Provider::Github).await.unwrap();
     assert!(get_connection(&mut tx, Provider::Github)
@@ -117,6 +138,12 @@ async fn tracker_connections_and_bindings_round_trip(pool: PgPool) {
         .is_none());
 
     tx.commit().await.unwrap();
+    assert_eq!(
+        resolve_connection_org(&db, Provider::Github, "installation-1")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// Guard 1 (the API shape), not guard 2 (RLS): a binding must not silently
@@ -195,5 +222,48 @@ async fn binding_rejects_a_repo_from_another_org(pool: PgPool) {
     assert!(
         err.to_string().contains("repo not found"),
         "unexpected error: {err}"
+    );
+}
+
+/// This is deliberately not an `rls_scopes_*` test: `tracker_connection_index`
+/// is outside RLS by design so a webhook can resolve which org owns a provider
+/// id before any `app.org_id` exists. What matters here is guard 1 — the only
+/// writers are pinned `Tx` methods, and the reverse lookup returns each org's
+/// own id rather than crossing tenants.
+#[sqlx::test]
+async fn resolve_connection_org_is_scoped_by_the_index_rows_written_from_each_org(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    upsert_connection(&mut tx, Provider::Github, "installation-a", None, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin(b.org).await.unwrap();
+    upsert_connection(&mut tx, Provider::Github, "installation-b", None, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        resolve_connection_org(&db, Provider::Github, "installation-a")
+            .await
+            .unwrap(),
+        Some(a.org)
+    );
+    assert_eq!(
+        resolve_connection_org(&db, Provider::Github, "installation-b")
+            .await
+            .unwrap(),
+        Some(b.org)
+    );
+    assert_ne!(
+        resolve_connection_org(&db, Provider::Github, "installation-a")
+            .await
+            .unwrap(),
+        Some(b.org)
     );
 }
