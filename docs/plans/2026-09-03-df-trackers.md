@@ -26,6 +26,12 @@ promoted `df-core::crypto` primitive.
   Never edit an applied migration — add a new one.
 - Run `cargo fmt --all` before every Rust commit. No `unwrap()` outside tests. No AI
   self-attribution anywhere (commits, PR bodies, comments, docs).
+- Coordination stays anchored on repos: a tracker binding always names a `repo_id`, never
+  a standalone tracker entity with no repo. Any `DF_*` config this milestone adds
+  (`DF_GITHUB_APP_ID`, `DF_GITHUB_APP_PRIVATE_KEY`, `DF_GITHUB_APP_WEBHOOK_SECRET`, later)
+  must fail `Config::from_env` loudly on an unparseable value, never default silently.
+- No credential is ever spent on a `GET` — the webhook route (Task 3) and any console
+  binding action (Task 6) that consumes a one-time code must be a `POST`.
 - Tests need `podman compose up -d` and a `.env` with `DATABASE_URL`
   (`cp .env.example .env`). `#[sqlx::test]` gives each test a fresh throwaway database;
   there are no database mocks.
@@ -51,6 +57,10 @@ promoted `df-core::crypto` primitive.
 | **Modify.** `crates/df-core/tests/isolation.rs` | cross-org negative tests for both new tables |
 | **Modify.** `crates/df-auth/src/crypto.rs` | delete `Cipher`/`Sealed` and their tests (moved) |
 | **Modify.** `crates/df-auth/Cargo.toml` | drop now-unused crypto deps if nothing else in the crate uses them |
+| **Modify.** `crates/df-server/src/main.rs`, `crates/df-server/src/lib.rs` | `df_auth::crypto::Cipher` → `df_core::crypto::Cipher` |
+| **Modify.** `crates/df-web/src/state.rs`, `crates/df-web/src/lib.rs` | same import change |
+| **Modify.** `crates/df-web/tests/common/mod.rs` | same import change (test helper) |
+| **Create.** `crates/df-core/tests/trackers.rs` | integration tests for the new CRUD, mirroring `tests/queue.rs`'s shape |
 | (Task 2+, not this plan revision's active task) `crates/df-trackers/src/github.rs` | GitHub App client |
 | (Task 2+) `crates/df-trackers/src/jira.rs` | JIRA OAuth 3LO client |
 | (Task 3+) `crates/df-trackers/src/webhook.rs` + `crates/df-web/src/...` | signature verification + `/webhooks/{provider}` route |
@@ -85,37 +95,46 @@ to consume. Consumes nothing new (no dependency edges added).
 - [ ] Add `aes-gcm`, `rand`, `subtle`, `base64` to `crates/df-core/Cargo.toml` (all already
       workspace dependencies used by `df-auth`; just add the `df-core` `[dependencies]`
       entries).
-- [ ] Move `Cipher`/`Sealed` (and their unit tests) from `crates/df-auth/src/crypto.rs` to
-      a new `crates/df-core/src/crypto.rs`, unchanged in behavior. Add `pub mod crypto;`
-      to `crates/df-core/src/lib.rs`.
+- [ ] Move `Cipher`/`Sealed` (and their unit tests, unchanged) from
+      `crates/df-auth/src/crypto.rs` to a new `crates/df-core/src/crypto.rs`. Add
+      `pub mod crypto;` to `crates/df-core/src/lib.rs`.
 - [ ] Add `Error::Config(String)` and `Error::Crypto(String)` to `crates/df-core/src/error.rs`
       (match the exact wording the moved tests assert: "DF_ENCRYPTION_KEY is not valid
       base64", "DF_ENCRYPTION_KEY must decode to 32 bytes, got {n}", "failed to seal
       secret", "stored nonce has the wrong length", "failed to open secret — wrong key or
       tampered ciphertext").
 - [ ] Delete `Cipher`/`Sealed` and their tests from `crates/df-auth/src/crypto.rs`; keep
-      `generate`, `hash`, `verify`, `prefix::*`. Run
-      `cargo test -p df-auth` — must still pass with everything that used those functions
-      untouched (there are no production callers of `Cipher`/`Sealed` in `df-auth` to
-      migrate, per the spec's verified finding).
-- [ ] Run `cargo build --workspace` to confirm the move compiles clean before moving on.
+      `generate`, `hash`, `verify`, `prefix::*` (these are what `df-web/src/routes/auth.rs`
+      and `df-web/src/routes/orgs.rs` actually call — confirmed unaffected).
+- [ ] Update every `df_auth::crypto::Cipher` reference to `df_core::crypto::Cipher`:
+      `crates/df-server/src/main.rs`, `crates/df-server/src/lib.rs`,
+      `crates/df-web/src/state.rs` (`use df_auth::crypto::Cipher` → `use df_core::crypto::Cipher`),
+      `crates/df-web/src/lib.rs`, `crates/df-web/tests/common/mod.rs`.
+- [ ] Run `cargo build --workspace` and `cargo test -p df-auth` — confirm the move compiles
+      clean and every remaining `df-auth` test (the ones exercising `generate`/`hash`/
+      `verify`/`prefix`) still passes. This proves the move is behavior-neutral before
+      any new tracker code is written.
+- [ ] Write a failing test first in a new `crates/df-core/tests/trackers.rs` (mirrors the
+      `#[sqlx::test]` shape in `crates/df-core/tests/queue.rs` and the shared setup in
+      `crates/df-core/tests/common/mod.rs` — there is no `tests/repos.rs`; `queue.rs` is
+      the closest existing example of per-org CRUD + cross-org assertions in this crate).
+      Cover: upsert/get/delete on both tables, the `ON CONFLICT (org_id, provider) DO
+      UPDATE` replace-on-rebind behavior, and `connection_id` becoming `NULL` when a
+      connection is deleted out from under a binding. Run it — confirm it fails to compile
+      (the module and migration do not exist yet).
 - [ ] Write `crates/df-core/migrations/0011_trackers.sql`: `tracker_provider` enum
       (`github`, `jira`), `tracker_connections` (`org_id NOT NULL`, `provider`,
       `external_id`, nullable `encrypted_credentials`, nullable `encrypted_webhook_secret`,
       `UNIQUE (org_id, provider)`), `tracker_bindings` (`org_id NOT NULL`, `repo_id`,
       `connection_id` nullable `ON DELETE SET NULL`, `provider`, `external_ref`,
       `UNIQUE (repo_id, provider)`), indexes on `org_id` and `connection_id` for bindings.
-      Exact column list and comments per spec §1.
-- [ ] In the same migration, add `FORCE ROW LEVEL SECURITY` and a
-      `tracker_connections_tenant_isolation` / `tracker_bindings_tenant_isolation` policy
-      for each table, matching `0007_rls.sql`'s existing policy shape exactly (`USING
-      (org_id = current_setting('app.org_id')::uuid)` under `df_app`, and the FORCE
-      variant for the managed-Postgres shape) — confirm by reading `0007_rls.sql` first.
-- [ ] `podman compose up -d` (if not already running), `cp .env.example .env` (if not
-      already present), then run migrations locally to confirm they apply cleanly:
-      `cargo run -p df-server` briefly, or `sqlx migrate run` if the repo's migration
-      runner is invoked that way — check `df-server`'s startup path for the actual
-      mechanism first.
+      Exact column list and comments per spec §1. In the same migration, add a `DO $$ …
+      $$` block exactly matching `0007_rls.sql`'s existing loop shape (confirmed):
+      `ALTER TABLE <t> ENABLE ROW LEVEL SECURITY`, `ALTER TABLE <t> FORCE ROW LEVEL
+      SECURITY`, then
+      `CREATE POLICY <t>_tenant_isolation ON <t> USING (org_id = current_org()) WITH CHECK (org_id = current_org())`
+      for `tracker_connections` and `tracker_bindings` — reusing the `current_org()`
+      function `0007_rls.sql` already defined; do not redefine it.
 - [ ] Write `crates/df-core/src/trackers.rs`: `Provider` enum (`sqlx::Type` →
       `tracker_provider`), `TrackerConnection`/`TrackerBinding` structs
       (`FromRow`/`Serialize`/`JsonSchema`, matching `repos.rs`'s derive list), private
@@ -124,23 +143,26 @@ to consume. Consumes nothing new (no dependency edges added).
       (`upsert_connection`, `get_connection`, `delete_connection`, `upsert_binding`,
       `get_binding`, `delete_binding`, `resolve_binding`) each taking `&mut Tx` and an
       explicit `org_id` bind on every statement. Add `pub mod trackers;` to
-      `crates/df-core/src/lib.rs`.
-- [ ] Write a failing test first in `crates/df-core/tests/trackers.rs` (new file, mirrors
-      `tests/repos.rs`'s shape): `#[sqlx::test]` cases for upsert/get/delete on both
-      tables, the `ON CONFLICT (org_id, provider) DO UPDATE` replace-on-rebind behavior,
-      and `ON DELETE SET NULL` when a connection is deleted out from under a binding.
-      Confirm it fails before the CRUD functions exist, then implement and confirm green.
-- [ ] Write cross-org negative tests in `crates/df-core/tests/isolation.rs`: for each of
-      `tracker_connections` and `tracker_bindings`, create a row under org A, then —
-      `SET LOCAL ROLE df_app; SET LOCAL app.org_id = '<org B>'` inside a pinned
-      transaction — issue an unscoped `SELECT`/`UPDATE`/`DELETE` and assert zero rows
-      visible/mutable. Confirm the test fails (or panics against a missing table) before
-      the migration's RLS policies exist, to prove it isn't a false positive, then confirm
-      green after.
+      `crates/df-core/src/lib.rs`. Run `crates/df-core/tests/trackers.rs` again — confirm
+      it now compiles and passes (migrations auto-apply against the throwaway
+      `#[sqlx::test]` database; no manual migration step needed for this check).
+- [ ] Write a failing cross-org negative test in `crates/df-core/tests/isolation.rs` for
+      `tracker_connections` and `tracker_bindings`, following the file's existing pattern
+      for another tenant table: create a row under org A inside a normal `Tx`, then open a
+      second transaction with `SET LOCAL ROLE df_app; SET LOCAL app.org_id = '<org B>'`
+      and issue an unscoped `SELECT`/`UPDATE`/`DELETE` against the same table, asserting
+      zero rows visible/mutable. Temporarily comment out the two new `CREATE POLICY`
+      statements in `0011_trackers.sql` and confirm the new test fails (proving it isn't a
+      false positive), then restore the policies and confirm it passes.
+- [ ] Confirm the production migration path once: `cp .env.example .env` if not already
+      present, `podman compose up -d`, then `cargo run -p df-server` briefly and check the
+      logs for `db.migrate().await` (the exact call in `crates/df-server/src/main.rs`)
+      completing without error — this is the only place migrations run outside the test
+      harness. `Ctrl-C` once it logs a successful bind.
 - [ ] `cargo test -p df-core --test isolation`, `cargo test -p df-core --test trackers`,
       `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`,
-      `cargo fmt --all`. All green before commit.
-- [ ] Commit: `df-core: tracker_connections, tracker_bindings, and the promoted crypto primitive`.
+      `cargo fmt --all --check`. All green before commit.
+- [ ] `cargo fmt --all` (writes formatting), then commit: `df-core: tracker_connections, tracker_bindings, and the promoted crypto primitive`.
 
 ---
 
