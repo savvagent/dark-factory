@@ -53,6 +53,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Pre-create df_app role
+        # 0007_rls.sql's CREATE ROLE df_app is guarded by a check-then-create
+        # that is idempotent across sequential migration runs but not atomic:
+        # `#[sqlx::test]` migrates one throwaway database per test, many in
+        # parallel, against this one cluster-scoped role. On a brand-new
+        # Postgres (unlike a long-lived local dev container, which already
+        # has the role from an earlier run) the first parallel batch races
+        # the check and `CREATE ROLE` fails with a duplicate-key error.
+        # Creating it once, before any test runs, removes the race instead of
+        # papering over it with --test-threads=1.
+        run: |
+          psql "postgres://factory:factory@localhost:15433/dark_factory" \
+            -c "CREATE ROLE df_app NOLOGIN;"
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
