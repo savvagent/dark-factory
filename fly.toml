@@ -19,8 +19,19 @@ primary_region = "iad"
   # Fly's proxy terminates TLS and forwards over the internal network, so the
   # process serves plain HTTP and the public origin is https.
   DF_BIND = "0.0.0.0:8080"
-  DF_PUBLIC_URL = "https://dark-factory-mcp.fly.dev"
-  DF_RESOURCE_URI = "https://dark-factory-mcp.fly.dev/mcp"
+  # The hostname a browser and an agent both see. `dark-factory-mcp.fly.dev`
+  # still answers, but nothing advertises it: every emailed-equivalent link, the
+  # OAuth issuer, both discovery documents, and the token audience are built
+  # from this value.
+  #
+  # It is also the WebAuthn relying party id (`df-server` derives it from this
+  # host and asserts it at startup), which makes changing it more expensive than
+  # it looks: **every passkey ever registered is bound to this hostname and
+  # would stop working.** Settled deliberately while the database held no
+  # accounts. A later move behind a Cloudflare Worker keeps this same hostname —
+  # a Worker custom domain serves it directly — so that migration is safe.
+  DF_PUBLIC_URL = "https://df.savvagent.com"
+  DF_RESOURCE_URI = "https://df.savvagent.com/mcp"
   DF_STATIC_DIR = "/srv/console"
   DF_LOG_FORMAT = "json"
   RUST_LOG = "info,df_server=info,df_mcp=info,df_web=info"

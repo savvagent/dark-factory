@@ -163,12 +163,33 @@ console and delivers themselves.
 There is consequently no `DF_ALLOW_LOG_MAILER`, no `Mailer`, and no deployment state in
 which links go to a log instead of a mailbox.
 
-Confirming `DF_PUBLIC_URL` / `DF_RESOURCE_URI` in `fly.toml` against the final
-hostname (Fly default `https://dark-factory-mcp.fly.dev` or a custom domain) and
-running the first live `fly deploy` are still pending a deliberate go — deploying
-spends real infrastructure and secrets already staged for this app.
+## The hostname, and why it was settled early
 
-Once that decision is made, first deploy is:
+The public hostname is **`df.savvagent.com`**, and the app answers on
+`dark-factory-mcp.fly.dev` without advertising it. DNS is at Namecheap:
+
+```
+A     df.savvagent.com  →  66.241.124.226            (Fly shared IPv4)
+AAAA  df.savvagent.com  →  2a09:8280:1::181:a2ef:0   (this app's dedicated IPv6)
+```
+
+`fly certs add df.savvagent.com` issues and renews the certificate; nothing else
+in DNS is needed, because the dedicated IPv6 is what Fly validates ownership
+against.
+
+**This was decided before the first account existed, on purpose.** `DF_PUBLIC_URL`
+is the OAuth issuer, the token audience, and both discovery documents — and once
+passkeys land it is also the WebAuthn relying party id that every credential is
+cryptographically bound to. Changing it after people hold passkeys re-registers
+all of them. Doing it while the database held zero users cost nothing.
+
+A later move behind a Cloudflare Worker keeps this same hostname: a Worker custom
+domain serves `df.savvagent.com` directly and proxies to the Fly app, so
+`DF_ORIGIN` becomes `dark-factory-mcp.fly.dev` and `DF_PUBLIC_URL` does not
+change. See `cloudflare.md`, whose `DF_ALLOWED_HOSTS` trap is exactly about that
+split.
+
+Deploying is:
 
 ```bash
 fly deploy -a dark-factory-mcp
