@@ -229,7 +229,7 @@ fn tracker_schemas() -> Value {
             "createdAt": timestamp,
             "updatedAt": timestamp,
         },
-        "required": ["id", "provider", "externalId", "hasCredentials"],
+        "required": ["id", "provider", "externalId", "hasCredentials", "createdAt", "updatedAt"],
     });
 
     let provider_setup = json!({
@@ -276,7 +276,16 @@ fn tracker_schemas() -> Value {
             "createdAt": timestamp,
             "updatedAt": timestamp,
         },
-        "required": ["id", "repoId", "provider", "externalRef", "triggerLabel", "live"],
+        "required": [
+            "id",
+            "repoId",
+            "provider",
+            "externalRef",
+            "triggerLabel",
+            "live",
+            "createdAt",
+            "updatedAt",
+        ],
     });
 
     json!({
