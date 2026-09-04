@@ -1628,6 +1628,102 @@ async fn sync_ticket_reports_an_outbound_failure_as_retriable(pool: PgPool) {
     assert_eq!(e.data.as_ref().unwrap()["retriable"], true);
 }
 
+/// The whole point of this issue: an org on a hard-stop plan already over its
+/// bucket must be refused *before* `sync_ticket` posts anything to the
+/// tracker, not after. The setup mirrors
+/// `sync_ticket_reports_an_outbound_failure_as_retriable` exactly (a binding
+/// is present, but the server has no GitHub App configured, so an outbound
+/// call — if one were attempted — would fail with `tracker_sync_failed`).
+/// Seeing `quota_exceeded` instead proves the pre-check ran first; if it
+/// didn't, this would return `tracker_sync_failed` just like that test does.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn sync_ticket_refuses_before_the_outbound_call_when_over_budget(pool: PgPool) {
+    let (env, caller) = env_metered(pool, Meter::new(true, UPGRADE_URL)).await;
+    let repo = env.register(&caller).await;
+    let repo_id: RepoId = repo["id"].as_str().unwrap().parse().unwrap();
+
+    let mut tx = env.db.begin(caller.org_id).await.unwrap();
+    let connection = upsert_connection(&mut tx, Provider::Github, "999999", None, None)
+        .await
+        .unwrap();
+    upsert_binding(
+        &mut tx,
+        repo_id,
+        Some(connection.id),
+        Provider::Github,
+        "acme/api",
+        "trackers",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // Link and claim the job while the bucket still has room — these are
+    // themselves billable calls, and the point of this test is the refusal
+    // on `sync_ticket` specifically, not on getting the job into position.
+    let job = env
+        .add_job(&caller, "linked and bound, but the org is over budget")
+        .await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    ok(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id.clone(),
+                tracker: Tracker::Github,
+                ticket_ref: "acme/api#21".into(),
+            }),
+        )
+        .await);
+
+    ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: Some("agent-one".into()),
+            }),
+        )
+        .await);
+
+    // Now spend the rest of the Free plan's bucket, so the org is exactly at
+    // its limit by the time `sync_ticket` is called. This test has already
+    // made a few real billable calls (add_job, link_ticket, claim_jobs), so
+    // both billable_count and total_count are updated together here — an
+    // update that only touched billable_count would leave total_count below
+    // billable_count, an impossible state for this table since every
+    // billable call is also a total one.
+    sqlx::query(
+        "INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
+         VALUES ($1, date_trunc('month', now() AT TIME ZONE 'utc')::date, 500, 500) \
+         ON CONFLICT (org_id, period_start) DO UPDATE SET billable_count = 500, total_count = 500",
+    )
+    .bind(caller.org_id)
+    .execute(env.db.pool())
+    .await
+    .unwrap();
+
+    let e = err(env
+        .factory
+        .sync_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+
+    assert_eq!(
+        code_of(&e),
+        "quota_exceeded",
+        "a quota_exceeded refusal proves the pre-check ran before the outbound call; \
+         tracker_sync_failed would mean the tracker was contacted anyway: {}",
+        e.message
+    );
+    assert_eq!(e.data.as_ref().unwrap()["retriable"], false);
+}
+
 /// A ticket_ref that isn't a valid GitHub issue reference ("owner/repo#N")
 /// will never succeed no matter how many times it's retried — it must not
 /// share the outbound-call path's retriable bucket, or an agent could poll
