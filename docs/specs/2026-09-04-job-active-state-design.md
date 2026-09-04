@@ -31,6 +31,15 @@ Success:
 - `activate_job` is classified in `df-billing::classify` (billable, alongside
   `claim_jobs`/`complete_job`/`fail_job`) — `every_tool_has_a_price` must not fail.
 
+## Public interface note
+
+This change is **additive, not breaking**, per Non-Negotiable Rule 6: `job_status` gains
+a new enum value (existing values `pending`/`in-progress`/`completed`/`failed` and their
+meanings are unchanged), and `activate_job` is a new MCP tool alongside the existing
+ones — no tool, field, route, or column is renamed or removed, and no result envelope's
+shape changes. `Stats` gains a new field (`active`), which is additive to an existing
+response shape. No version bump is required.
+
 ## Scope
 
 **In:**
@@ -39,7 +48,11 @@ Success:
   to the `job_status` enum.
 - `crates/df-core/src/jobs.rs`: `Status::Active` variant, `as_str`/`FromStr`, a new
   `Tx::activate_job` transition method, `finalize`/`close_from_ticket` accepting `Active`
-  as a valid starting state, `Stats.active` counter and its query.
+  as a valid starting state, `Stats.active` counter and its query, and widening
+  `get_live_job_by_ticket_for_repo`'s open-status filter to include `active`.
+- New migration also recreates `jobs_org_repo_tracker_ticket_open_idx`
+  (`0015_jobs_ticket_ref_uniqueness.sql`) to treat `active` as an open status, so the
+  ticket-dedupe guarantee does not regress for a job that has moved past `in-progress`.
 - `crates/df-mcp/src/tools/jobs.rs`: new `activate_job` tool (`ActivateJobArgs` reuses the
   existing single-`job` shape), updated tool descriptions listing `active` among valid
   states, and the `sync_ticket` status match extended to handle `Status::Active`.
@@ -89,14 +102,34 @@ Success:
 -- enum values can only be appended, and ordering here does not matter because
 -- nothing compares job_status by its enum ordinal.
 ALTER TYPE job_status ADD VALUE 'active';
+
+-- 0015_jobs_ticket_ref_uniqueness.sql's partial unique index enforces at most
+-- one *open* (non-terminal) job per (repo, tracker, ticket_ref), scoped to
+-- 'pending'/'in-progress'. An active job is still open — it must keep
+-- blocking a second job for the same ticket, or a webhook race could create
+-- a duplicate for a ticket whose job has moved to 'active'. 0015 is never
+-- edited (it is already applied); the index is dropped and recreated here
+-- with the same shape, widened to include 'active'.
+DROP INDEX jobs_org_repo_tracker_ticket_open_idx;
+CREATE UNIQUE INDEX jobs_org_repo_tracker_ticket_open_idx
+    ON jobs (org_id, repo_id, tracker, ticket_ref)
+    WHERE ticket_ref IS NOT NULL AND status IN ('pending', 'in-progress', 'active');
 ```
 
 Postgres requires `ALTER TYPE ... ADD VALUE` to run outside an explicit transaction
 block in older versions but sqlx's migrator runs each migration file in its own
 transaction; as of Postgres 12+ this specific form (adding a value, not using it in the
-same transaction) is allowed inside a transaction, which is what sqlx uses. No manual
-`COMMIT` trick is needed — confirmed by testing against the same Postgres 16 the test
-suite runs against, matching the version pinned in `podman-compose.yml`.
+same transaction) is allowed inside a transaction, which is what sqlx uses. The new
+enum value is not referenced by the index-recreation statements above (they reference it
+only as a string literal in a `WHERE` clause, not a cast), so there is no
+add-value-then-use-it-in-the-same-transaction conflict. Confirmed against the same
+Postgres 16 the test suite runs against, matching the version pinned in
+`podman-compose.yml`.
+
+`get_live_job_by_ticket_for_repo` (`crates/df-core/src/jobs.rs`) backs the conflict
+lookup callers make after losing a race against this index — its own `status IN
+('pending', 'in-progress')` filter is widened to `('pending', 'in-progress', 'active')`
+in §2, so it keeps agreeing with what the index now considers "open."
 
 ## §2 — `crates/df-core/src/jobs.rs`
 
@@ -172,6 +205,17 @@ needs no logic change — `Active` already falls into "anything but pending" —
 `Stats` gains an `active: i64` field (placed after `in_progress`, before `completed`, to
 read as the lifecycle order), and `stats()`'s query gains
 `COUNT(*) FILTER (WHERE status = 'active') AS active`.
+
+`get_live_job_by_ticket_for_repo`'s `status IN ('pending', 'in-progress')` filter is
+widened to `status IN ('pending', 'in-progress', 'active')`, matching the widened index
+from §1 — an active job is still the "live" holder of its ticket_ref for conflict
+lookups after a webhook race.
+
+`activate_job` does not touch `started_at` — it was already set at claim time
+(`claim_jobs` sets it to `now()`) and keeps meaning "when this job was first claimed,"
+not "when work actually began." `activate_job` adds no new timestamp column; the moment
+of activation is observable only via the status change itself (and, if a caller wants a
+record of it, `watch`/change notifications already fire on every `UPDATE jobs`).
 
 ## §3 — `crates/df-mcp/src/tools/jobs.rs`
 
@@ -258,7 +302,11 @@ value the existing `GET` endpoints pass through.
   `complete_job`/`fail_job` succeed directly from `in-progress` (unchanged path) and also
   from `active` (new path); a test that `activate_job` on a `pending` or already-
   `completed`/`failed`/`active` job returns `WrongStatus` naming `"in-progress"` as
-  expected; a `stats()` test asserting the new `active` counter.
+  expected; a `stats()` test asserting the new `active` counter; a test that a
+  ticket-linked job moved to `active` still blocks a second job for the same
+  (repo, tracker, ticket_ref) via `jobs_org_repo_tracker_ticket_open_idx`
+  (a duplicate insert violates the unique index) — the regression the spec critique
+  surfaced.
 - `crates/df-mcp/tests/tools.rs`: `activate_job` end-to-end (claim → activate → assert
   status), `activate_job` rejected on an unclaimed job, `complete_job`/`fail_job` still
   passing without a prior `activate_job` call, and `activate_job` appearing in the tool
