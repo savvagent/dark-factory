@@ -515,17 +515,13 @@ fn validate_external_ref(provider: Provider, external_ref: &str) -> Result<(), A
             }
         }
         Provider::Jira => {
-            // The project key half of the PROJECT-123 grammar `df-trackers`
-            // already enforces on issue keys: letters and digits, starting with
-            // a letter, no separator.
-            let valid = !external_ref.is_empty()
-                && external_ref.starts_with(|c: char| c.is_ascii_alphabetic())
-                && external_ref
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && external_ref
-                    .chars()
-                    .all(|c| !c.is_ascii_lowercase() || c == '_');
+            // Asked of the existing grammar rather than restated here.
+            // `validate_jira_issue_key` is what every outbound JIRA call
+            // already checks a ticket against, so a project key it would reject
+            // is one whose tickets could be bound and then never synced. A
+            // second copy of the rule is a second thing to drift.
+            let valid =
+                df_trackers::jira::validate_jira_issue_key(&format!("{external_ref}-1")).is_ok();
             if valid {
                 Ok(())
             } else {
@@ -552,10 +548,21 @@ mod tests {
         for bad in ["acme", "acme/api/extra", "acme/", "/api", "acme /api", ""] {
             validate_external_ref(Provider::Github, bad).expect_err(bad);
         }
-        for good in ["ACME", "DF", "A1", "PROJ_X"] {
+        for good in ["ACME", "DF", "A1"] {
             validate_external_ref(Provider::Jira, good).expect(good);
         }
-        for bad in ["acme-123", "not a key", "1ACME", "ACME-1", ""] {
+        // `PROJ_X` is the one worth naming: it looks like a plausible key and
+        // is not one, so a binding to it would be stored and its tickets would
+        // then be refused by the same grammar every outbound call applies.
+        for bad in [
+            "acme-123",
+            "not a key",
+            "1ACME",
+            "ACME-1",
+            "PROJ_X",
+            "acme",
+            "",
+        ] {
             validate_external_ref(Provider::Jira, bad).expect_err(bad);
         }
     }
