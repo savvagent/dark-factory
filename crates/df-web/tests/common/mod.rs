@@ -46,6 +46,31 @@ pub fn harness(pool: PgPool) -> Harness {
     }
 }
 
+/// A harness whose deployment can actually take an admin through connecting a
+/// tracker.
+///
+/// The plain [`harness`] configures no provider, which is a real deployment
+/// shape worth testing (and what `a_deployment_that_cannot_connect_a_provider_says_so`
+/// asserts) — but it means every connect request is refused for the deployment's
+/// gap before the request itself is ever looked at. This one gets past that.
+pub fn harness_with_trackers(pool: PgPool) -> Harness {
+    let db = Db::from_pool(pool);
+    let mut config = Config::new(PUBLIC_URL, RESOURCE);
+    config.github_app_slug = Some("dark-factory".into());
+    config.github_app_client_id = Some("gh-client".into());
+    config.github_app_client_secret = Some("gh-secret".into());
+    config.jira_client_id = Some("jira-client".into());
+    config.jira_client_secret = Some("jira-secret".into());
+    let webauthn = df_web::relying_party(&config).expect("relying party");
+    let state = AppState::new(db.clone(), cipher(), webauthn, config);
+
+    Harness {
+        db,
+        router: df_web::router(state),
+        cipher: cipher(),
+    }
+}
+
 pub fn cipher() -> Cipher {
     Cipher::from_base64_key(&base64::engine::general_purpose::STANDARD.encode([9u8; 32])).unwrap()
 }

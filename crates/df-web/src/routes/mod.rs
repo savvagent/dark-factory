@@ -11,5 +11,6 @@ pub mod orgs;
 pub mod repos;
 pub mod teams;
 pub mod tokens;
+pub mod trackers;
 pub mod usage;
 pub mod webhooks;

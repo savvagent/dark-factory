@@ -148,10 +148,60 @@ export interface Repo {
   defaultBranch: string;
   teamId: string | null;
   defaultAgentType: string | null;
-  trackerBinding: Record<string, unknown>;
   active: boolean;
   createdAt: string;
   createdBy: string | null;
+}
+
+export type TrackerProvider = 'github' | 'jira';
+
+/**
+ * One org's connection to a tracker.
+ *
+ * There is no field for the stored credential and there is not meant to be:
+ * the server returns `hasCredentials` and never the ciphertext itself.
+ */
+export interface TrackerConnection {
+  id: string;
+  provider: TrackerProvider;
+  /** GitHub: the App installation id. JIRA: the cloud site id. */
+  externalId: string;
+  hasCredentials: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * What this deployment can take an admin through, for one provider.
+ *
+ * Read at runtime rather than baked into the bundle: `startUrl` carries the
+ * App slug or OAuth client id of whichever deployment served the page, and a
+ * hard-coded one is how a staging console sends an admin to install the
+ * production App.
+ */
+export interface ProviderSetup {
+  configured: boolean;
+  /** Where to send the browser to begin, minus its `state`. */
+  startUrl: string | null;
+}
+
+export interface TrackerConnections {
+  connections: TrackerConnection[];
+  github: ProviderSetup;
+  jira: ProviderSetup;
+}
+
+export interface TrackerBinding {
+  id: string;
+  repoId: string;
+  provider: TrackerProvider;
+  /** GitHub: `owner/repo`. JIRA: a project key. */
+  externalRef: string;
+  triggerLabel: string;
+  /** False while the org has no connection for this provider. */
+  live: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /**

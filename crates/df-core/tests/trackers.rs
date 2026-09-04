@@ -8,7 +8,8 @@ use common::{db, tenant};
 use df_core::crypto::Cipher;
 use df_core::trackers::{
     delete_binding, delete_connection, find_binding_by_external_ref, get_binding, get_connection,
-    resolve_binding, resolve_connection_org, upsert_binding, upsert_connection, Provider,
+    list_bindings_for_repo, list_connections, resolve_binding, resolve_connection_org,
+    upsert_binding, upsert_connection, Provider,
 };
 use sqlx::PgPool;
 
@@ -304,4 +305,105 @@ async fn resolve_connection_org_is_scoped_by_the_index_rows_written_from_each_or
             .unwrap(),
         Some(b.org)
     );
+}
+
+/// The console reads both tables as lists — one card per provider on the org
+/// page, one binding row per provider in a repo's expander. Both listings are
+/// pinned to the transaction's org, which is what keeps the console's tracker
+/// page from becoming a second surface onto another tenant's rows.
+#[sqlx::test]
+async fn listing_connections_and_bindings_is_scoped_to_the_transactions_org(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(b.org).await.unwrap();
+    upsert_connection(&mut tx, Provider::Github, "installation-99", None, None)
+        .await
+        .unwrap();
+    upsert_binding(
+        &mut tx,
+        b.repo,
+        None,
+        Provider::Github,
+        "globex/api",
+        "dark-factory",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    assert!(
+        list_connections(&mut tx).await.unwrap().is_empty(),
+        "another org's connection is visible in this org's listing"
+    );
+
+    let github = upsert_connection(&mut tx, Provider::Github, "installation-1", None, None)
+        .await
+        .unwrap();
+    upsert_connection(&mut tx, Provider::Jira, "site-1", None, None)
+        .await
+        .unwrap();
+
+    // Ordered by provider so the console renders the same two cards in the same
+    // order on every load, rather than in whatever order Postgres returns rows.
+    let connections = list_connections(&mut tx).await.unwrap();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].provider, Provider::Github);
+    assert_eq!(connections[1].provider, Provider::Jira);
+
+    assert!(
+        list_bindings_for_repo(&mut tx, a.repo)
+            .await
+            .unwrap()
+            .is_empty(),
+        "another org's binding is visible against this org's repo"
+    );
+
+    upsert_binding(
+        &mut tx,
+        a.repo,
+        Some(github.id),
+        Provider::Github,
+        "acme/api",
+        "dark-factory",
+    )
+    .await
+    .unwrap();
+
+    let bindings = list_bindings_for_repo(&mut tx, a.repo).await.unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].external_ref, "acme/api");
+    assert_eq!(bindings[0].connection_id, Some(github.id));
+}
+
+/// A repo id from another org lists nothing rather than that repo's bindings.
+/// `list_bindings_for_repo` binds `org_id` as well as `repo_id` for exactly
+/// this reason: a `repo_id` is a uuid a console caller could otherwise guess
+/// their way into, and the binding names the customer's JIRA project.
+#[sqlx::test]
+async fn listing_bindings_for_another_orgs_repo_returns_nothing(pool: PgPool) {
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(b.org).await.unwrap();
+    upsert_binding(
+        &mut tx,
+        b.repo,
+        None,
+        Provider::Jira,
+        "GLOBEX",
+        "dark-factory",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    assert!(list_bindings_for_repo(&mut tx, b.repo)
+        .await
+        .unwrap()
+        .is_empty());
 }

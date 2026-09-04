@@ -8,7 +8,12 @@
 //! The request types here are df-web's own rather than `df_core::NewRepo`
 //! deserialized directly. `NewRepo` carries `created_by`, which the *server*
 //! decides from the session — a client that could set it would be able to
-//! attribute its registrations to somebody else.
+//! attribute its registrations to somebody else. It also carries
+//! `tracker_binding`, the free-form JSON blob from Milestone 1, which the
+//! console deliberately no longer writes: `tracker_bindings` rows created
+//! through `routes::trackers` are what webhook ingest and the sync engine
+//! actually read, and two fields describing the same thing where only one is
+//! consulted is a trap rather than a convenience.
 
 use axum::extract::{Json, Path, State};
 use axum::response::{IntoResponse, Response};
@@ -42,8 +47,6 @@ pub struct RegisterRepoRequest {
     pub team_id: Option<TeamId>,
     #[serde(default)]
     pub default_agent_type: Option<String>,
-    #[serde(default)]
-    pub tracker_binding: Option<serde_json::Value>,
 }
 
 /// A partial update. Absent fields are left alone — see `df_core::RepoPatch`
@@ -62,8 +65,6 @@ pub struct UpdateRepoRequest {
     pub team_id: Option<Option<TeamId>>,
     #[serde(default)]
     pub default_agent_type: Option<String>,
-    #[serde(default)]
-    pub tracker_binding: Option<serde_json::Value>,
     #[serde(default)]
     pub active: Option<bool>,
     #[serde(default)]
@@ -124,7 +125,11 @@ async fn visible_repos(
 /// caller may not see is reported as not found, not forbidden — the same
 /// "an org you are not in is 404" rule this file already applies to orgs
 /// extends to a team-scoped repo a non-member should not learn exists.
-async fn require_visible(tx: &mut df_core::Tx<'_>, ctx: &OrgCtx, repo: Repo) -> ApiResult<Repo> {
+pub(crate) async fn require_visible(
+    tx: &mut df_core::Tx<'_>,
+    ctx: &OrgCtx,
+    repo: Repo,
+) -> ApiResult<Repo> {
     if ctx.role.can_administer() {
         return Ok(repo);
     }
@@ -176,7 +181,13 @@ pub async fn register_repo(
             default_branch: req.default_branch,
             team_id: req.team_id,
             default_agent_type: req.default_agent_type,
-            tracker_binding: req.tracker_binding,
+            // The free-form `repos.tracker_binding` JSON blob is not writable
+            // from the console. `tracker_bindings` — structured, linked to a
+            // connection, and the only thing webhook ingest and the sync engine
+            // read — replaced it; see `routes::trackers`. The column and its
+            // `NewRepo`/`RepoPatch` fields stay, because the MCP tools still
+            // accept them and this task is not a change to the agent surface.
+            tracker_binding: None,
             // From the session, never from the request.
             created_by: Some(ctx.user.id),
         })
@@ -236,7 +247,8 @@ pub async fn update_repo(
                 default_branch: req.default_branch,
                 team_id: req.team_id,
                 default_agent_type: req.default_agent_type,
-                tracker_binding: req.tracker_binding,
+                // Not writable from the console — see `register_repo`.
+                tracker_binding: None,
                 active: req.active,
                 add_remotes: req.add_remotes,
             },

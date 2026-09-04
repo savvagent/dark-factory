@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{add_member, harness, onboard, org_with_owner, sign_in, Call};
+use common::{add_member, harness, harness_with_trackers, onboard, org_with_owner, sign_in, Call};
 use df_core::orgs::Role;
 use http::StatusCode;
 use sqlx::PgPool;
@@ -1290,4 +1290,369 @@ async fn an_admin_cannot_reset_an_owners_authenticator(pool: PgPool) {
 
     // The owner's credential is untouched.
     sign_in(&h, &mut owner).await.expect(StatusCode::OK);
+}
+
+// --------------------------------------------------------------- trackers
+
+/// Tracker setup grants a repo the ability to move a customer's tickets, so
+/// every route that writes one is admin-only. The read is a member read for the
+/// same reason `GET /repos` is: it describes a repo the member can already see.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn only_an_admin_can_connect_a_tracker_or_bind_a_repo(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let bob = onboard(&h, "bob@acme.test").await;
+
+    let org = org_with_owner(&h, "acme", &rob).await;
+    add_member(&h, org, bob.user, Role::Member).await;
+
+    Call::post("/api/orgs/acme/repos")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "slug": "api" }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::CREATED);
+
+    // A member reads a repo's bindings.
+    Call::get("/api/orgs/acme/repos/api/tracker-bindings")
+        .with_session(&bob.session)
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
+
+    for call in [
+        Call::get("/api/orgs/acme/tracker-connections"),
+        Call::post("/api/orgs/acme/tracker-connections/github")
+            .json(serde_json::json!({ "code": "x", "installationId": 17 })),
+        Call::delete("/api/orgs/acme/tracker-connections/github"),
+        Call::put("/api/orgs/acme/repos/api/tracker-bindings/github")
+            .json(serde_json::json!({ "externalRef": "acme/api" })),
+        Call::delete("/api/orgs/acme/repos/api/tracker-bindings/github"),
+    ] {
+        call.with_session(&bob.session)
+            .send(&h.router)
+            .await
+            .expect(StatusCode::FORBIDDEN);
+    }
+}
+
+/// The same "an org you are not in is a 404, never a 403" rule the rest of the
+/// console keeps. A tracker route is a particularly bad place to break it: the
+/// binding names the customer's JIRA project key.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn another_orgs_tracker_routes_are_invisible(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let mallory = onboard(&h, "mallory@evil.test").await;
+
+    org_with_owner(&h, "acme", &rob).await;
+    org_with_owner(&h, "evil", &mallory).await;
+
+    Call::post("/api/orgs/acme/repos")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "slug": "api" }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::CREATED);
+
+    for (real, imaginary) in [
+        (
+            Call::get("/api/orgs/acme/tracker-connections"),
+            Call::get("/api/orgs/no-such-org/tracker-connections"),
+        ),
+        (
+            Call::delete("/api/orgs/acme/tracker-connections/github"),
+            Call::delete("/api/orgs/no-such-org/tracker-connections/github"),
+        ),
+        (
+            Call::get("/api/orgs/acme/repos/api/tracker-bindings"),
+            Call::get("/api/orgs/no-such-org/repos/api/tracker-bindings"),
+        ),
+        (
+            Call::put("/api/orgs/acme/repos/api/tracker-bindings/github")
+                .json(serde_json::json!({ "externalRef": "acme/api" })),
+            Call::put("/api/orgs/no-such-org/repos/api/tracker-bindings/github")
+                .json(serde_json::json!({ "externalRef": "acme/api" })),
+        ),
+    ] {
+        let real = real.with_session(&mallory.session).send(&h.router).await;
+        let imaginary = imaginary
+            .with_session(&mallory.session)
+            .send(&h.router)
+            .await;
+
+        real.expect(StatusCode::NOT_FOUND);
+        assert_eq!(
+            real.status, imaginary.status,
+            "a real org you are not in must answer like one that does not exist"
+        );
+        assert_eq!(real.error_code(), imaginary.error_code());
+    }
+}
+
+/// A binding that can never match an inbound event is a configuration error
+/// worth catching where it is typed, not at 3am when the label appears to do
+/// nothing. `owner/repo` is what webhook ingest matches `repository.full_name`
+/// against; a project key is what it matches `fields.project.key` against.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_binding_that_could_never_match_an_event_is_refused(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    Call::post("/api/orgs/acme/repos")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "slug": "api" }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::CREATED);
+
+    for (provider, bad) in [
+        ("github", "acme"),
+        ("github", "acme/api/extra"),
+        ("github", "acme/"),
+        ("jira", "not a key"),
+        ("jira", "acme-123"),
+    ] {
+        let refused = Call::put(format!(
+            "/api/orgs/acme/repos/api/tracker-bindings/{provider}"
+        ))
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "externalRef": bad }))
+        .send(&h.router)
+        .await;
+        refused.expect(StatusCode::BAD_REQUEST);
+        assert!(
+            !refused.text.is_empty(),
+            "{provider} binding {bad:?} was refused with no explanation"
+        );
+    }
+
+    // And the shapes that can match are accepted, and round-trip.
+    Call::put("/api/orgs/acme/repos/api/tracker-bindings/github")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "externalRef": "acme/api", "triggerLabel": "agent" }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
+    Call::put("/api/orgs/acme/repos/api/tracker-bindings/jira")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "externalRef": "ACME" }))
+        .send(&h.router)
+        .await
+        .expect(StatusCode::OK);
+
+    let listed = Call::get("/api/orgs/acme/repos/api/tracker-bindings")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    listed.expect(StatusCode::OK);
+    assert!(listed.text.contains("acme/api"), "{}", listed.text);
+    assert!(listed.text.contains("ACME"), "{}", listed.text);
+    assert!(
+        listed.text.contains("agent"),
+        "the trigger label is what inbound sync watches for: {}",
+        listed.text
+    );
+
+    Call::delete("/api/orgs/acme/repos/api/tracker-bindings/jira")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await
+        .expect(StatusCode::NO_CONTENT);
+
+    let after = Call::get("/api/orgs/acme/repos/api/tracker-bindings")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    assert!(!after.text.contains("ACME"), "{}", after.text);
+}
+
+/// Ciphertext is not a secret in the sense that leaking it grants access, but a
+/// console `GET` handing every admin's browser the sealed JIRA refresh token is
+/// gratuitous exposure of exactly the material `DF_ENCRYPTION_KEY` exists to
+/// protect. The listing is a view type for this reason, not the domain row.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn the_connection_listing_never_carries_stored_secrets(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let org = org_with_owner(&h, "acme", &rob).await;
+
+    let mut tx = h.db.begin(org).await.expect("tx");
+    df_core::trackers::upsert_connection(
+        &mut tx,
+        df_core::trackers::Provider::Jira,
+        "site-1",
+        Some(&common::cipher().seal(b"jira-refresh-token").expect("seal")),
+        None,
+    )
+    .await
+    .expect("connection");
+    tx.commit().await.expect("commit");
+
+    let listed = Call::get("/api/orgs/acme/tracker-connections")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    listed.expect(StatusCode::OK);
+
+    assert!(
+        listed.text.contains("site-1"),
+        "the external id is what the admin needs to see: {}",
+        listed.text
+    );
+    assert!(
+        !listed.text.contains("encrypted"),
+        "the console listing carried stored ciphertext: {}",
+        listed.text
+    );
+    assert!(
+        listed.text.contains("hasCredentials"),
+        "the page still needs to know a credential is stored: {}",
+        listed.text
+    );
+}
+
+/// A deployment with no GitHub OAuth client cannot finish a connect flow, and
+/// says so instead of walking an admin through an install they then have to
+/// undo by hand. The test harness configures no provider, which is exactly the
+/// deployment shape being asserted.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_deployment_that_cannot_connect_a_provider_says_so(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    let listed = Call::get("/api/orgs/acme/tracker-connections")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    listed.expect(StatusCode::OK);
+    assert!(
+        listed.text.contains("\"configured\":false"),
+        "an unconfigured deployment must not advertise a connect flow: {}",
+        listed.text
+    );
+
+    let refused = Call::post("/api/orgs/acme/tracker-connections/github")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "code": "x", "installationId": 17 }))
+        .send(&h.router)
+        .await;
+    refused.expect(StatusCode::BAD_REQUEST);
+    assert!(
+        refused.text.contains("not configured"),
+        "the refusal should name the deployment's gap: {}",
+        refused.text
+    );
+}
+
+/// GitHub's connect flow needs an installation id and JIRA's does not have one.
+/// A GitHub request without it is refused rather than defaulted, because the
+/// value is what the whole verification is about — and refused *before* any
+/// call to GitHub, which is what lets this test run without a network.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn connecting_github_without_an_installation_id_is_refused(pool: PgPool) {
+    let h = harness_with_trackers(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    // A configured deployment advertises both flows, with the provider URLs
+    // built server-side so no App slug or client id is baked into the bundle.
+    let listed = Call::get("/api/orgs/acme/tracker-connections")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    listed.expect(StatusCode::OK);
+    assert!(
+        listed
+            .text
+            .contains("github.com/apps/dark-factory/installations/new"),
+        "the install link is built from the configured slug: {}",
+        listed.text
+    );
+    assert!(
+        listed.text.contains("offline_access"),
+        "without offline_access JIRA returns no refresh token and the connection dies \
+         an hour after it is made: {}",
+        listed.text
+    );
+
+    let refused = Call::post("/api/orgs/acme/tracker-connections/github")
+        .with_session(&rob.session)
+        .json(serde_json::json!({ "code": "x" }))
+        .send(&h.router)
+        .await;
+    refused.expect(StatusCode::BAD_REQUEST);
+    assert!(
+        refused.text.contains("installationId"),
+        "the refusal should name the missing field: {}",
+        refused.text
+    );
+}
+
+/// An unknown provider names the two that exist rather than 404ing into
+/// silence — the same rule the MCP errors follow.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn an_unknown_provider_names_the_ones_that_exist(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    let refused = Call::delete("/api/orgs/acme/tracker-connections/linear")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    refused.expect(StatusCode::BAD_REQUEST);
+    assert!(
+        refused.text.contains("github") && refused.text.contains("jira"),
+        "the refusal should list the valid providers: {}",
+        refused.text
+    );
+}
+
+/// The console API no longer writes the free-form `repos.tracker_binding` blob
+/// — `tracker_bindings` rows replaced it, and they are what webhook ingest and
+/// the sync engine actually read.
+///
+/// **Dropping the field must not turn it into a `400`.** An unknown field is
+/// not an error in this API, and making it one for this field alone would be a
+/// second breaking change on top of the first: a client still sending it would
+/// go from "stored somewhere nothing reads" to "cannot register a repo at all".
+/// It is ignored, and the repo is created.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn the_console_ignores_the_retired_tracker_binding_field(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    let created = Call::post("/api/orgs/acme/repos")
+        .with_session(&rob.session)
+        .json(serde_json::json!({
+            "slug": "api",
+            "trackerBinding": { "jira": "ACME" }
+        }))
+        .send(&h.router)
+        .await;
+    created.expect(StatusCode::CREATED);
+    assert!(
+        !created.text.contains("ACME"),
+        "the retired field was stored rather than ignored: {}",
+        created.text
+    );
+
+    let patched = Call::patch("/api/orgs/acme/repos/api")
+        .with_session(&rob.session)
+        .json(serde_json::json!({
+            "name": "API",
+            "trackerBinding": { "jira": "ACME" }
+        }))
+        .send(&h.router)
+        .await;
+    patched.expect(StatusCode::OK);
+    assert!(
+        patched.text.contains("API") && !patched.text.contains("ACME"),
+        "the update applied the wrong half: {}",
+        patched.text
+    );
 }

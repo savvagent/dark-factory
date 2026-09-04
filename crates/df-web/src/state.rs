@@ -5,6 +5,15 @@ use std::sync::Arc;
 use df_core::crypto::Cipher;
 use df_core::Db;
 
+/// What the JIRA connection asks Atlassian for.
+///
+/// Exactly what `df_trackers::jira::JiraClient` calls: reading an issue's
+/// `updated` field and its transitions, writing a comment and a transition.
+/// `offline_access` is what yields the refresh token the connection is stored
+/// with. Asking for more than this would put a consent screen in front of an
+/// admin listing permissions the product never uses.
+const JIRA_SCOPES: &str = "read:jira-work write:jira-work offline_access";
+
 /// Deployment-dependent settings.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -29,6 +38,25 @@ pub struct Config {
     /// Shared secret for GitHub webhook signature verification. Optional
     /// because tracker integration itself is optional per deployment.
     pub github_app_webhook_secret: Option<String>,
+
+    /// The GitHub App's URL slug, and its *user*-to-server OAuth credentials.
+    ///
+    /// All three are needed before an admin can connect a GitHub installation:
+    /// the slug builds the install link, and the client id/secret pair is what
+    /// verifies that the admin who came back from GitHub actually administers
+    /// the installation they are claiming. A deployment holding some but not
+    /// all of them offers no Connect GitHub button at all — see
+    /// [`Config::github_tracker_configured`], which is the one place that
+    /// conjunction is computed so the console can never offer a flow the server
+    /// cannot finish.
+    pub github_app_slug: Option<String>,
+    pub github_app_client_id: Option<String>,
+    pub github_app_client_secret: Option<String>,
+
+    /// Atlassian's OAuth client credentials, for the JIRA 3LO exchange the
+    /// tracker console performs. Optional for the same reason.
+    pub jira_client_id: Option<String>,
+    pub jira_client_secret: Option<String>,
 
     /// The header a trusted proxy writes the client address into, lowercase,
     /// or `None` to use the peer address of the connection.
@@ -69,6 +97,11 @@ impl Config {
             resource_uri: resource_uri.into(),
             totp_issuer: "dark-factory".into(),
             github_app_webhook_secret: None,
+            github_app_slug: None,
+            github_app_client_id: None,
+            github_app_client_secret: None,
+            jira_client_id: None,
+            jira_client_secret: None,
             client_ip_header: None,
             enforce_quotas: false,
         }
@@ -95,6 +128,82 @@ impl Config {
             .next()
             .filter(|h| !h.is_empty())
             .map(str::to_string)
+    }
+
+    /// Where both providers send a browser back after authorization.
+    ///
+    /// One static string per deployment, registered with GitHub and Atlassian,
+    /// which is exactly why it cannot be org-scoped: a redirect URI is fixed at
+    /// the provider and an org slug varies per customer. The org travels in the
+    /// OAuth `state` instead — see
+    /// `docs/specs/2026-09-04-tracker-console-design.md` §1.
+    pub fn tracker_callback_url(&self) -> String {
+        self.url("/trackers/callback")
+    }
+
+    /// Whether this deployment can take an admin through connecting GitHub.
+    ///
+    /// The conjunction lives here rather than in the console because getting it
+    /// wrong is silent in the worst direction: a Connect GitHub button on a
+    /// deployment with no OAuth client sends an admin to GitHub, through an
+    /// install, and back to an error — having already installed an App that now
+    /// has to be uninstalled by hand.
+    ///
+    /// The App id and private key are deliberately *not* part of this. They are
+    /// what `df-mcp` mints tokens with once a connection exists; a deployment
+    /// missing them has working setup and broken sync, which is a different
+    /// failure with a different message, and pretending otherwise here would
+    /// hide the connection an operator needs to see to diagnose it.
+    pub fn github_tracker_configured(&self) -> bool {
+        self.github_app_slug.is_some()
+            && self.github_app_client_id.is_some()
+            && self.github_app_client_secret.is_some()
+    }
+
+    pub fn jira_tracker_configured(&self) -> bool {
+        self.jira_client_id.is_some() && self.jira_client_secret.is_some()
+    }
+
+    /// The GitHub App installation link, minus its `state`.
+    ///
+    /// Built here rather than in the console bundle: a hard-coded App slug is
+    /// how a staging console sends an admin to install the production App.
+    pub fn github_install_url(&self) -> Option<String> {
+        if !self.github_tracker_configured() {
+            return None;
+        }
+        let slug = self.github_app_slug.as_ref()?;
+        let mut url =
+            url::Url::parse(&format!("https://github.com/apps/{slug}/installations/new")).ok()?;
+        url.query_pairs_mut()
+            .append_pair("redirect_uri", &self.tracker_callback_url());
+        Some(url.into())
+    }
+
+    /// The Atlassian consent link, minus its `state`.
+    ///
+    /// `offline_access` is not optional decoration — it is what makes Atlassian
+    /// return a refresh token, and without one a connection works until the
+    /// first access token expires and then stops, an hour after the admin
+    /// watched it succeed.
+    pub fn jira_authorize_url(&self) -> Option<String> {
+        if !self.jira_tracker_configured() {
+            return None;
+        }
+        let client_id = self.jira_client_id.as_ref()?;
+        let mut url = url::Url::parse("https://auth.atlassian.com/authorize").ok()?;
+        url.query_pairs_mut()
+            .append_pair("audience", "api.atlassian.com")
+            .append_pair("client_id", client_id)
+            .append_pair("scope", JIRA_SCOPES)
+            .append_pair("redirect_uri", &self.tracker_callback_url())
+            .append_pair("response_type", "code")
+            // Atlassian returns a refresh token only when consent is actually
+            // shown; without this an admin who has authorized before gets a
+            // silent re-approval and no refresh token, and the connection dies
+            // an hour later.
+            .append_pair("prompt", "consent");
+        Some(url.into())
     }
 
     /// Join a path onto the public URL. Every link handed to a human goes

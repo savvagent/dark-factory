@@ -49,6 +49,10 @@ import type {
   SessionOpened,
   Team,
   TeamMember,
+  TrackerBinding,
+  TrackerConnection,
+  TrackerConnections,
+  TrackerProvider,
   TokenSummary,
   UsageStatus
 } from './types';
@@ -243,6 +247,38 @@ export const api = {
     patch<Repo>(`/api/orgs/${seg(org)}/repos/${seg(repo)}`, body),
   leases: (org: string, repo: string) =>
     get<Lease[]>(`/api/orgs/${seg(org)}/repos/${seg(repo)}/leases`),
+
+  // ------------------------------------------------------------- trackers
+  trackerConnections: (org: string) =>
+    get<TrackerConnections>(`/api/orgs/${seg(org)}/tracker-connections`),
+  /**
+   * Redeem what the provider handed the browser.
+   *
+   * A POST, like every other single-use redemption in this console: the code
+   * arrives in a URL, and a link preview that followed that URL must not be
+   * able to spend it.
+   */
+  connectTracker: (
+    org: string,
+    provider: TrackerProvider,
+    body: { code: string; installationId?: number }
+  ) => post<TrackerConnection>(`/api/orgs/${seg(org)}/tracker-connections/${seg(provider)}`, body),
+  disconnectTracker: (org: string, provider: TrackerProvider) =>
+    del<void>(`/api/orgs/${seg(org)}/tracker-connections/${seg(provider)}`),
+  trackerBindings: (org: string, repo: string) =>
+    get<TrackerBinding[]>(`/api/orgs/${seg(org)}/repos/${seg(repo)}/tracker-bindings`),
+  bindRepo: (
+    org: string,
+    repo: string,
+    provider: TrackerProvider,
+    body: { externalRef: string; triggerLabel?: string }
+  ) =>
+    put<TrackerBinding>(
+      `/api/orgs/${seg(org)}/repos/${seg(repo)}/tracker-bindings/${seg(provider)}`,
+      body
+    ),
+  unbindRepo: (org: string, repo: string, provider: TrackerProvider) =>
+    del<void>(`/api/orgs/${seg(org)}/repos/${seg(repo)}/tracker-bindings/${seg(provider)}`),
 
   // ---------------------------------------------------------------- queue
   jobs: (

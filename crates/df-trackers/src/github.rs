@@ -343,6 +343,242 @@ impl GithubAppClient {
     }
 }
 
+/// The App's *user*-to-server OAuth half.
+///
+/// Separate from [`GithubAppClient`] because it shares none of its machinery:
+/// no App JWT, no installation-token cache, and a different host. What it
+/// shares is a purpose — this is the only thing that can answer "does the
+/// human who just clicked through GitHub's install screen actually administer
+/// the installation they came back claiming?", and the tracker console refuses
+/// to write a connection row without that answer.
+///
+/// The alternative, `GET /app/installations/{id}` with the App JWT, proves the
+/// installation exists. That is precisely what an attacker enumerating small
+/// integers already assumes, so it proves nothing worth having.
+pub struct GithubUserAuth {
+    client_id: String,
+    client_secret: String,
+    http: reqwest::Client,
+    /// `https://github.com` — where codes are redeemed. Not the API host.
+    oauth_base: String,
+    /// `https://api.github.com` — where the resulting token is spent.
+    api_base: String,
+}
+
+#[derive(Deserialize)]
+struct UserTokenResponse {
+    access_token: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserInstallationsPage {
+    #[serde(default)]
+    installations: Vec<InstallationRecord>,
+}
+
+#[derive(Deserialize)]
+struct InstallationRecord {
+    id: i64,
+}
+
+impl GithubUserAuth {
+    pub fn new(client_id: String, client_secret: String) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(|source| Error::Http {
+                provider: "GitHub",
+                action: "building the HTTP client",
+                source,
+            })?;
+
+        Ok(Self {
+            client_id,
+            client_secret,
+            http,
+            oauth_base: "https://github.com".into(),
+            api_base: "https://api.github.com".into(),
+        })
+    }
+
+    /// Redeem `code` and confirm it speaks for someone who administers
+    /// `installation_id`.
+    ///
+    /// Returns `Ok(())` and nothing else on purpose: the user token is spent
+    /// here and deliberately not handed back. Nothing downstream should hold a
+    /// credential that speaks for a human — every later call is made by the
+    /// App on the installation's behalf, which is the identity the audit trail
+    /// and GitHub's own permissions are written in terms of.
+    pub async fn verify_installation_access(&self, code: &str, installation_id: i64) -> Result<()> {
+        let token = self.exchange_user_code(code).await?;
+        if self.administers(&token, installation_id).await? {
+            Ok(())
+        } else {
+            Err(Error::GithubInstallationNotAdministered { installation_id })
+        }
+    }
+
+    async fn exchange_user_code(&self, code: &str) -> Result<String> {
+        let action = "redeeming a user authorization code";
+        let response: UserTokenResponse = self
+            .send_json(
+                self.http
+                    .post(format!("{}/login/oauth/access_token", self.oauth_base))
+                    // Without this GitHub answers form-encoded, and the body
+                    // parses as an error rather than as a token.
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .json(&serde_json::json!({
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret,
+                        "code": code,
+                    })),
+                action,
+            )
+            .await?;
+
+        if let Some(token) = response.access_token {
+            return Ok(token);
+        }
+
+        // A 200 with no token is the spent/forged-code case; say which, in
+        // GitHub's own words, because the admin's next step depends on it.
+        // Both halves are kept where GitHub sends both: the description is
+        // what the admin reads, the code is what an operator greps for.
+        Err(Error::GithubUserCodeRejected(
+            match (response.error_description, response.error) {
+                (Some(description), Some(code)) => format!("{description} [{code}]"),
+                (Some(only), None) | (None, Some(only)) => only,
+                (None, None) => "no access token in GitHub's response".into(),
+            },
+        ))
+    }
+
+    /// Whether the account behind `token` administers `installation_id`.
+    ///
+    /// Pages are followed to the end rather than trusting the first one. An
+    /// account with more installations than fit on a page would otherwise have
+    /// the tail of its list dropped, and a dropped installation reads exactly
+    /// like one the admin does not administer — the wrong refusal, aimed at
+    /// somebody legitimate.
+    async fn administers(&self, token: &str, installation_id: i64) -> Result<bool> {
+        let action = "listing the installations a user administers";
+        let mut url = Some(format!("{}/user/installations?per_page=100", self.api_base));
+
+        while let Some(next) = url {
+            let response = self
+                .http
+                .get(&next)
+                .bearer_auth(token)
+                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+                .send()
+                .await
+                .map_err(|source| Error::Http {
+                    provider: "GitHub",
+                    action,
+                    source,
+                })?;
+
+            let status = response.status();
+            let link = response
+                .headers()
+                .get(reqwest::header::LINK)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = response.text().await.map_err(|source| Error::Http {
+                provider: "GitHub",
+                action,
+                source,
+            })?;
+
+            if !status.is_success() {
+                return Err(Error::Api {
+                    provider: "GitHub",
+                    action,
+                    status,
+                    body: sanitize_error_body(&body),
+                });
+            }
+
+            let page: UserInstallationsPage =
+                serde_json::from_str(&body).map_err(|error| Error::InvalidResponse {
+                    provider: "GitHub",
+                    action,
+                    message: format!("{error}; body was {}", sanitize_error_body(&body)),
+                })?;
+
+            if page.installations.iter().any(|i| i.id == installation_id) {
+                return Ok(true);
+            }
+
+            url = link.as_deref().and_then(next_page_url);
+        }
+
+        Ok(false)
+    }
+
+    async fn send_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: reqwest::RequestBuilder,
+        action: &'static str,
+    ) -> Result<T> {
+        let response = request.send().await.map_err(|source| Error::Http {
+            provider: "GitHub",
+            action,
+            source,
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|source| Error::Http {
+            provider: "GitHub",
+            action,
+            source,
+        })?;
+        if !status.is_success() {
+            return Err(Error::Api {
+                provider: "GitHub",
+                action,
+                status,
+                body: sanitize_error_body(&body),
+            });
+        }
+        serde_json::from_str(&body).map_err(|error| Error::InvalidResponse {
+            provider: "GitHub",
+            action,
+            message: format!("{error}; body was {}", sanitize_error_body(&body)),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_bases(mut self, oauth_base: String, api_base: String) -> Self {
+        self.oauth_base = oauth_base;
+        self.api_base = api_base;
+        self
+    }
+}
+
+/// The `next` URL out of an RFC 8288 `Link` header, if there is one.
+///
+/// Deliberately narrow: it reads only the URL GitHub itself just sent, and
+/// only from the relation named `next`. Building the next page's URL locally
+/// from a page counter would mean re-deriving pagination GitHub already
+/// described, and drifting from it the day it changes.
+fn next_page_url(link: &str) -> Option<String> {
+    link.split(',').find_map(|part| {
+        let (url, rel) = part.split_once(';')?;
+        rel.split(';')
+            .any(|attr| attr.trim().replace(['"', '\''], "") == "rel=next")
+            .then(|| {
+                url.trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string()
+            })
+    })
+}
+
 fn sanitize_error_body(body: &str) -> String {
     match serde_json::from_str::<Value>(body) {
         Ok(mut value) => {
@@ -633,5 +869,151 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
         server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn verifying_an_installation_accepts_one_the_user_administers() {
+        let server = TestServer::start().await;
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({ "access_token": "user-token", "token_type": "bearer" }),
+        ));
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({
+                "total_count": 2,
+                "installations": [{ "id": 11 }, { "id": 17 }]
+            }),
+        ));
+
+        let auth = GithubUserAuth::new("client".into(), "secret".into())
+            .expect("auth")
+            .with_bases(server.base_url.clone(), server.base_url.clone());
+
+        auth.verify_installation_access("the-code", 17)
+            .await
+            .expect("installation 17 is administered by this user");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/login/oauth/access_token");
+        // The secret goes in the body, never the query string: a URL is logged
+        // by every proxy between here and GitHub.
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("exchange body is json");
+        assert_eq!(body["client_secret"], "secret");
+        assert_eq!(body["code"], "the-code");
+        assert_eq!(requests[1].method, "GET");
+        assert!(requests[1].path.starts_with("/user/installations"));
+        assert_eq!(requests[1].headers["authorization"], "Bearer user-token");
+    }
+
+    /// The whole reason this exchange exists. An installation id is a small
+    /// integer; without this check any org admin could type one and drive
+    /// another customer's issues with the operator's own App credentials.
+    #[tokio::test]
+    async fn verifying_an_installation_refuses_one_the_user_does_not_administer() {
+        let server = TestServer::start().await;
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({ "access_token": "user-token" }),
+        ));
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({ "total_count": 1, "installations": [{ "id": 11 }] }),
+        ));
+
+        let auth = GithubUserAuth::new("client".into(), "secret".into())
+            .expect("auth")
+            .with_bases(server.base_url.clone(), server.base_url.clone());
+
+        let error = auth
+            .verify_installation_access("the-code", 17)
+            .await
+            .expect_err("installation 17 is not in the user's list");
+
+        assert!(
+            matches!(
+                error,
+                Error::GithubInstallationNotAdministered {
+                    installation_id: 17
+                }
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// GitHub answers a spent or forged code with HTTP 200 and an `error` field
+    /// rather than a failing status, so a client that only checked the status
+    /// would sail on with no `access_token` and report something misleading.
+    #[tokio::test]
+    async fn a_rejected_authorization_code_is_reported_as_such() {
+        let server = TestServer::start().await;
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({
+                "error": "bad_verification_code",
+                "error_description": "The code passed is incorrect or expired."
+            }),
+        ));
+
+        let auth = GithubUserAuth::new("client".into(), "secret".into())
+            .expect("auth")
+            .with_bases(server.base_url.clone(), server.base_url.clone());
+
+        let error = auth
+            .verify_installation_access("spent", 17)
+            .await
+            .expect_err("a spent code cannot verify anything");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("bad_verification_code"),
+            "the admin needs GitHub's own reason: {message}"
+        );
+        assert!(
+            message.contains("again"),
+            "the message must say what to do next: {message}"
+        );
+        assert_eq!(server.requests().len(), 1, "no token, no second call");
+    }
+
+    /// An account with more installations than fit on one page must not have
+    /// the tail of its list silently dropped — that would read as "you do not
+    /// administer this" to someone who does.
+    #[tokio::test]
+    async fn installation_pages_are_followed_to_the_end() {
+        let server = TestServer::start().await;
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({ "access_token": "user-token" }),
+        ));
+        let mut first = MockResponse::json(
+            200,
+            serde_json::json!({ "total_count": 2, "installations": [{ "id": 11 }] }),
+        );
+        first.headers.push((
+            "link".into(),
+            format!(
+                "<{}/user/installations?page=2>; rel=\"next\"",
+                server.base_url
+            ),
+        ));
+        server.push(first);
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({ "total_count": 2, "installations": [{ "id": 17 }] }),
+        ));
+
+        let auth = GithubUserAuth::new("client".into(), "secret".into())
+            .expect("auth")
+            .with_bases(server.base_url.clone(), server.base_url.clone());
+
+        auth.verify_installation_access("the-code", 17)
+            .await
+            .expect("installation 17 is on the second page");
+
+        assert_eq!(server.requests().len(), 3);
     }
 }

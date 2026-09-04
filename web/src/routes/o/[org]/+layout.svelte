@@ -65,6 +65,7 @@
     { href: `/o/${slug}/repos`, label: 'Repos' },
     { href: `/o/${slug}/members`, label: 'Members' },
     { href: `/o/${slug}/teams`, label: 'Teams' },
+    ...(context.isAdmin ? [{ href: `/o/${slug}/trackers`, label: 'Trackers' }] : []),
     { href: `/o/${slug}/connect`, label: 'Connect an agent' },
     { href: `/o/${slug}/usage`, label: 'Usage' },
     ...(context.isAdmin ? [{ href: `/o/${slug}/audit`, label: 'Audit log' }] : [])

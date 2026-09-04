@@ -60,6 +60,8 @@ pub mod action {
     pub const REPO_UPDATED: &str = "repo.updated";
     pub const TRACKER_CONNECTED: &str = "tracker.connected";
     pub const TRACKER_DISCONNECTED: &str = "tracker.disconnected";
+    pub const TRACKER_BOUND: &str = "tracker.repo.bound";
+    pub const TRACKER_UNBOUND: &str = "tracker.repo.unbound";
 }
 
 /// One recorded event. Built with the fluent constructors rather than a struct

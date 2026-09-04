@@ -13,7 +13,9 @@ no AI attribution, forward-only migrations) intact.
 ## Status — 2026-09-03
 
 Task 1 ✅ shipped (PR #18). Task 2 ✅ shipped (PR #20). Task 3 ✅ shipped (PR #22).
-Task 4 ✅ shipped (PR #24). Task 5 ✅ shipped (PR #26). Task 6 ⬜, not started.
+Task 4 ✅ shipped (PR #24). Task 5 ✅ shipped (PR #26). Task 6 ✅ shipped — expanded into
+five sub-tasks under [`docs/plans/2026-09-04-tracker-console.md`](2026-09-04-tracker-console.md),
+because the four checkboxes below assumed console REST routes that did not exist.
 
 ## Global Constraints
 
@@ -433,7 +435,7 @@ the per-job-vs-repo-binding question and specifies exact error/billing/output sh
       `cargo fmt --all`.
 - [ ] Commit.
 
-## Task 6 — Console UI: tracker connections + bindings ⬜
+## Task 6 — Console UI: tracker connections + bindings ✅
 
 **Files:** `web/src/routes/o/[org]/settings/...` (org-level connection binding),
 `web/src/routes/o/[org]/repos/[repo]/...` (repo-level tracker binding), `df-web`'s
@@ -441,10 +443,10 @@ the per-job-vs-repo-binding question and specifies exact error/billing/output sh
 over the *queue* specifically — a tracker-connection admin action is not a queue write,
 same as existing repo-registration console flows).
 
-- [ ] Bind GitHub App installation / JIRA site at the org level (admin-only, `OrgCtx::require_admin`).
-- [ ] Set a repo's tracker binding (project key / owner-repo) from the repo settings page.
-- [ ] `npm run check && npm run lint && npm test && npm run build`.
-- [ ] Commit.
+- [x] Bind GitHub App installation / JIRA site at the org level (admin-only, `OrgCtx::require_admin`).
+- [x] Set a repo's tracker binding (project key / owner-repo) from the repo settings page.
+- [x] `npm run check && npm run lint && npm test && npm run build`.
+- [x] Commit.
 
 **Out-of-band reminders for whichever task lands last:** confirm `DF_GITHUB_APP_PRIVATE_KEY`
 and any other new `DF_*` vars are documented in `.env.example` with the *why*, and that
