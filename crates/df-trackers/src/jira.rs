@@ -7,6 +7,33 @@ use crate::{Error, Result};
 const USER_AGENT: &str = "dark-factory/0.1";
 const MAX_ERROR_BODY_BYTES: usize = 256;
 
+/// JIRA issue keys are spliced unescaped into REST URL paths below. Unlike
+/// the GitHub side (`parse_github_ticket_ref` strictly splits
+/// `"owner/repo#123"`), an issue key arriving from a webhook payload is
+/// whatever the org's own JIRA Automation rule sends — not a value shaped by
+/// Atlassian itself. Refusing anything that isn't `PROJECT-123`-shaped before
+/// it reaches a URL keeps a misconfigured (or hostile) automation rule from
+/// redirecting an outbound call to an unintended path segment.
+fn validate_jira_issue_key(issue_key: &str) -> Result<()> {
+    let valid = issue_key.split_once('-').is_some_and(|(project, number)| {
+        !project.is_empty()
+            && project
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+            && project.chars().all(|c| {
+                c.is_ascii_alphanumeric() && (c.is_ascii_uppercase() || c.is_ascii_digit())
+            })
+            && !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit())
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidJiraIssueKey(issue_key.to_string()))
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access_token: String,
@@ -161,6 +188,7 @@ impl JiraClient {
         issue_key: &str,
         body: &str,
     ) -> Result<()> {
+        validate_jira_issue_key(issue_key)?;
         self.send_without_response(
             self.http
                 .post(format!(
@@ -193,6 +221,7 @@ impl JiraClient {
         cloud_id: &str,
         issue_key: &str,
     ) -> Result<Vec<Transition>> {
+        validate_jira_issue_key(issue_key)?;
         let response: TransitionListResponse = self
             .send_json(
                 self.http
@@ -229,6 +258,7 @@ impl JiraClient {
         issue_key: &str,
         transition_id: &str,
     ) -> Result<()> {
+        validate_jira_issue_key(issue_key)?;
         self.send_without_response(
             self.http
                 .post(format!(
@@ -253,6 +283,7 @@ impl JiraClient {
         cloud_id: &str,
         issue_key: &str,
     ) -> Result<Option<String>> {
+        validate_jira_issue_key(issue_key)?;
         let issue: JiraIssueResponse = self
             .send_json(
                 self.http
@@ -391,6 +422,37 @@ mod tests {
 
     use super::*;
     use crate::test_support::{MockResponse, TestServer};
+
+    #[test]
+    fn issue_key_validation_accepts_the_project_number_grammar_and_rejects_everything_else() {
+        assert!(validate_jira_issue_key("PROJ-123").is_ok());
+        assert!(validate_jira_issue_key("A1B2-1").is_ok());
+
+        assert!(validate_jira_issue_key("").is_err());
+        assert!(validate_jira_issue_key("PROJ").is_err());
+        assert!(validate_jira_issue_key("PROJ-").is_err());
+        assert!(validate_jira_issue_key("-123").is_err());
+        assert!(validate_jira_issue_key("proj-123").is_err());
+        assert!(validate_jira_issue_key("PROJ-abc").is_err());
+        assert!(validate_jira_issue_key("PROJ-123/../secrets").is_err());
+        assert!(validate_jira_issue_key("PROJ/123").is_err());
+        assert!(validate_jira_issue_key("PROJ-123?evil=1").is_err());
+    }
+
+    #[tokio::test]
+    async fn outbound_calls_refuse_a_malformed_issue_key_before_building_a_url() {
+        let server = TestServer::start().await;
+        let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .with_bases(server.base_url.clone(), server.base_url.clone());
+
+        let error = client
+            .post_comment("token", "cloud-1", "../not-an-issue-key", "hi")
+            .await
+            .expect_err("malformed issue key must be refused");
+        assert!(matches!(error, Error::InvalidJiraIssueKey(_)));
+        // No request was ever sent — the check runs before any HTTP call.
+        assert!(server.requests().is_empty());
+    }
 
     #[tokio::test]
     async fn authorization_code_exchange_parses_token_response() {

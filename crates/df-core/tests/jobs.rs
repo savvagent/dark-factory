@@ -84,6 +84,89 @@ async fn create_from_ticket_sets_tracker_fields(pool: PgPool) {
     assert_eq!(fetched.metadata, serde_json::json!({}));
 }
 
+/// Two concurrent webhook deliveries for the same freshly-labelled issue can
+/// each run inbound_decision, each see "no existing job" for the ticket_ref,
+/// and each call create_from_ticket — the exact race
+/// 0015_jobs_ticket_ref_uniqueness.sql's partial unique index exists to
+/// close. This drives two real, separately-connected transactions through
+/// that race (one blocks on the other's uncommitted insert, then loses the
+/// unique check once it commits) and asserts the loser converges on the
+/// winner's job instead of erroring or creating a second job.
+#[sqlx::test]
+async fn concurrent_create_from_ticket_converges_on_one_job(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let db_a = db.clone();
+    let db_b = db.clone();
+    let repo = t.repo;
+    let org = t.org;
+
+    let (first, second) = tokio::join!(
+        async move {
+            let mut tx = db_a.begin(org).await.unwrap();
+            let job = tx
+                .create_from_ticket(
+                    repo,
+                    Tracker::Github,
+                    "acme/api#99",
+                    "first delivery",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            // Hold the row uncommitted briefly so the second delivery below
+            // genuinely races against an in-flight insert, not an
+            // already-committed one.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tx.commit().await.unwrap();
+            job
+        },
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let mut tx = db_b.begin(org).await.unwrap();
+            let job = tx
+                .create_from_ticket(
+                    repo,
+                    Tracker::Github,
+                    "acme/api#99",
+                    "second delivery",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            job
+        }
+    );
+
+    assert_eq!(
+        first.id, second.id,
+        "concurrent deliveries for the same ticket produced two different jobs"
+    );
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let all = tx
+        .list_jobs(&df_core::jobs::JobFilter {
+            repo_id: Some(t.repo),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let matching: Vec<_> = all
+        .into_iter()
+        .filter(|j| j.ticket_ref.as_deref() == Some("acme/api#99"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one job for the racing ticket, found {matching:?}"
+    );
+}
+
 #[sqlx::test]
 async fn close_from_ticket_allows_pending_and_in_progress(pool: PgPool) {
     let db = db(pool);

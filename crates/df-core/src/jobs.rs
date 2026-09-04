@@ -277,7 +277,15 @@ impl Tx<'_> {
         .ok_or(Error::OrgNotFound(org))?;
 
         let id = JobId::from_seq(seq);
-        let job = sqlx::query_as(&format!(
+        // A savepoint, not a bare INSERT: Postgres aborts the *whole*
+        // enclosing transaction on any statement error, so recovering from
+        // a unique-violation by running another query in the same Tx would
+        // otherwise fail with "current transaction is aborted" instead of
+        // ever reaching the recovery query below.
+        sqlx::query("SAVEPOINT create_from_ticket")
+            .execute(self.conn())
+            .await?;
+        let inserted = sqlx::query_as(&format!(
             "INSERT INTO jobs (id, org_id, repo_id, team_id, title, description, ticket_ref, \
                                tracker, remote_revision, metadata) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING {JOB_COLS}"
@@ -293,7 +301,42 @@ impl Tx<'_> {
         .bind(remote_revision)
         .bind(serde_json::json!({}))
         .fetch_one(self.conn())
-        .await?;
+        .await;
+
+        let job = match inserted {
+            Ok(job) => {
+                sqlx::query("RELEASE SAVEPOINT create_from_ticket")
+                    .execute(self.conn())
+                    .await?;
+                job
+            }
+            // Two concurrent webhook deliveries for the same freshly-labelled
+            // issue can both observe "no existing job" from
+            // get_job_by_ticket_for_repo and both reach this insert;
+            // 0015_jobs_ticket_ref_uniqueness.sql's partial index turns the
+            // loser into a unique-violation instead of a duplicate job. Treat
+            // it as the race it is: hand back the job the other transaction
+            // just created rather than failing the caller (the webhook route
+            // would otherwise 500 on a request that, semantically, succeeded)
+            // — never guessed, since the id burned above is simply unused.
+            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                sqlx::query("ROLLBACK TO SAVEPOINT create_from_ticket")
+                    .execute(self.conn())
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT create_from_ticket")
+                    .execute(self.conn())
+                    .await?;
+                self.get_job_by_ticket_for_repo(repo_id, tracker, ticket_ref)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "create_from_ticket lost a unique-violation race for {ticket_ref:?} \
+                             but no concurrently-created job was found"
+                        ))
+                    })?
+            }
+            Err(error) => return Err(Error::Db(error)),
+        };
 
         Ok(job)
     }

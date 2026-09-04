@@ -231,6 +231,18 @@ impl Factory {
                 .map_err(|error| error.to_string())?;
             tx.commit().await.map_err(|error| error.to_string())?;
             let Some(connection) = connection else {
+                // Should be unreachable: a binding only ever carries a
+                // `connection_id` alongside the `tracker_connections` row it
+                // points at. Log it as the invariant violation it is instead
+                // of letting outbound sync silently vanish with no operator
+                // signal, matching how the inbound webhook route treats the
+                // same broken-invariant shape.
+                tracing::error!(
+                    job_id = %job.id,
+                    repo_id = %job.repo_id,
+                    provider = %provider,
+                    "tracker binding resolved a connection id with no matching tracker_connections row"
+                );
                 return Ok(());
             };
             (binding, connection)
