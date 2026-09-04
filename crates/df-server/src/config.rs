@@ -35,7 +35,8 @@ pub struct Config {
     pub resource_uri: String,
 
     /// 32 bytes, base64. Encrypts secrets at rest (currently tracker webhook
-    /// secrets — see `df_trackers::webhooks`).
+    /// secrets and JIRA OAuth credentials — see `df_core::trackers` and
+    /// `df_trackers::jira`).
     pub encryption_key: String,
     /// Unused since passkeys replaced TOTP (see `CLAUDE.md`'s Authentication
     /// section) — kept only because `DF_TOTP_ISSUER` is still read from the

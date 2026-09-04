@@ -114,8 +114,9 @@ pub struct AppState {
     /// would make a configuration change silently invalidate credentials
     /// instead of failing at boot.
     pub webauthn: Arc<df_auth::passkeys::Webauthn>,
-    /// Decrypts secrets at rest (currently tracker webhook secrets — see
-    /// `df_trackers::webhooks`). Held as an `Arc` because the key material is
+    /// Decrypts secrets at rest (currently tracker webhook secrets and JIRA
+    /// OAuth credentials — see `df_core::trackers` and `df_trackers::jira`).
+    /// Held as an `Arc` because the key material is
     /// loaded once at startup and shared by every request.
     pub cipher: Arc<Cipher>,
     pub config: Arc<Config>,
