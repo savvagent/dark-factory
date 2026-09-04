@@ -184,6 +184,10 @@ async fn cross_org_ticket_sync_accessors_are_refused(pool: PgPool) {
         .set_remote_revision(&acme_job.id, "2099-01-01T00:00:00Z")
         .await
         .is_err());
+    assert!(tx
+        .link_ticket(&acme_job.id, Tracker::Github, "globex/api#99")
+        .await
+        .is_err());
     let _ = tx.rollback().await;
 
     // A's job is exactly as it was.
@@ -196,6 +200,7 @@ async fn cross_org_ticket_sync_accessors_are_refused(pool: PgPool) {
         after.remote_revision.as_deref(),
         Some("2026-09-03T12:00:00Z")
     );
+    assert_eq!(after.ticket_ref.as_deref(), Some("acme/api#42"));
 }
 
 /// `update_repo` from the wrong org must not reach the row, and must not be

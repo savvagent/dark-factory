@@ -1,6 +1,7 @@
 mod common;
 
 use common::{db, job, tenant};
+use df_core::error::Error;
 use df_core::jobs::Status;
 use df_core::jobs::Tracker;
 use df_core::repos::NewRepo;
@@ -82,6 +83,190 @@ async fn create_from_ticket_sets_tracker_fields(pool: PgPool) {
         Some("2026-09-03T12:00:00Z")
     );
     assert_eq!(fetched.metadata, serde_json::json!({}));
+}
+
+#[sqlx::test]
+async fn link_ticket_sets_tracker_and_ticket_ref(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let created = tx.add_job(job(&t, "handmade job")).await.unwrap();
+    assert_eq!(created.tracker, None);
+    assert_eq!(created.ticket_ref, None);
+
+    let linked = tx
+        .link_ticket(&created.id, Tracker::Github, "acme/api#42")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(linked.tracker, Some(Tracker::Github));
+    assert_eq!(linked.ticket_ref.as_deref(), Some("acme/api#42"));
+}
+
+#[sqlx::test]
+async fn link_ticket_clears_stale_remote_revision_on_relink(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let created = tx
+        .create_from_ticket(
+            t.repo,
+            Tracker::Github,
+            "acme/api#1",
+            "first ticket",
+            None,
+            Some("etag-for-ticket-1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created.remote_revision.as_deref(),
+        Some("etag-for-ticket-1")
+    );
+
+    let relinked = tx
+        .link_ticket(&created.id, Tracker::Github, "acme/api#2")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(relinked.ticket_ref.as_deref(), Some("acme/api#2"));
+    assert_eq!(relinked.remote_revision, None);
+}
+
+#[sqlx::test]
+async fn link_ticket_on_a_ticket_another_live_job_holds_returns_ticket_already_linked(
+    pool: PgPool,
+) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let holder = tx
+        .create_from_ticket(
+            t.repo,
+            Tracker::Github,
+            "acme/api#7",
+            "already linked",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let other = tx.add_job(job(&t, "wants the same ticket")).await.unwrap();
+
+    let err = tx
+        .link_ticket(&other.id, Tracker::Github, "acme/api#7")
+        .await
+        .unwrap_err();
+    tx.commit().await.unwrap();
+
+    match err {
+        Error::TicketAlreadyLinked { ticket_ref, job } => {
+            assert_eq!(ticket_ref, "acme/api#7");
+            assert_eq!(job, holder.id);
+        }
+        other => panic!("expected TicketAlreadyLinked, got {other:?}"),
+    }
+}
+
+/// `repend_job` can revive an older terminal job without touching its
+/// `created_at`, so "newest row for this ticket_ref" is not always "the live
+/// row a second writer just lost a unique-violation against." Set up exactly
+/// that shape — an older job revived live, and a newer-but-terminal job with
+/// the same ticket_ref sitting alongside it — and confirm the conflict names
+/// the actual live holder, not the newer historical one.
+#[sqlx::test]
+async fn link_ticket_conflict_names_the_live_holder_not_a_newer_terminal_job(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let older = tx
+        .create_from_ticket(
+            t.repo,
+            Tracker::Github,
+            "acme/api#9",
+            "older job",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let claimed = tx
+        .claim_jobs(std::slice::from_ref(&older.id), t.user, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|j| j.id == older.id)
+        .expect("older job claimable");
+    tx.complete_job(&claimed.id, Some("done")).await.unwrap();
+
+    // Created after `older` finished, so it has a later created_at and is
+    // free to reuse the same ticket_ref — the unique index only blocks live
+    // rows.
+    let newer_terminal = tx
+        .create_from_ticket(
+            t.repo,
+            Tracker::Github,
+            "acme/api#9",
+            "newer but will terminate",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let claimed_newer = tx
+        .claim_jobs(std::slice::from_ref(&newer_terminal.id), t.user, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|j| j.id == newer_terminal.id)
+        .expect("newer job claimable");
+    tx.fail_job(&claimed_newer.id, Some("nope")).await.unwrap();
+
+    // Revives `older` in place — created_at is unchanged, so it stays the
+    // earlier of the two rows sharing this ticket_ref, but it is once again
+    // the only *live* one.
+    tx.repend_job(&older.id).await.unwrap();
+
+    let contender = tx.add_job(job(&t, "wants the same ticket")).await.unwrap();
+    let err = tx
+        .link_ticket(&contender.id, Tracker::Github, "acme/api#9")
+        .await
+        .unwrap_err();
+    tx.commit().await.unwrap();
+
+    match err {
+        Error::TicketAlreadyLinked { ticket_ref, job } => {
+            assert_eq!(ticket_ref, "acme/api#9");
+            assert_eq!(
+                job, older.id,
+                "must name the live holder, not the newer terminal job"
+            );
+        }
+        other => panic!("expected TicketAlreadyLinked, got {other:?}"),
+    }
+}
+
+#[sqlx::test]
+async fn link_ticket_rejects_a_blank_ticket_ref(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let created = tx.add_job(job(&t, "handmade job")).await.unwrap();
+
+    let err = tx
+        .link_ticket(&created.id, Tracker::Github, "   ")
+        .await
+        .unwrap_err();
+    tx.commit().await.unwrap();
+
+    assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
 }
 
 /// Two concurrent webhook deliveries for the same freshly-labelled issue can
