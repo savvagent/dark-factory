@@ -20,7 +20,12 @@ const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Atlassian itself. Refusing anything that isn't `PROJECT-123`-shaped before
 /// it reaches a URL keeps a misconfigured (or hostile) automation rule from
 /// redirecting an outbound call to an unintended path segment.
-fn validate_jira_issue_key(issue_key: &str) -> Result<()> {
+///
+/// Public so a caller can validate a `ticket_ref` up front — e.g.
+/// `df-mcp`'s `sync_ticket`, which needs to tell a malformed issue key
+/// (caller input, never retriable) apart from a genuine JIRA API failure
+/// (transient, retriable) before it ever reaches this client.
+pub fn validate_jira_issue_key(issue_key: &str) -> Result<()> {
     let valid = issue_key.split_once('-').is_some_and(|(project, number)| {
         !project.is_empty()
             && project

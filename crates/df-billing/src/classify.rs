@@ -75,8 +75,6 @@ pub const BILLABLE: &[&str] = &[
     "register_repo",
     // Same category as register_repo: it changes what the org has registered.
     "update_repo",
-    // Milestone 2. Listed now so the table is the single place this question is
-    // answered, rather than something to remember when the tools arrive.
     "link_ticket",
     "sync_ticket",
 ];
@@ -123,10 +121,7 @@ pub fn exhaustive_over<'a>(tools: impl IntoIterator<Item = &'a str>) -> Vec<Stri
     }
 
     for known in FREE.iter().chain(BILLABLE.iter()) {
-        // Milestone 2's tracker tools are priced but not yet built, so they are
-        // allowed to be absent from the surface.
-        let unbuilt = matches!(*known, "link_ticket" | "sync_ticket");
-        if !unbuilt && !seen.iter().any(|s| s == known) {
+        if !seen.iter().any(|s| s == known) {
             problems.push(format!("{known} is classified but no such tool exists"));
         }
     }
@@ -185,11 +180,7 @@ mod tests {
     /// Every tool that is priced and built, which is what a real surface looks
     /// like.
     fn built() -> Vec<&'static str> {
-        FREE.iter()
-            .chain(BILLABLE.iter())
-            .copied()
-            .filter(|t| !matches!(*t, "link_ticket" | "sync_ticket"))
-            .collect()
+        FREE.iter().chain(BILLABLE.iter()).copied().collect()
     }
 
     #[test]
@@ -219,14 +210,5 @@ mod tests {
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("watch"));
         assert!(problems[0].contains("no such tool"));
-    }
-
-    /// Milestone 2's tracker tools are priced before they are built, on purpose:
-    /// this table is where that question gets answered, not something to
-    /// remember later.
-    #[test]
-    fn tools_priced_ahead_of_being_built_are_not_reported() {
-        assert!(BILLABLE.contains(&"link_ticket"));
-        assert!(exhaustive_over(built()).is_empty());
     }
 }

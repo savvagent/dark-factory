@@ -65,7 +65,7 @@ Task 4 ✅ shipped (PR #24). Tasks 5–6 ⬜, not started.
 | (Task 2+) `crates/df-trackers/src/jira.rs` | JIRA OAuth 3LO client |
 | (Task 3+) `crates/df-trackers/src/webhook.rs` + `crates/df-web/src/...` | signature verification + `/webhooks/{provider}` route |
 | (Task 4+) `crates/df-trackers/src/sync.rs` | inbound/outbound sync engine |
-| (Task 5+) `crates/df-mcp/src/tools/trackers.rs`, `crates/df-billing/src/classify.rs` | `link_ticket`/`sync_ticket` tools + pricing |
+| (Task 5+) `crates/df-mcp/src/tools/jobs.rs`, `crates/df-billing/src/classify.rs` | `link_ticket`/`sync_ticket` tools + pricing |
 | (Task 6+) `web/src/...` | console UI for binding a connection + per-repo tracker binding |
 
 ## Task Order & Rationale
@@ -360,18 +360,77 @@ webhooks.rs` (call the inbound half inside the existing per-request `Tx`);
 
 ## Task 5 — `link_ticket` / `sync_ticket` MCP tools ⬜
 
-**Files:** `crates/df-mcp/src/tools/trackers.rs`, `crates/df-mcp/src/tools/mod.rs`,
-`crates/df-mcp/src/tools/out.rs`, `crates/df-billing/src/classify.rs`.
+**Spec:** `docs/specs/2026-09-03-df-trackers-design.md` §7 — read it first, it resolves
+the per-job-vs-repo-binding question and specifies exact error/billing/output shapes.
 
-- [ ] `link_ticket(job_id, provider, external_ref)` — creates/updates a `tracker_bindings`-
-      backed link on the job (design detail: confirm against Task 4's revision-tracking
-      decision whether this is per-job or per-repo-level binding reuse).
-- [ ] `sync_ticket(job_id)` — forces an immediate outbound sync.
-- [ ] Both added to `df-billing::classify::BILLABLE` (per the design doc's own
-      classification table, already predeclared) — `every_tool_has_a_price` must pass.
-- [ ] Tool descriptions written for an LLM caller with no docs, matching the rest of
-      `df-mcp`'s tool surface.
-- [ ] `cargo test -p df-mcp --test tools`, `cargo test -p df-billing`, clippy, fmt.
+**Files:** `crates/df-core/src/jobs.rs`, `crates/df-core/src/error.rs`,
+`crates/df-core/tests/isolation.rs`, `crates/df-core/tests/jobs.rs`,
+`crates/df-mcp/src/tools/jobs.rs`, `crates/df-mcp/src/tools/mod.rs`,
+`crates/df-billing/src/classify.rs`, `crates/df-mcp/tests/tools.rs`.
+
+- [ ] `Error::TicketAlreadyLinked { ticket_ref: String, job: JobId }` in
+      `crates/df-core/src/error.rs` — `code()` → `"ticket_already_linked"`, message per §7,
+      `retriable()` → `false`.
+- [ ] Failing test first: `crates/df-core/tests/jobs.rs` — `link_ticket_sets_tracker_and_ticket_ref`,
+      `link_ticket_clears_stale_remote_revision_on_relink`,
+      `link_ticket_on_a_ticket_another_live_job_holds_returns_ticket_already_linked`,
+      `link_ticket_rejects_a_blank_ticket_ref`. Run `cargo test -p df-core --test jobs` and
+      confirm they fail to compile/fail (no `link_ticket` yet).
+- [ ] Implement `jobs::link_ticket(tx, id, tracker, ticket_ref) -> Result<Job>` in
+      `crates/df-core/src/jobs.rs`: `UPDATE jobs SET tracker = $3, ticket_ref = $4,
+      remote_revision = NULL WHERE org_id = $1 AND id = $2 RETURNING …`, wrapped in
+      `SAVEPOINT`/`ROLLBACK TO SAVEPOINT` to catch the unique-violation on
+      `0015_jobs_ticket_ref_uniqueness.sql`'s existing partial index, then look up the
+      existing holder (reuse `get_job_by_ticket_for_repo`) and return
+      `Error::TicketAlreadyLinked`. `Error::JobNotFound` if the UPDATE returns no rows.
+      `Error::Invalid` if `ticket_ref.trim().is_empty()`.
+- [ ] Cross-org negative test in `crates/df-core/tests/isolation.rs` —
+      `link_ticket_cannot_touch_another_orgs_job` (per Load-Bearing Invariant 1; `jobs` is
+      already RLS-governed, no new policy needed, just the test).
+- [ ] Run the Task 5 `df-core` tests above; confirm green.
+- [ ] Refactor `crates/df-mcp/src/tools/jobs.rs`: factor `sync_job_after_transition`'s
+      binding-resolution block (the `resolve_binding` + `get_connection` step) into its own
+      private helper returning `enum BindingLookup { NotConfigured, Broken,
+      Ready(TrackerBinding, TrackerConnection) }` (`Broken` keeps the existing
+      log-and-continue invariant-violation case distinct from an ordinary "nothing
+      configured" gap). Update `sync_job_after_transition` to call it and keep mapping both
+      `NotConfigured` and `Broken` to `Ok(())` exactly as today (no behavior change for
+      `claim_jobs`/`complete_job`/`fail_job`) — run `cargo test -p df-mcp --test tools` to
+      confirm no regression before proceeding.
+- [ ] New `#[tool(...)]` method `link_ticket` in the same `impl` block: args
+      `{job: JobId, tracker: Tracker, ticket_ref: String}`, `scope::TRACKERS` (add
+      `pub const TRACKERS: &str = "trackers";` to `crates/df-mcp/src/tools/mod.rs`'s
+      `scope` module first), charges inside the same `Tx` as the `jobs::link_ticket` call
+      (standard "charge before the work, same Tx" shape), returns `out::JobOut`. Tool
+      description written for an LLM caller per house style.
+- [ ] New `#[tool(...)]` method `sync_ticket`: args `{job: JobId}`. Reads the job in an
+      uncharged `Tx`; `Error::Invalid` if `tracker`/`ticket_ref` unset (pointing at
+      `link_ticket`) or if `Status` is `Pending`; maps current `Status` →
+      `JobTransition`/`detail` per §7's table; calls the shared `BindingLookup` helper and
+      returns `Error::Invalid` on `NotConfigured` (pointing at binding setup) or `Broken`
+      (naming it a data-integrity problem needing an operator, not a retry) rather than
+      the silent no-op `sync_job_after_transition` uses; calls
+      `sync_github_job`/`sync_jira_job` and propagates their `Err` as the tool's error;
+      on success, writes back `remote_revision`/rotated credentials in its own short `Tx`,
+      which commits unconditionally *before* charging is attempted, then charges in a
+      second, separate short `Tx` (§7's billing-exception paragraph — a quota refusal
+      after a successful outbound call must not roll back loop-safety state for a
+      tracker call that already happened); returns the re-read `out::JobOut` reflecting
+      the post-sync row.
+- [ ] Remove the "unbuilt tools" carve-out in `crates/df-billing/src/classify.rs`
+      (`exhaustive_over()`'s exemption and the `built()` test helper) now that both tools
+      exist on the router; confirm `tools_priced_ahead_of_being_built_are_not_reported`
+      either still passes vacuously or is removed if it no longer has a case to cover.
+- [ ] Add `"link_ticket"`/`"sync_ticket"` to `crates/df-mcp/tests/tools.rs`'s
+      `the_advertised_surface_is_exactly_what_the_design_specifies` expected list; confirm
+      `every_tool_has_a_price` passes without the carve-out.
+- [ ] Recorded-fixture / unit tests for `sync_ticket`'s transition-derivation mapping and
+      its no-binding / not-configured / outbound-failure error paths (no live network),
+      matching this crate's existing testing convention.
+- [ ] `cargo test -p df-core --test jobs`, `cargo test -p df-core --test isolation`,
+      `cargo test -p df-mcp --test tools`, `cargo test -p df-billing`,
+      `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`,
+      `cargo fmt --all`.
 - [ ] Commit.
 
 ## Task 6 — Console UI: tracker connections + bindings ⬜

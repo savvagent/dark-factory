@@ -146,6 +146,16 @@ impl Factory {
     ///
     /// It also puts the quota check where a refusal is cheapest — before the
     /// work, not after it.
+    ///
+    /// `sync_ticket` (`tools::jobs`) is a second exception, alongside
+    /// `watch`: its "work" is an outbound call to the tracker that has
+    /// already happened by the time any Tx opens, so charging in the same Tx
+    /// as the DB write-back would let a quota refusal roll back loop-safety
+    /// state (`remote_revision`, rotated credentials) for a tracker call that
+    /// cannot be un-made. It writes back first, in its own Tx, then charges
+    /// in a second one — a quota refusal there means the call is not billed
+    /// and the caller sees an error, but the write-back survives so a retry
+    /// does not re-post to the tracker.
     pub async fn charge(
         &self,
         tx: &mut Tx<'_>,

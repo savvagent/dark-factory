@@ -44,6 +44,12 @@ pub enum Error {
     #[error("job {job} was claimed by someone else")]
     AlreadyClaimed { job: JobId },
 
+    #[error(
+        "ticket {ticket_ref} is already linked to job {job} — unlink it there first, \
+         or use a different ticket_ref"
+    )]
+    TicketAlreadyLinked { ticket_ref: String, job: JobId },
+
     #[error("dependency cycle: {0} would depend on itself through {1}")]
     DependencyCycle(JobId, JobId),
 
@@ -133,6 +139,7 @@ impl Error {
             Error::RemoteTaken(..) => "remote_taken",
             Error::WrongStatus { .. } => "wrong_status",
             Error::AlreadyClaimed { .. } => "already_claimed",
+            Error::TicketAlreadyLinked { .. } => "ticket_already_linked",
             Error::DependencyCycle(..) => "dependency_cycle",
             Error::LeaseHeld { .. } => "lease_held",
             Error::LeaseNotHeld(_) => "lease_not_held",

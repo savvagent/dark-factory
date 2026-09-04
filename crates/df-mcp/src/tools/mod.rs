@@ -51,6 +51,7 @@ pub mod scope {
     pub const REPOS_READ: &str = "repos:read";
     pub const REPOS_WRITE: &str = "repos:write";
     pub const MESSAGES: &str = "messages";
+    pub const TRACKERS: &str = "trackers";
 }
 
 /// Resolve a repo the caller named, or fail with the error that lists what is

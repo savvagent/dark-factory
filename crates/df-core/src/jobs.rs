@@ -248,6 +248,145 @@ impl Tx<'_> {
         Ok(job)
     }
 
+    /// Look up the *live* job holding a ticket ref, scoped to one repo and
+    /// tracker. Unlike `get_job_by_ticket_for_repo`'s newest-wins semantics —
+    /// deliberately tolerant of multiple *historical* jobs sharing a
+    /// ticket_ref (a ticket that closes and reopens gets a fresh job) —
+    /// this is for callers who just lost a race against
+    /// `jobs_org_repo_tracker_ticket_open_idx`, which allows at most one
+    /// `pending`/`in-progress` row per (repo, tracker, ticket_ref). "Newest
+    /// created_at" is not the same job as "the live one": `repend_job` can
+    /// revive an older job without changing its `created_at`, which could
+    /// leave a newer but already-terminal job looking like the conflict
+    /// instead of the actual live holder the index just rejected a second
+    /// writer for.
+    async fn get_live_job_by_ticket_for_repo(
+        &mut self,
+        repo_id: RepoId,
+        tracker: Tracker,
+        ticket_ref: &str,
+    ) -> Result<Option<Job>> {
+        let org = self.org();
+        let job = sqlx::query_as(&format!(
+            "SELECT {JOB_COLS} FROM jobs \
+             WHERE org_id = $1 AND repo_id = $2 AND tracker = $3 AND ticket_ref = $4 \
+             AND status IN ('pending', 'in-progress') LIMIT 1"
+        ))
+        .bind(org)
+        .bind(repo_id)
+        .bind(tracker)
+        .bind(ticket_ref)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(job)
+    }
+
+    /// Attach a tracker identity to an already-existing job. Per-job, not a
+    /// repo-level binding: `tracker_bindings` (Task 1) already answers "which
+    /// tracker does this repo use, and through which connection" —
+    /// `link_ticket` answers a different question, "which ticket does *this*
+    /// job correspond to", the half a job created by hand (`add_job`, whose
+    /// `ticket_ref` is recorded but not resolved to a `tracker`) or claimed
+    /// before anyone thought to link it does not have.
+    pub async fn link_ticket(
+        &mut self,
+        id: &JobId,
+        tracker: Tracker,
+        ticket_ref: &str,
+    ) -> Result<Job> {
+        if ticket_ref.trim().is_empty() {
+            return Err(Error::Invalid("ticket_ref must not be empty".into()));
+        }
+
+        let org = self.org();
+        let repo_id: RepoId =
+            sqlx::query_scalar("SELECT repo_id FROM jobs WHERE org_id = $1 AND id = $2")
+                .bind(org)
+                .bind(id)
+                .fetch_optional(self.conn())
+                .await?
+                .ok_or_else(|| Error::JobNotFound(id.clone()))?;
+
+        // A savepoint, not a bare UPDATE: Postgres aborts the whole enclosing
+        // transaction on any statement error, so recovering from a
+        // unique-violation by running the lookup query below in the same Tx
+        // would otherwise fail with "current transaction is aborted" instead
+        // of ever reaching that lookup.
+        sqlx::query("SAVEPOINT link_ticket")
+            .execute(self.conn())
+            .await?;
+        // remote_revision resets to NULL: it is loop-safety state for the
+        // inbound stale/echo guard, scoped to whichever ticket the job
+        // currently points at. Relinking to a different ticket without
+        // clearing it would make that ticket's first genuine webhook look
+        // like an old echo of the previous one and get silently dropped.
+        let updated = sqlx::query_as(&format!(
+            "UPDATE jobs SET tracker = $3, ticket_ref = $4, remote_revision = NULL \
+             WHERE org_id = $1 AND id = $2 RETURNING {JOB_COLS}"
+        ))
+        .bind(org)
+        .bind(id)
+        .bind(tracker)
+        .bind(ticket_ref)
+        .fetch_one(self.conn())
+        .await;
+
+        let job = match updated {
+            Ok(job) => {
+                sqlx::query("RELEASE SAVEPOINT link_ticket")
+                    .execute(self.conn())
+                    .await?;
+                job
+            }
+            // 0015_jobs_ticket_ref_uniqueness.sql's partial index already
+            // guards one live job per (repo, tracker, ticket_ref) for
+            // create_from_ticket's inbound race case; an explicit
+            // link_ticket call hitting it means a caller asked to attach a
+            // ticket a different live job already owns — a genuine conflict
+            // to name, not a race to silently converge on (unlike
+            // create_from_ticket's handling of the same index).
+            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                sqlx::query("ROLLBACK TO SAVEPOINT link_ticket")
+                    .execute(self.conn())
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT link_ticket")
+                    .execute(self.conn())
+                    .await?;
+                let holder = self
+                    .get_live_job_by_ticket_for_repo(repo_id, tracker, ticket_ref)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "link_ticket lost a unique-violation for {ticket_ref:?} but no \
+                             conflicting job was found"
+                        ))
+                    })?;
+                return Err(Error::TicketAlreadyLinked {
+                    ticket_ref: ticket_ref.to_string(),
+                    job: holder.id,
+                });
+            }
+            // The job named by `id` existed for the `SELECT repo_id` lookup
+            // above but is gone by the time this `UPDATE ... RETURNING`
+            // runs — e.g. `delete_job` ran concurrently in between. Report
+            // it as the not-found it now is rather than letting `Error::Db`
+            // redact it into an opaque "retry shortly": there is nothing to
+            // retry, the job is gone.
+            Err(sqlx::Error::RowNotFound) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT link_ticket")
+                    .execute(self.conn())
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT link_ticket")
+                    .execute(self.conn())
+                    .await?;
+                return Err(Error::JobNotFound(id.clone()));
+            }
+            Err(error) => return Err(Error::Db(error)),
+        };
+
+        Ok(job)
+    }
+
     pub async fn create_from_ticket(
         &mut self,
         repo_id: RepoId,

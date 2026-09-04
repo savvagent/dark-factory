@@ -606,6 +606,176 @@ UI) are recorded in `docs/plans/2026-09-03-df-trackers.md` and build on this fou
 - Deleting a repo cascades its bindings (`ON DELETE CASCADE` on `repo_id`) — no orphaned
   binding for a repo that no longer exists.
 
+## §7 `link_ticket` / `sync_ticket` MCP tools (Task 5)
+
+This section resolves the plan's Task 5 open design question ("confirm against Task 4's
+revision-tracking decision whether this is per-job or per-repo-level binding reuse") and
+the two tools' exact shapes.
+
+**Resolution: per-job, not per-repo-binding reuse.** `tracker_bindings` (Task 1) already
+answers "which tracker/project does this repo map to, and through which connection" —
+that question is settled at the repo level and `link_ticket` does not touch it.
+`jobs.tracker` / `jobs.ticket_ref` (added in Task 1, populated by `create_from_ticket` for
+inbound-created jobs, left `NULL` by `add_job` for everything else) are what is actually
+missing: a job created by hand (`add_job`, no `tracker` set even when a bare `ticket_ref`
+was passed) or claimed before anyone thought to link it has no way to acquire a tracker
+identity after the fact. `link_ticket` sets exactly those two columns on one job. §6's
+outbound path already reads them (`checked first, before any tracker client is
+constructed` — a job with neither is a no-op) and resolves *which connection* to use via
+the existing repo-level `resolve_binding(tx, repo_id, provider)` — `link_ticket` supplies
+the other half that path needs and changes nothing about how the connection is resolved.
+
+**`link_ticket(job, tracker, ticketRef)`.** New `df-core` function
+`jobs::link_ticket(tx, id, tracker, ticket_ref) -> Result<Job>`:
+
+```sql
+UPDATE jobs SET tracker = $3, ticket_ref = $4 WHERE org_id = $1 AND id = $2 RETURNING …
+```
+
+- `ticket_ref` must not be blank (trimmed), same guard `create_from_ticket` already
+  applies to `title` — `Error::Invalid` if empty.
+- **Also clears `remote_revision` to `NULL` in the same UPDATE.** A job's `remote_revision`
+  is loop-safety state for §6's inbound stale/echo guard, scoped to *whichever ticket the
+  job currently points at*. `link_ticket` can retarget an already-linked job (relink from
+  ticket A to ticket B, or correct a wrong tracker), and leaving A's `remote_revision` in
+  place would make the first genuine webhook for B look like an old echo and get silently
+  dropped — the guard would be protecting against the wrong remote object. Since
+  `link_ticket` is an explicit, infrequent admin-style action, unconditionally clearing it
+  (even when tracker/ticket_ref happen not to change) is simpler than diffing old vs. new
+  and costs nothing real.
+- **Reuses `0015_jobs_ticket_ref_uniqueness.sql`'s existing partial unique index**
+  (`(org_id, repo_id, tracker, ticket_ref) WHERE ticket_ref IS NOT NULL AND status IN
+  ('pending','in-progress')`) rather than adding a second one — the index is table-wide,
+  so any writer that would create two non-terminal jobs pointing at the same ticket in the
+  same repo hits it, `link_ticket` included. Unlike `create_from_ticket`'s handling of the
+  same index (a race between two *webhook deliveries* creating the same job, silently
+  converged on since both callers meant the same thing), a `link_ticket` call hitting this
+  index means a caller explicitly asked to attach a ticket another live job already owns —
+  a genuine conflict the caller needs to know about, not a race to paper over. Caught via
+  the same `SAVEPOINT`/`ROLLBACK TO SAVEPOINT` pattern `create_from_ticket` already uses
+  (required because Postgres aborts the whole transaction on any statement error), but the
+  recovery here is a new `Error::TicketAlreadyLinked { ticket_ref: String, job: JobId }`
+  naming the job that already holds it, not a silent hand-back of that job — an agent
+  linking a ticket does not mean the same thing as a webhook re-delivering an event it
+  already applied. `code()` → `"ticket_already_linked"`; message: `"ticket {ticket_ref}
+  is already linked to job {job} — unlink it there first, or use a different ticket_ref"`;
+  `retriable()` → `false` (identical to `RemoteTaken`/`DependencyCycle`: retrying the same
+  call cannot succeed, the caller's request itself needs to change).
+- No format validation on `ticket_ref` at this layer — `df-core` stays provider-agnostic
+  (matching `add_job`'s own "recorded, not resolved" framing for the same field).
+  Provider-specific grammar is `df-trackers::jira::validate_jira_issue_key`'s job, applied
+  at the point an outbound call actually needs the string as a URL path segment; a
+  malformed ref surfaces there, on the first `sync_ticket`/queue-transition write-back that
+  touches it, exactly the way an unresolvable repo surfaces at `resolve_repo`, not earlier.
+- No repo/binding check: `link_ticket` does not require `tracker_bindings` to already have
+  a binding for the job's `(repo_id, tracker)` pair. A job can be linked to a ticket before
+  an admin finishes configuring the repo's binding — the outbound path already tolerates a
+  missing/inactive binding as a no-op (§6, "a job can exist and be worked without its
+  ticket ever being reachable"), and `link_ticket` does not need to duplicate that check to
+  stay consistent with it.
+
+**`sync_ticket(job)`.** Forces the same outbound write-back §6's `claim_jobs`/
+`complete_job`/`fail_job` perform automatically after their own transition, but derived
+from the job's **current** status rather than a status change that just happened — the
+tool exists for exactly the cases §6 names as not self-healing: the retry window after a
+tracker outage (§6's outbound guard section), and the moment right after `link_ticket`
+where nothing has been posted to the ticket yet because no transition has fired since the
+link was made.
+
+- Requires `job.tracker` and `job.ticket_ref` both set — `Error::Invalid` naming the job
+  and pointing at `link_ticket` if not (an LLM caller's next action, per Invariant 16).
+- Maps the job's current `Status` to the same `JobTransition` §6's outbound path already
+  knows how to render:
+  - `InProgress` → `JobTransition::Claimed`, detail = `job.claimed_by_label`.
+  - `Completed` → `JobTransition::Completed`, detail = `job.result`.
+  - `Failed` → `JobTransition::Failed`, detail = `job.error`.
+  - `Pending` → `Error::Invalid` — nothing has happened to this job yet, so there is no
+    transition to (re-)announce; `link_ticket` alone does not imply a "claimed" comment
+    that nobody actually claimed.
+- **Reuses `sync_job_after_transition`'s binding-resolution and per-provider outbound
+  helpers (`sync_github_job`/`sync_jira_job`), but not its "no binding" no-op and not its
+  fire-and-forget wrapper.** §6's `sync_job_after_transition` returns `Ok(())` — a silent
+  success — for three distinct situations today: no `tracker_bindings` row for the
+  provider, a binding with `connection_id IS NULL` (configured but not yet activated), and
+  (the broken-invariant case, logged as an error before returning) a binding whose
+  `connection_id` points at no matching `tracker_connections` row. Collapsing all three to
+  a single `Ok(())` is correct for the automatic post-transition callers — the queue
+  transition already happened and is the billed action, and none of the three is a failure
+  of *that*. It is wrong for `sync_ticket` in a second way beyond silence: the third case
+  is an operator-facing data-integrity problem, not a caller-facing configuration gap, and
+  the two need different messages. Implementation therefore factors the shared resolution
+  step (`resolve_binding` + `get_connection`) out of `sync_job_after_transition` into its
+  own helper returning a three-way
+  `enum BindingLookup { NotConfigured, Broken, Ready(TrackerBinding, TrackerConnection) }`
+  (`NotConfigured` covers "no binding" and "`connection_id IS NULL`" together — both mean
+  the same thing to a caller, "nothing is wired up yet"; `Broken` is the existing
+  log-and-continue invariant-violation case, kept distinct rather than flattened into
+  `NotConfigured` so it is not misreported as an ordinary configuration gap).
+  `sync_job_after_transition` keeps mapping both `NotConfigured` and `Broken` to `Ok(())`
+  exactly as today (still logging `Broken` as it already does), while `sync_ticket` maps
+  `NotConfigured` to `Error::Invalid` naming the missing piece ("this repo has no active
+  {provider} binding — configure one before calling sync_ticket") and `Broken` to a
+  separate `Error::Invalid` message flagging the data-integrity problem instead ("this
+  repo's {provider} binding points at a connection that no longer exists — this needs an
+  operator to fix, not a retry"), so the caller is never told to "configure a binding" when
+  one already exists and is merely corrupt. The per-provider network calls and their
+  write-back (`sync_github_job`/`sync_jira_job`, and the `set_remote_revision` /
+  `upsert_connection` write-back already inside them) are unchanged and shared by both
+  paths — only the binding-lookup branch and the top-level error handling differ.
+- **Surfaces a tracker/network failure as the tool's own error, unlike the fire-and-forget
+  wrapper.** §6's automatic write-back after `claim_jobs`/`complete_job`/`fail_job` must
+  never fail the tool call, because the queue transition it follows already succeeded and
+  is the billed action — a tracker outage cannot be allowed to look like the claim itself
+  failed. `sync_ticket` has no such transition to protect: talking to the tracker *is* the
+  entire point of the call, so `sync_github_job`/`sync_jira_job` returning `Err` propagates
+  as the tool's `McpResult` error (the wrapped HTTP/API error text) rather than being
+  logged and swallowed. An agent calling `sync_ticket` needs to know whether the sync it
+  explicitly asked for actually happened.
+- **Billing is the second documented exception to "charge before the work," alongside
+  `watch`.** For every other mutating tool in this file, `self.charge(&mut tx, ...)` is
+  billable because the primary action *is* the Postgres write inside that same `tx` — the
+  charge and the write commit or roll back together. `sync_ticket`'s primary action is the
+  outbound HTTP call, which (per §6, "an external HTTP call has no place holding a Postgres
+  transaction open") cannot happen inside that transaction, so whether the call is billable
+  is only known *after* it returns. Charging up front — as an earlier draft of this section
+  proposed — would bill a call whose tracker request then fails, which the metering
+  invariant forbids ("a failed call is never billed"). `sync_ticket` therefore reads the
+  job in a short, uncharged `Tx` (mirroring the read-then-act shape `resolve_binding`
+  already uses), makes the outbound call, and — only on success — writes back
+  `remote_revision`/rotated credentials in its own short `Tx`, which commits
+  unconditionally before charging is even attempted. Charging then runs in a second,
+  separate short `Tx`. This refines an earlier draft of this section, which proposed
+  charging inside the same `Tx` as the write-back: the outbound call has, by this point,
+  already happened and cannot be un-made, so a quota refusal at charge time must not be
+  able to roll back the loop-safety state (`remote_revision`) that a subsequent retry
+  depends on to avoid re-posting to the tracker a second time. A failed outbound call
+  still returns its error with nothing written and nothing charged; a quota refusal after
+  a successful outbound call returns its own error with nothing charged, but the
+  write-back survives. `watch`'s "meters in its own short transaction" is the established
+  precedent for a tool whose charge cannot live in the initiating transaction.
+- Returns `{"job": …}` (`out::JobOut`) re-read after the write-back `Tx` commits (or the
+  original read if the call resulted in a no-op that still counts as success — there is no
+  such path once the binding-check above turns "nothing to sync to" into an error, so in
+  practice this is always the post-write-back row) — never the pre-sync snapshot, so the
+  returned `remote_revision` reflects what was actually written, not stale state.
+
+**Scope and billing.** Both tools require the `trackers` scope — already declared in
+`df_auth::oauth::KNOWN_SCOPES` and described on the consent screen
+(`df-web/src/oauth.rs`: `"trackers" => "Link jobs to issues in JIRA or GitHub"`) since an
+earlier task anticipated it; `df-mcp`'s `scope` module gains
+`pub const TRACKERS: &str = "trackers";` to match. Both are already predeclared in
+`df_billing::classify::BILLABLE` (Milestone 2 was priced ahead of being built, per that
+module's own comment) — this task's only billing-table change is removing the "unbuilt"
+carve-out in `classify::exhaustive_over` and its test's `built()` helper, now that both
+tools exist on the router and the exemption is no longer needed.
+
+**Cross-org negative test.** `link_ticket` is a new tenant-scoped write on the existing
+`jobs` table (no new table, no new RLS policy needed — `jobs` is already governed by
+`jobs_tenant_isolation`), but per Invariant 1 it still needs its own cross-org negative
+test: attempting `link_ticket` against another org's job id must be refused/invisible,
+exactly like the existing `create_from_ticket`/`update_from_ticket`/`close_from_ticket`/
+`set_remote_revision` cross-org coverage in `crates/df-core/tests/isolation.rs`.
+
 ## Risks & Open Questions
 
 - The existing free-form `repos.tracker_binding` `jsonb` column (Milestone 1) and the new
