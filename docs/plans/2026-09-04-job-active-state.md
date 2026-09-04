@@ -160,7 +160,7 @@ Steps:
       tenant-table shape changed).
 - [x] `cargo fmt --all && git add -A && git commit -m "df-core: add active job status"`
 
-## Task 2 — `df-mcp` + `df-billing`: `activate_job` tool ⬜
+## Task 2 — `df-mcp` + `df-billing`: `activate_job` tool ✅
 
 **Files:** `crates/df-mcp/src/tools/jobs.rs`, `crates/df-mcp/tests/tools.rs`,
 `crates/df-billing/src/classify.rs`
@@ -172,7 +172,7 @@ Steps:
 
 Steps:
 
-- [ ] Write the failing tests first in `crates/df-mcp/tests/tools.rs`:
+- [x] Write the failing tests first in `crates/df-mcp/tests/tools.rs`:
   - Add `"activate_job"` to `the_advertised_surface_is_exactly_what_the_design_specifies`'s
     `expected` list (Jobs section, after `"claim_jobs"` or alongside `"complete_job"`).
     Running `cargo test -p df-mcp --test tools the_advertised_surface` now fails (tool
@@ -189,7 +189,7 @@ Steps:
   - Run `cargo test -p df-mcp --test tools` — expect compile failure (`activate_job` tool
     doesn't exist) and `every_tool_has_a_price` failure once it does exist but is
     unclassified.
-- [ ] In `crates/df-mcp/src/tools/jobs.rs`:
+- [x] In `crates/df-mcp/src/tools/jobs.rs`:
   - Add the `activate_job` tool per spec §3 (description text, `JobArgs` input,
     `out::JobOut` output, `self.charge(&mut tx, &caller, "activate_job")`, no
     `sync_jobs_after_transition` call).
@@ -203,10 +203,10 @@ Steps:
     `Status::Active` is now a valid starting state for it (§3's match extension).
   - Update the module doc comment (near line 3) the same way as Task 1's `jobs.rs`
     change.
-- [ ] In `crates/df-billing/src/classify.rs`: add `"activate_job"` to the `BILLABLE`
+- [x] In `crates/df-billing/src/classify.rs`: add `"activate_job"` to the `BILLABLE`
       array (near `"claim_jobs"`/`"complete_job"`/`"fail_job"`), and add `"activate_job"`
       to the `for tool in [...]` billable-assertion list in the module's own tests.
-- [ ] Run `cargo test -p df-mcp --test tools` and `cargo test -p df-billing` — all pass,
+- [x] Run `cargo test -p df-mcp --test tools` and `cargo test -p df-billing` — all pass,
       including `every_tool_has_a_price`.
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo fmt --all && git add -A && git commit -m "df-mcp: add activate_job tool"`
