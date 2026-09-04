@@ -148,7 +148,6 @@ export interface Repo {
   defaultBranch: string;
   teamId: string | null;
   defaultAgentType: string | null;
-  trackerBinding: Record<string, unknown>;
   active: boolean;
   createdAt: string;
   createdBy: string | null;

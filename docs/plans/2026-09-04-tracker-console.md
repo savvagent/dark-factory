@@ -7,7 +7,7 @@ do not, so this splits into five sub-tasks, server first.
 
 ## Status — 2026-09-04
 
-6.1 ✅ shipped, 6.2 ✅ shipped, 6.3 ✅ shipped, 6.4 ✅ shipped, 6.5 ⬜.
+6.1 ✅ shipped, 6.2 ✅ shipped, 6.3 ✅ shipped, 6.4 ✅ shipped, 6.5 ✅ shipped.
 
 ## Global Constraints
 
@@ -162,7 +162,7 @@ free function taking the OAuth credentials is the likelier shape).
 - [x] `npm run check && npm run lint && npm test && npm run build`. Commit:
       `web: connect a tracker and bind a repo to it`.
 
-## Task 6.5 — drop `trackerBinding` from the console ⬜
+## Task 6.5 — drop `trackerBinding` from the console ✅
 
 **Files:** `crates/df-web/src/routes/repos.rs`, `crates/df-web/src/openapi.rs`,
 `web/src/lib/types.ts`, `crates/df-web/tests/console.rs`.
@@ -170,16 +170,16 @@ free function taking the OAuth credentials is the likelier shape).
 **This is the task's one breaking change** (spec §7). It lands alone so it can be reverted
 without reverting the feature.
 
-- [ ] Remove `tracker_binding` from `RegisterRepoRequest` and `UpdateRepoRequest`, passing
+- [x] Remove `tracker_binding` from `RegisterRepoRequest` and `UpdateRepoRequest`, passing
       `None` to `NewRepo`/`RepoPatch`. `df-core` keeps the field; the MCP surface is untouched.
-- [ ] Remove it from the `RegisterRepoRequest`/`UpdateRepoRequest` components in
+- [x] Remove it from the `RegisterRepoRequest`/`UpdateRepoRequest` components in
       `openapi.rs`; mark it `deprecated: true` on the `Repo` response component with a
       description naming `/api/orgs/{org}/repos/{repo}/tracker-binding` as the replacement.
-- [ ] Remove it from `Repo` in `web/src/lib/types.ts` (nothing in `web/src` reads it).
-- [ ] A test asserting a `POST /repos` carrying `trackerBinding` is accepted and *ignores*
+- [x] Remove it from `Repo` in `web/src/lib/types.ts` (nothing in `web/src` reads it).
+- [x] A test asserting a `POST /repos` carrying `trackerBinding` is accepted and *ignores*
       the field, rather than `400`ing — an unknown field is not an error in this API and
       making it one would be a second breaking change.
-- [ ] `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`,
+- [x] `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`,
       `cargo fmt --all`, `npm run check && npm run lint && npm test`. Commit:
       `df-web: drop the free-form trackerBinding field from the console API`.
 

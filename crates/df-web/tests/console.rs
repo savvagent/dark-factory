@@ -1563,3 +1563,49 @@ async fn an_unknown_provider_names_the_ones_that_exist(pool: PgPool) {
         refused.text
     );
 }
+
+/// The console API no longer writes the free-form `repos.tracker_binding` blob
+/// — `tracker_bindings` rows replaced it, and they are what webhook ingest and
+/// the sync engine actually read.
+///
+/// **Dropping the field must not turn it into a `400`.** An unknown field is
+/// not an error in this API, and making it one for this field alone would be a
+/// second breaking change on top of the first: a client still sending it would
+/// go from "stored somewhere nothing reads" to "cannot register a repo at all".
+/// It is ignored, and the repo is created.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn the_console_ignores_the_retired_tracker_binding_field(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    org_with_owner(&h, "acme", &rob).await;
+
+    let created = Call::post("/api/orgs/acme/repos")
+        .with_session(&rob.session)
+        .json(serde_json::json!({
+            "slug": "api",
+            "trackerBinding": { "jira": "ACME" }
+        }))
+        .send(&h.router)
+        .await;
+    created.expect(StatusCode::CREATED);
+    assert!(
+        !created.text.contains("ACME"),
+        "the retired field was stored rather than ignored: {}",
+        created.text
+    );
+
+    let patched = Call::patch("/api/orgs/acme/repos/api")
+        .with_session(&rob.session)
+        .json(serde_json::json!({
+            "name": "API",
+            "trackerBinding": { "jira": "ACME" }
+        }))
+        .send(&h.router)
+        .await;
+    patched.expect(StatusCode::OK);
+    assert!(
+        patched.text.contains("API") && !patched.text.contains("ACME"),
+        "the update applied the wrong half: {}",
+        patched.text
+    );
+}

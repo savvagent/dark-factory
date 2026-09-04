@@ -416,7 +416,16 @@ fn entity_schemas() -> Value {
             "defaultBranch": { "type": "string" },
             "teamId": { "type": ["string", "null"], "format": "uuid" },
             "defaultAgentType": { "type": ["string", "null"] },
-            "trackerBinding": { "type": "object" },
+            "trackerBinding": {
+                "type": "object",
+                "deprecated": true,
+                "description":
+                    "The free-form binding blob from Milestone 1. Nothing reads it: \
+                     webhook ingest and the sync engine read the structured rows under \
+                     /api/orgs/{org}/repos/{repo}/tracker-bindings instead. Not writable \
+                     through this API — it is returned only because the field still \
+                     exists on the row.",
+            },
             "active": { "type": "boolean" },
             "createdAt": timestamp,
             "createdBy": { "type": ["string", "null"], "format": "uuid" },
@@ -918,7 +927,6 @@ fn request_schemas() -> Value {
                     "type": ["string", "null"],
                     "description": "A free-form hint. Never validated against a list.",
                 },
-                "trackerBinding": { "type": ["object", "null"] },
             },
             "required": ["slug"],
         },
@@ -932,7 +940,6 @@ fn request_schemas() -> Value {
                 "defaultBranch": { "type": ["string", "null"] },
                 "teamId": { "type": ["string", "null"], "format": "uuid" },
                 "defaultAgentType": { "type": ["string", "null"] },
-                "trackerBinding": { "type": ["object", "null"] },
                 "active": { "type": ["boolean", "null"] },
                 "addRemotes": { "type": "array", "items": { "type": "string" } },
             },
