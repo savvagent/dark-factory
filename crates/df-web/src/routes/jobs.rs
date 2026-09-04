@@ -32,7 +32,7 @@ use crate::state::AppState;
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListJobsQuery {
-    /// `pending` | `in-progress` | `completed` | `failed`.
+    /// `pending` | `in-progress` | `active` | `completed` | `failed`.
     #[serde(default)]
     pub status: Option<String>,
     /// A registered repo slug.

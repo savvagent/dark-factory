@@ -211,7 +211,7 @@ Steps:
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo fmt --all && git add -A && git commit -m "df-mcp: add activate_job tool"`
 
-## Task 3 — `df-web`: expose `active` on the read-only queue surface ⬜
+## Task 3 — `df-web`: expose `active` on the read-only queue surface ✅
 
 **Files:** `crates/df-web/src/routes/jobs.rs`, `crates/df-web/src/openapi.rs`,
 `crates/df-web/tests/console.rs`
@@ -224,12 +224,12 @@ Steps:
 
 Steps:
 
-- [ ] Write the failing test first in `crates/df-web/src/openapi.rs`'s existing
+- [x] Write the failing test first in `crates/df-web/src/openapi.rs`'s existing
       `#[cfg(test)] mod tests` block (alongside its other schema assertions): a test
       asserting the job status `enum` array in the `Job` schema contains `"active"`, and
       that the `QueueStats` schema's `properties`/`required` both contain `"active"`.
       Run `cargo test -p df-web openapi::tests` — fails until the schema is updated below.
-- [ ] Write the failing test first in `crates/df-web/tests/console.rs`:
+- [x] Write the failing test first in `crates/df-web/tests/console.rs`:
       `an_active_job_is_visible_in_the_queue_and_its_stats`: reuse the `enqueue` helper to
       seed jobs, move one to `active` via `df-core` directly (claim then `activate_job`,
       the same way other console tests seed job state through `df-core` rather than the
@@ -240,12 +240,12 @@ Steps:
       round-tripping — only the OpenAPI *document*, a separately maintained JSON literal,
       needs the update below); that is fine, the assertion is the regression guard going
       forward, and the openapi.rs unit test above is what actually catches schema drift.
-- [ ] Update `crates/df-web/src/routes/jobs.rs`'s `ListJobsQuery.status` doc comment to
+- [x] Update `crates/df-web/src/routes/jobs.rs`'s `ListJobsQuery.status` doc comment to
       `` `pending` | `in-progress` | `active` | `completed` | `failed` ``.
-- [ ] Update `crates/df-web/src/openapi.rs`: add `"active"` to the job status `enum`
+- [x] Update `crates/df-web/src/openapi.rs`: add `"active"` to the job status `enum`
       array (in the `Job` schema, ~line 474); add an `"active": { "type": "integer" }`
       property to the `QueueStats` schema and to its `required` array (~line 523/529).
-- [ ] Run `cargo test -p df-web --test console` and the `openapi` unit tests — all pass.
+- [x] Run `cargo test -p df-web --test console` and the `openapi` unit tests — all pass.
 - [ ] `cargo fmt --all && git add -A && git commit -m "df-web: document the active job status"`
 
 ## Task 4 — `web/`: console UI ⬜

@@ -749,6 +749,53 @@ async fn the_queue_view_lists_filters_and_counts(pool: PgPool) {
     assert_eq!(repo_stats.body["total"], 2);
 }
 
+/// `active` is a `df-core` state the console never sets — it only has to
+/// read it back correctly through the same read-only routes every other
+/// status already goes through.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn an_active_job_is_visible_in_the_queue_and_its_stats(pool: PgPool) {
+    let h = harness(pool);
+    let rob = onboard(&h, "rob@acme.test").await;
+    let acme = org_with_owner(&h, "acme", &rob).await;
+
+    let api: df_core::ids::RepoId = {
+        let created = Call::post("/api/orgs/acme/repos")
+            .with_session(&rob.session)
+            .json(serde_json::json!({ "slug": "api" }))
+            .send(&h.router)
+            .await;
+        created.expect(StatusCode::CREATED);
+        created.body["id"].as_str().unwrap().parse().unwrap()
+    };
+
+    let job = enqueue(&h, acme, api, "activate then check", rob.user).await;
+    {
+        let mut tx = h.db.begin(acme).await.unwrap();
+        tx.claim_jobs(std::slice::from_ref(&job.id), rob.user, Some("agent-one"))
+            .await
+            .unwrap();
+        tx.activate_job(&job.id).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let active = Call::get("/api/orgs/acme/jobs?status=active")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    active.expect(StatusCode::OK);
+    let active_jobs = active.body.as_array().unwrap();
+    assert_eq!(active_jobs.len(), 1);
+    assert_eq!(active_jobs[0]["id"], job.id.to_string());
+
+    let stats = Call::get("/api/orgs/acme/jobs/stats")
+        .with_session(&rob.session)
+        .send(&h.router)
+        .await;
+    stats.expect(StatusCode::OK);
+    assert_eq!(stats.body["active"], 1);
+    assert_eq!(stats.body["inProgress"], 0);
+}
+
 #[sqlx::test(migrations = "../df-core/migrations")]
 async fn a_job_detail_names_what_it_is_waiting_for(pool: PgPool) {
     let h = harness(pool);
