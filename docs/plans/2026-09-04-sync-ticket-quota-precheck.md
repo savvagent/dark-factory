@@ -64,12 +64,12 @@ Steps:
       which this test's setup mirrors). Name it
       `sync_ticket_refuses_before_the_outbound_call_when_over_budget`. Shape:
       - `env_metered(pool, Meter::new(true, UPGRADE_URL))` (enforcement on).
-      - Register a repo, add a job, `link_ticket` it to GitHub with a well-formed
-        `ticket_ref` (e.g. `"acme/api#21"`), `claim_jobs` it — but do **not** configure a
-        GitHub App connection/binding the way
-        `sync_ticket_reports_an_outbound_failure_as_retriable` does NOT configure one
-        either (i.e. reuse that test's "binding present, no App configured" setup so an
-        outbound call, if attempted, would fail with `tracker_sync_failed`).
+      - Set up the DB `tracker_connections`/`tracker_bindings` rows exactly like
+        `sync_ticket_reports_an_outbound_failure_as_retriable` does (`upsert_connection` +
+        `upsert_binding` for `Provider::Github`) — a binding IS present, but the server's
+        GitHub App itself remains unconfigured, so an outbound call, if attempted, fails
+        with `tracker_sync_failed`. Then add a job, `link_ticket` it to GitHub with a
+        well-formed `ticket_ref` (e.g. `"acme/api#21"`), and `claim_jobs` it.
       - Seed `org_period_usage` to exactly `included_ops` (500 for the Free plan, matching
         `enforcement_stops_work_but_never_reads`'s seed) via the same raw `sqlx::query`
         upsert those existing tests use.
@@ -116,8 +116,8 @@ Steps:
       `exhaustive_over` in `df-billing` need no update, since `sync_ticket`'s classification
       is unchanged).
 - [ ] Out-of-band artifacts: none touched (`Dockerfile`, `fly.toml`, `web/`, `web/worker/`,
-      `crates/df-core/migrations/`, `.github/workflows/` all untouched) — vacuously
-      satisfied, state so explicitly in the PR body.
+      `crates/df-core/migrations/`, `.github/workflows/`, `.env.example` all untouched) —
+      vacuously satisfied, state so explicitly in the PR body.
 - [ ] Format and commit: `cargo fmt --all`, then
       `git commit -m "df-billing: add read-only quota pre-check for sync_ticket"` (one
       commit covering `meter.rs`, `server.rs`, `jobs.rs`, and the new test — they must land
