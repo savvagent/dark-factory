@@ -6,6 +6,12 @@ use crate::{Error, Result};
 
 const USER_AGENT: &str = "dark-factory/0.1";
 const MAX_ERROR_BODY_BYTES: usize = 256;
+/// The outbound sync path (Task 4) calls into this client synchronously,
+/// after the job's own transaction has already committed, so a stalled
+/// tracker API would otherwise hold the MCP tool call open indefinitely —
+/// reqwest sets no timeout by default. A bounded timeout turns "the tracker
+/// is down" into a logged, best-effort failure instead of a hung agent call.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// JIRA issue keys are spliced unescaped into REST URL paths below. Unlike
 /// the GitHub side (`parse_github_ticket_ref` strictly splits
@@ -121,14 +127,23 @@ pub struct JiraClient {
 }
 
 impl JiraClient {
-    pub fn new(client_id: String, client_secret: String) -> Self {
-        Self {
+    pub fn new(client_id: String, client_secret: String) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(|source| Error::Http {
+                provider: "JIRA",
+                action: "building the HTTP client",
+                source,
+            })?;
+        Ok(Self {
             client_id,
             client_secret,
-            http: reqwest::Client::new(),
+            http,
             auth_base: "https://auth.atlassian.com".into(),
             api_base: "https://api.atlassian.com".into(),
-        }
+        })
     }
 
     pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<OAuthTokens> {
@@ -443,6 +458,7 @@ mod tests {
     async fn outbound_calls_refuse_a_malformed_issue_key_before_building_a_url() {
         let server = TestServer::start().await;
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
 
         let error = client
@@ -467,6 +483,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
         let tokens = client
             .exchange_code("auth-code", "https://example.com/callback")
@@ -511,6 +528,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
         let tokens = client
             .refresh_access_token("refresh-1")
@@ -550,6 +568,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
         let resources = client
             .accessible_resources("access-1")
@@ -604,6 +623,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
 
         client
@@ -687,6 +707,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
         let error = client
             .accessible_resources("access-1")

@@ -171,7 +171,13 @@ async fn cross_org_ticket_sync_accessors_are_refused(pool: PgPool) {
         .await
         .is_err());
     assert!(tx
-        .close_from_ticket(&acme_job.id, df_core::jobs::Status::Completed, None, None)
+        .close_from_ticket(
+            &acme_job.id,
+            df_core::jobs::Status::Completed,
+            None,
+            None,
+            None,
+        )
         .await
         .is_err());
     assert!(tx

@@ -240,20 +240,15 @@ pub async fn receive(
                                 remote_revision,
                             } => {
                                 if let Some(existing) = existing.as_ref() {
-                                    let closed = tx
-                                        .close_from_ticket(
-                                            &existing.id,
-                                            to,
-                                            result.as_deref(),
-                                            error.as_deref(),
-                                        )
-                                        .await
-                                        .map_err(ApiError::from)?;
-                                    if let Some(remote_revision) = remote_revision.as_deref() {
-                                        tx.set_remote_revision(&closed.id, remote_revision)
-                                            .await
-                                            .map_err(ApiError::from)?;
-                                    }
+                                    tx.close_from_ticket(
+                                        &existing.id,
+                                        to,
+                                        result.as_deref(),
+                                        error.as_deref(),
+                                        remote_revision.as_deref(),
+                                    )
+                                    .await
+                                    .map_err(ApiError::from)?;
                                 }
                             }
                         }

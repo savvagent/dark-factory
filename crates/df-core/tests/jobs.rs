@@ -190,6 +190,7 @@ async fn close_from_ticket_allows_pending_and_in_progress(pool: PgPool) {
             Status::Completed,
             Some("remote complete"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -199,7 +200,13 @@ async fn close_from_ticket_allows_pending_and_in_progress(pool: PgPool) {
         .await
         .unwrap();
     let failed = tx
-        .close_from_ticket(&in_progress.id, Status::Failed, None, Some("remote failed"))
+        .close_from_ticket(
+            &in_progress.id,
+            Status::Failed,
+            None,
+            Some("remote failed"),
+            None,
+        )
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -223,10 +230,84 @@ async fn close_from_ticket_rejects_terminal_jobs(pool: PgPool) {
     tx.complete_job(&job.id, Some("done")).await.unwrap();
 
     let err = tx
-        .close_from_ticket(&job.id, Status::Failed, None, Some("too late"))
+        .close_from_ticket(&job.id, Status::Failed, None, Some("too late"), None)
         .await
         .unwrap_err();
     tx.rollback().await.unwrap();
 
     assert_eq!(err.code(), "wrong_status");
+}
+
+/// `close_from_ticket`'s `remote_revision` param folds the revision stamp
+/// into the same UPDATE as the status transition (mirroring
+/// `update_from_ticket`'s COALESCE), so a ticket close can never leave the
+/// job's status and revision written by two separate statements that could
+/// drift apart.
+#[sqlx::test]
+async fn close_from_ticket_stamps_remote_revision_in_the_same_statement(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let created = tx
+        .create_from_ticket(
+            t.repo,
+            Tracker::Github,
+            "acme/api#99",
+            "closes with revision",
+            None,
+            Some("2026-09-03T12:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    let closed = tx
+        .close_from_ticket(
+            &created.id,
+            Status::Completed,
+            Some("done"),
+            None,
+            Some("2026-09-04T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(closed.status, Status::Completed);
+    assert_eq!(
+        closed.remote_revision.as_deref(),
+        Some("2026-09-04T00:00:00Z")
+    );
+}
+
+/// A `None` remote_revision on close must not clear the previously-recorded
+/// one — the same self-correcting COALESCE semantics as `update_from_ticket`.
+#[sqlx::test]
+async fn close_from_ticket_with_no_revision_preserves_the_existing_one(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let created = tx
+        .create_from_ticket(
+            t.repo,
+            Tracker::Github,
+            "acme/api#100",
+            "closes without a new revision",
+            None,
+            Some("2026-09-03T12:00:00Z"),
+        )
+        .await
+        .unwrap();
+
+    let closed = tx
+        .close_from_ticket(&created.id, Status::Completed, None, None, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        closed.remote_revision.as_deref(),
+        Some("2026-09-03T12:00:00Z")
+    );
 }

@@ -537,6 +537,7 @@ impl Tx<'_> {
         to: Status,
         result: Option<&str>,
         error: Option<&str>,
+        remote_revision: Option<&str>,
     ) -> Result<Job> {
         if !matches!(to, Status::Completed | Status::Failed) {
             return Err(Error::Invalid(format!(
@@ -562,8 +563,14 @@ impl Tx<'_> {
             });
         }
 
+        // `remote_revision` folds into the same statement as the status
+        // transition (COALESCE, matching `update_from_ticket`) rather than a
+        // follow-up `set_remote_revision` call, so a ticket close and its
+        // revision stamp can never drift apart into two partially-applied
+        // writes.
         let job = sqlx::query_as(&format!(
-            "UPDATE jobs SET status = $3, completed_at = now(), result = $4, error = $5 \
+            "UPDATE jobs SET status = $3, completed_at = now(), result = $4, error = $5, \
+                    remote_revision = COALESCE($6, remote_revision) \
              WHERE org_id = $1 AND id = $2 RETURNING {JOB_COLS}"
         ))
         .bind(org)
@@ -571,6 +578,7 @@ impl Tx<'_> {
         .bind(to)
         .bind(result)
         .bind(error)
+        .bind(remote_revision)
         .fetch_one(self.conn())
         .await?;
 

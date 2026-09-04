@@ -405,7 +405,8 @@ impl Factory {
         let sealed = decode_stored_secret(encoded).map_err(|error| error.to_string())?;
         let refresh_token =
             JiraClient::open_refresh_token(&cipher, &sealed).map_err(|error| error.to_string())?;
-        let client = JiraClient::new(client_id, client_secret);
+        let client =
+            JiraClient::new(client_id, client_secret).map_err(|error| error.to_string())?;
         let tokens = client
             .refresh_access_token(&refresh_token)
             .await

@@ -13,6 +13,12 @@ const USER_AGENT: &str = "dark-factory/0.1";
 const JWT_IAT_SKEW_SECONDS: i64 = 30;
 const INSTALLATION_TOKEN_REFRESH_SKEW_SECONDS: i64 = 30;
 const MAX_ERROR_BODY_BYTES: usize = 256;
+/// The outbound sync path (Task 4) calls into this client synchronously,
+/// after the job's own transaction has already committed, so a stalled
+/// GitHub API would otherwise hold the MCP tool call open indefinitely —
+/// reqwest sets no timeout by default. A bounded timeout turns "GitHub is
+/// down" into a logged, best-effort failure instead of a hung agent call.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone, PartialEq, Eq)]
 struct CachedToken {
@@ -75,6 +81,7 @@ impl GithubAppClient {
         let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
             .map_err(Error::InvalidGithubPrivateKey)?;
         let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
             .user_agent(USER_AGENT)
             .build()
             .map_err(|source| Error::Http {
