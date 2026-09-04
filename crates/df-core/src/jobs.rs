@@ -2,7 +2,11 @@
 //!
 //! Every job is anchored to a repo. The lifecycle is
 //! `pending → in-progress → completed | failed`, with `repend` returning a
-//! terminal job to `pending` for one more dispatch.
+//! terminal job to `pending` for one more dispatch. `in-progress` covers both
+//! "claimed" and its optional refinement `active` — a claiming agent may call
+//! `activate_job` to confirm it is actively working right now, but
+//! `complete_job`/`fail_job` accept either as a starting state, so nothing
+//! requires passing through `active` to finish.
 
 use crate::db::Tx;
 use crate::error::{Error, Result};
@@ -20,6 +24,13 @@ pub enum Status {
     #[sqlx(rename = "in-progress")]
     #[serde(rename = "in-progress")]
     InProgress,
+    /// A refinement of `in-progress`: the claiming agent has confirmed it is
+    /// actively working right now, not merely holding the claim. Never set
+    /// or cleared by the server on its own — only an explicit `activate_job`
+    /// call moves a job here, and `complete_job`/`fail_job` accept a job in
+    /// either `in-progress` or `active` as their starting state, so calling
+    /// `activate_job` is optional, not a gate.
+    Active,
     Completed,
     Failed,
 }
@@ -29,6 +40,7 @@ impl Status {
         match self {
             Status::Pending => "pending",
             Status::InProgress => "in-progress",
+            Status::Active => "active",
             Status::Completed => "completed",
             Status::Failed => "failed",
         }
@@ -45,10 +57,12 @@ impl std::str::FromStr for Status {
         match s {
             "pending" => Ok(Status::Pending),
             "in-progress" => Ok(Status::InProgress),
+            "active" => Ok(Status::Active),
             "completed" => Ok(Status::Completed),
             "failed" => Ok(Status::Failed),
             other => Err(Error::Invalid(format!(
-                "unknown status {other:?} (expected pending | in-progress | completed | failed)"
+                "unknown status {other:?} (expected pending | in-progress | active | \
+                 completed | failed)"
             ))),
         }
     }
@@ -121,6 +135,7 @@ pub struct JobFilter {
 pub struct Stats {
     pub pending: i64,
     pub in_progress: i64,
+    pub active: i64,
     pub completed: i64,
     pub failed: i64,
     pub blocked: i64,
@@ -254,7 +269,7 @@ impl Tx<'_> {
     /// ticket_ref (a ticket that closes and reopens gets a fresh job) —
     /// this is for callers who just lost a race against
     /// `jobs_org_repo_tracker_ticket_open_idx`, which allows at most one
-    /// `pending`/`in-progress` row per (repo, tracker, ticket_ref). "Newest
+    /// `pending`/`in-progress`/`active` row per (repo, tracker, ticket_ref). "Newest
     /// created_at" is not the same job as "the live one": `repend_job` can
     /// revive an older job without changing its `created_at`, which could
     /// leave a newer but already-terminal job looking like the conflict
@@ -270,7 +285,7 @@ impl Tx<'_> {
         let job = sqlx::query_as(&format!(
             "SELECT {JOB_COLS} FROM jobs \
              WHERE org_id = $1 AND repo_id = $2 AND tracker = $3 AND ticket_ref = $4 \
-             AND status IN ('pending', 'in-progress') LIMIT 1"
+             AND status IN ('pending', 'in-progress', 'active') LIMIT 1"
         ))
         .bind(org)
         .bind(repo_id)
@@ -621,14 +636,49 @@ impl Tx<'_> {
         Ok(jobs)
     }
 
-    /// Mark an in-progress job completed.
+    /// Mark an in-progress (or active) job completed.
     pub async fn complete_job(&mut self, id: &JobId, result: Option<&str>) -> Result<Job> {
         self.finalize(id, Status::Completed, result, None).await
     }
 
-    /// Mark an in-progress job failed.
+    /// Mark an in-progress (or active) job failed.
     pub async fn fail_job(&mut self, id: &JobId, error: Option<&str>) -> Result<Job> {
         self.finalize(id, Status::Failed, None, error).await
+    }
+
+    /// Confirm a claimed job is being actively worked on, not merely claimed.
+    /// This is a refinement signal only — `complete_job`/`fail_job` accept a
+    /// job in `in-progress` OR `active` as their starting state, so calling
+    /// this is optional, never a gate an agent must pass through to finish
+    /// work.
+    pub async fn activate_job(&mut self, id: &JobId) -> Result<Job> {
+        let org = self.org();
+        let current: Option<Status> =
+            sqlx::query_scalar("SELECT status FROM jobs WHERE org_id = $1 AND id = $2 FOR UPDATE")
+                .bind(org)
+                .bind(id)
+                .fetch_optional(self.conn())
+                .await?;
+
+        let current = current.ok_or_else(|| Error::JobNotFound(id.clone()))?;
+        if current != Status::InProgress {
+            return Err(Error::WrongStatus {
+                job: id.clone(),
+                actual: current.as_str().to_string(),
+                expected: "in-progress".into(),
+            });
+        }
+
+        let job = sqlx::query_as(&format!(
+            "UPDATE jobs SET status = 'active' WHERE org_id = $1 AND id = $2 \
+             RETURNING {JOB_COLS}"
+        ))
+        .bind(org)
+        .bind(id)
+        .fetch_one(self.conn())
+        .await?;
+
+        Ok(job)
     }
 
     async fn finalize(
@@ -647,11 +697,11 @@ impl Tx<'_> {
                 .await?;
 
         let current = current.ok_or_else(|| Error::JobNotFound(id.clone()))?;
-        if current != Status::InProgress {
+        if !matches!(current, Status::InProgress | Status::Active) {
             return Err(Error::WrongStatus {
                 job: id.clone(),
                 actual: current.as_str().to_string(),
-                expected: "in-progress".into(),
+                expected: "in-progress or active".into(),
             });
         }
 
@@ -694,11 +744,14 @@ impl Tx<'_> {
                 .await?;
 
         let current = current.ok_or_else(|| Error::JobNotFound(id.clone()))?;
-        if !matches!(current, Status::Pending | Status::InProgress) {
+        if !matches!(
+            current,
+            Status::Pending | Status::InProgress | Status::Active
+        ) {
             return Err(Error::WrongStatus {
                 job: id.clone(),
                 actual: current.as_str().to_string(),
-                expected: "pending or in-progress".into(),
+                expected: "pending, in-progress, or active".into(),
             });
         }
 
@@ -740,7 +793,7 @@ impl Tx<'_> {
             return Err(Error::WrongStatus {
                 job: id.clone(),
                 actual: "pending".into(),
-                expected: "completed, failed, or in-progress".into(),
+                expected: "completed, failed, in-progress, or active".into(),
             });
         }
 
@@ -970,6 +1023,7 @@ impl Tx<'_> {
             "SELECT \
                COUNT(*) FILTER (WHERE status = 'pending')     AS pending, \
                COUNT(*) FILTER (WHERE status = 'in-progress') AS in_progress, \
+               COUNT(*) FILTER (WHERE status = 'active')      AS active, \
                COUNT(*) FILTER (WHERE status = 'completed')   AS completed, \
                COUNT(*) FILTER (WHERE status = 'failed')      AS failed, \
                COUNT(*) FILTER (WHERE status = 'pending' AND EXISTS ( \

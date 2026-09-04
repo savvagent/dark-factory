@@ -359,6 +359,72 @@ async fn the_full_loop_from_remote_url_to_completed_job(pool: PgPool) {
     assert_eq!(stats["stats"]["pending"], 0);
 }
 
+/// `activate_job` is the agent's explicit signal that a claim has turned into
+/// real work, and it must not disturb the ordinary claim → complete path that
+/// never calls it.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn activating_a_claimed_job_marks_it_active_and_completion_still_works(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    let job = env.add_job(&caller, "activate then complete").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: Some("agent-one".into()),
+            }),
+        )
+        .await);
+
+    let activated = ok(env
+        .factory
+        .activate_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id.clone() }),
+        )
+        .await);
+    assert_eq!(activated["job"]["status"], "active");
+
+    let done = ok(env
+        .factory
+        .complete_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::CompleteJobArgs {
+                job: id,
+                result: Some("done".into()),
+            }),
+        )
+        .await);
+    assert_eq!(done["job"]["status"], "completed");
+}
+
+/// A job that has not been claimed yet has nothing to confirm — `activate_job`
+/// must refuse it rather than silently skip the claim step it exists to
+/// distinguish from.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn activate_job_on_an_unclaimed_job_is_refused(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    let job = env.add_job(&caller, "never claimed").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    let e = err(env
+        .factory
+        .activate_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+    assert_eq!(code_of(&e), "wrong_status");
+    assert!(e.message.contains("in-progress"));
+}
+
 /// Most jobs have no linked ticket. Their hot path must stay the same cheap
 /// queue transition it was before tracker write-back existed.
 #[sqlx::test(migrations = "../df-core/migrations")]
@@ -911,6 +977,7 @@ fn the_advertised_surface_is_exactly_what_the_design_specifies() {
         "update_job",
         "delete_job",
         "claim_jobs",
+        "activate_job",
         "complete_job",
         "fail_job",
         "repend_job",

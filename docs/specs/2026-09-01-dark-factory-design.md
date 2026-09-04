@@ -55,7 +55,7 @@ fork of the TUI and shares no code with it.
 
 | Taken from `manager-mcp` | Dropped |
 |---|---|
-| Job model + lifecycle (`pending → in-progress → completed/failed`) | The TUI, the PTY host, and every hook |
+| Job model + lifecycle (`pending → in-progress → completed/failed`, with an optional `active` refinement of `in-progress`) | The TUI, the PTY host, and every hook |
 | Atomic multi-job `claim` under one transaction | Session rotation / auto-compact controllers |
 | Dependency graph (`ready` / `blocked` / `set_dependencies`) | The activity channel + OTLP session tracking |
 | `LISTEN`/`NOTIFY` + long-poll `watch` change notification | SigV4 `GetCallerIdentity` auth + ARN allowlist |

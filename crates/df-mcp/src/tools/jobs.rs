@@ -1,11 +1,12 @@
 //! Job tools — the queue itself.
 //!
-//! The lifecycle is `pending → in-progress → completed | failed`, with
-//! `repend_job` returning a terminal job to `pending` for one more dispatch.
-//! The one rule an agent has to internalize is that **claiming is what makes
-//! work yours**: `ready` shows what is claimable, `claim_jobs` takes it
-//! atomically, and starting work you have not claimed is how two agents end up
-//! writing the same file.
+//! The lifecycle is `pending → in-progress → completed | failed`, with an
+//! optional `active` refinement of `in-progress` an agent can set once it has
+//! actually started (see `activate_job`) and `repend_job` returning a
+//! terminal job to `pending` for one more dispatch. The one rule an agent has
+//! to internalize is that **claiming is what makes work yours**: `ready`
+//! shows what is claimable, `claim_jobs` takes it atomically, and starting
+//! work you have not claimed is how two agents end up writing the same file.
 
 use df_core::ids::JobId;
 use df_core::jobs::{Job, JobFilter, NewJob, Status, Tracker};
@@ -113,8 +114,8 @@ pub struct JobArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ListJobsArgs {
-    /// Only jobs in this state: "pending", "in-progress", "completed" or
-    /// "failed". Omit for all of them.
+    /// Only jobs in this state: "pending", "in-progress", "active",
+    /// "completed" or "failed". Omit for all of them.
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
@@ -802,6 +803,30 @@ impl Factory {
     }
 
     #[tool(
+        name = "activate_job",
+        description = "Confirm a job you claimed is being actively worked on right now, not \
+                       just claimed. This is what lets a console or API client tell a stalled \
+                       claim apart from real progress — call it once you actually start, not \
+                       at claim time. Optional: complete_job and fail_job both accept a job \
+                       that never called this."
+    )]
+    pub async fn activate_job(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<JobArgs>,
+    ) -> Result<Json<out::JobOut>, ErrorData> {
+        let caller = self.caller(&parts)?;
+        caller.require_scope(scope::JOBS_WRITE).mcp()?;
+
+        let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "activate_job").await?;
+        let job = tx.activate_job(&JobId::from(args.job)).await.mcp()?;
+        tx.commit().await.mcp()?;
+
+        Ok(Json(out::JobOut { job }))
+    }
+
+    #[tool(
         name = "repend_job",
         description = "Return a completed or failed job to pending so it can be claimed again. \
                        The attempt count is preserved, so repeated failures stay visible."
@@ -898,9 +923,9 @@ impl Factory {
 
     #[tool(
         name = "stats",
-        description = "Counts of jobs by state — pending, in-progress, completed, failed, and \
-                       how many of the pending ones are blocked — for the whole organization or \
-                       one repository."
+        description = "Counts of jobs by state — pending, in-progress, active, completed, \
+                       failed, and how many of the pending ones are blocked — for the whole \
+                       organization or one repository."
     )]
     pub async fn stats(
         &self,
@@ -950,15 +975,16 @@ impl Factory {
     #[tool(
         name = "sync_ticket",
         description = "Force an immediate outbound write-back to the ticket a job is linked to, \
-                       reflecting the job's current status (in-progress, completed, or failed) \
-                       as a comment and, where the tracker supports it, a status transition. \
+                       reflecting the job's current status (in-progress, active, completed, or \
+                       failed) as a comment and, where the tracker supports it, a status \
+                       transition. \
                        Use this after link_ticket, when nothing has been posted yet because no \
                        transition has fired since the link was made, or to retry after a \
                        tracker outage — unlike the automatic write-back after claim_jobs, \
                        complete_job and fail_job, this call surfaces a tracker failure as its \
                        own error rather than swallowing it, because talking to the tracker is \
                        the entire point of calling it. Requires the job to already be linked \
-                       via link_ticket and to be in-progress, completed, or failed."
+                       via link_ticket and to be in-progress, active, completed, or failed."
     )]
     pub async fn sync_ticket(
         &self,
@@ -1008,6 +1034,7 @@ impl Factory {
                 .mcp();
             }
             Status::InProgress => (JobTransition::Claimed, job.claimed_by_label.clone()),
+            Status::Active => (JobTransition::Claimed, job.claimed_by_label.clone()),
             Status::Completed => (JobTransition::Completed, job.result.clone()),
             Status::Failed => (JobTransition::Failed, job.error.clone()),
         };

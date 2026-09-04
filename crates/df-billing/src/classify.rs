@@ -66,6 +66,7 @@ pub const BILLABLE: &[&str] = &[
     "update_job",
     "delete_job",
     "claim_jobs",
+    "activate_job",
     "complete_job",
     "fail_job",
     "repend_job",
@@ -162,7 +163,13 @@ mod tests {
 
     #[test]
     fn work_is_billable_and_looking_is_not() {
-        for tool in ["add_job", "claim_jobs", "complete_job", "acquire_lease"] {
+        for tool in [
+            "add_job",
+            "claim_jobs",
+            "activate_job",
+            "complete_job",
+            "acquire_lease",
+        ] {
             assert_eq!(classify(tool), Class::Billable, "{tool}");
         }
         for tool in ["get_job", "ready", "stats", "inbox", "whoami"] {

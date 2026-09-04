@@ -1,0 +1,13 @@
+-- Adds 'active' to job_status: an agent-signaled refinement of 'in-progress'
+-- meaning "claimed AND actively being worked on right now," distinct from a
+-- claim that may have stalled. Additive only — 0003_jobs.sql is never edited;
+-- enum values can only be appended, and ordering here does not matter because
+-- nothing compares job_status by its enum ordinal.
+--
+-- This is its own migration file, separate from 0017's index change, because
+-- Postgres refuses to let a new enum value be *used* (even as a string
+-- literal in a partial index's WHERE clause) in the same transaction that
+-- added it ("unsafe use of new value ... New enum values must be committed
+-- before they can be used") — and sqlx runs each migration file in its own
+-- transaction, so the two steps cannot share one file.
+ALTER TYPE job_status ADD VALUE 'active';

@@ -471,7 +471,7 @@ fn queue_schemas() -> Value {
                 "description": { "type": ["string", "null"] },
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "in-progress", "completed", "failed"],
+                    "enum": ["pending", "in-progress", "active", "completed", "failed"],
                 },
                 "ticketRef": { "type": ["string", "null"], "examples": ["ACME-17"] },
                 "tracker": { "type": ["string", "null"], "enum": ["jira", "github", null] },
@@ -521,12 +521,15 @@ fn queue_schemas() -> Value {
             "properties": {
                 "pending": { "type": "integer" },
                 "inProgress": { "type": "integer" },
+                "active": { "type": "integer" },
                 "completed": { "type": "integer" },
                 "failed": { "type": "integer" },
                 "blocked": { "type": "integer" },
                 "total": { "type": "integer" },
             },
-            "required": ["pending", "inProgress", "completed", "failed", "blocked", "total"],
+            "required": [
+                "pending", "inProgress", "active", "completed", "failed", "blocked", "total",
+            ],
         },
     })
 }
@@ -860,6 +863,39 @@ mod tests {
             Value::Array(items) => items.iter().for_each(|v| collect_refs(v, out)),
             _ => {}
         }
+    }
+
+    /// This is a hand-maintained JSON literal, not generated from
+    /// `df_core::jobs::Status`/`Stats` — nothing else catches it drifting out
+    /// of sync with a status the server actually returns.
+    #[test]
+    fn the_job_schema_and_queue_stats_know_about_active() {
+        let doc = doc();
+        let schemas = &doc["components"]["schemas"];
+
+        let status_enum = schemas["Job"]["properties"]["status"]["enum"]
+            .as_array()
+            .expect("Job.status has no enum array");
+        assert!(
+            status_enum.iter().any(|v| v == "active"),
+            "Job.status.enum is missing \"active\": {status_enum:?}"
+        );
+
+        let stats_props = schemas["QueueStats"]["properties"]
+            .as_object()
+            .expect("QueueStats has no properties object");
+        assert!(
+            stats_props.contains_key("active"),
+            "QueueStats.properties is missing \"active\""
+        );
+
+        let stats_required = schemas["QueueStats"]["required"]
+            .as_array()
+            .expect("QueueStats has no required array");
+        assert!(
+            stats_required.iter().any(|v| v == "active"),
+            "QueueStats.required is missing \"active\": {stats_required:?}"
+        );
     }
 
     /// An endpoint with no summary is an endpoint nobody outside this repo can

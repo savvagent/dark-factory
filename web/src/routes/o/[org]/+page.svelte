@@ -62,6 +62,7 @@
       ? [
           { label: 'Pending', value: stats.pending, tone: 'text-muted' },
           { label: 'In progress', value: stats.inProgress, tone: 'text-busy' },
+          { label: 'Active', value: stats.active, tone: 'text-accent' },
           {
             label: 'Blocked',
             value: stats.blocked,
