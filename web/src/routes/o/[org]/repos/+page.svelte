@@ -2,7 +2,7 @@
   import { api, ApiError } from '$lib/api';
   import { useOrg } from '$lib/org.svelte';
   import { relative, slugPreview } from '$lib/format';
-  import type { Lease, Repo, Team } from '$lib/types';
+  import type { Lease, Repo, Team, TrackerBinding, TrackerProvider } from '$lib/types';
   import Alert from '$lib/components/Alert.svelte';
   import Button from '$lib/components/Button.svelte';
   import Card from '$lib/components/Card.svelte';
@@ -20,7 +20,13 @@
    *
    * Leases are loaded per repo and only when a row is expanded. Fetching every
    * repo's leases up front would be one request per repo on every page load, to
-   * render something nobody had asked to see.
+   * render something nobody had asked to see. The tracker bindings in the same
+   * expander are loaded the same way and for the same reason.
+   *
+   * A binding lives here rather than on a page of its own because it is a fact
+   * about one repo: which project its tickets come from, and what label on an
+   * issue there means "queue this". The connection those bindings hang off is
+   * per-org and lives on the Trackers page.
    */
 
   const org = useOrg();
@@ -33,6 +39,19 @@
 
   let expanded = $state<string | undefined>(undefined);
   let leases = $state<Record<string, Lease[] | 'loading' | 'failed'>>({});
+  let bindings = $state<Record<string, TrackerBinding[] | 'loading' | 'failed'>>({});
+
+  // Keyed by `${repo}:${provider}` so two providers on one repo edit
+  // independently and a third repo's draft never lands in this one's field.
+  let refDraft = $state<Record<string, string>>({});
+  let labelDraft = $state<Record<string, string>>({});
+  let bindingBusy = $state<string | undefined>(undefined);
+  let bindingError = $state<Record<string, string | undefined>>({});
+
+  const PROVIDERS: { provider: TrackerProvider; name: string; hint: string }[] = [
+    { provider: 'github', name: 'GitHub', hint: 'owner/repo' },
+    { provider: 'jira', name: 'JIRA', hint: 'PROJECT KEY' }
+  ];
 
   let showForm = $state(false);
   let slug = $state('');
@@ -79,14 +98,93 @@
       return;
     }
     expanded = repo.slug;
-    if (leases[repo.slug] && leases[repo.slug] !== 'failed') return;
+    void loadLeases(repo.slug);
+    void loadBindings(repo.slug);
+  }
 
-    leases = { ...leases, [repo.slug]: 'loading' };
+  async function loadLeases(slug_: string) {
+    if (leases[slug_] && leases[slug_] !== 'failed') return;
+    leases = { ...leases, [slug_]: 'loading' };
     try {
-      const found = await api.leases(org.slug, repo.slug);
-      leases = { ...leases, [repo.slug]: found };
+      const found = await api.leases(org.slug, slug_);
+      leases = { ...leases, [slug_]: found };
     } catch {
-      leases = { ...leases, [repo.slug]: 'failed' };
+      leases = { ...leases, [slug_]: 'failed' };
+    }
+  }
+
+  async function loadBindings(slug_: string) {
+    if (bindings[slug_] && bindings[slug_] !== 'failed') return;
+    bindings = { ...bindings, [slug_]: 'loading' };
+    try {
+      const found = await api.trackerBindings(org.slug, slug_);
+      bindings = { ...bindings, [slug_]: found };
+      // Seed the drafts from what is stored, so the field an admin edits shows
+      // what is live rather than an empty box beside a bound repo.
+      for (const binding of found) {
+        const key = `${slug_}:${binding.provider}`;
+        refDraft[key] = binding.externalRef;
+        labelDraft[key] = binding.triggerLabel;
+      }
+    } catch {
+      bindings = { ...bindings, [slug_]: 'failed' };
+    }
+  }
+
+  function bindingFor(slug_: string, provider: TrackerProvider): TrackerBinding | undefined {
+    const found = bindings[slug_];
+    return Array.isArray(found) ? found.find((b) => b.provider === provider) : undefined;
+  }
+
+  /**
+   * Re-read after a write rather than patching the local array.
+   *
+   * The server decides two of the fields shown here — the default trigger
+   * label, and whether the binding is `live` — so a locally patched row would
+   * show what was typed instead of what was stored.
+   */
+  async function reloadBindings(slug_: string) {
+    bindings = { ...bindings, [slug_]: 'failed' };
+    await loadBindings(slug_);
+  }
+
+  async function saveBinding(slug_: string, provider: TrackerProvider) {
+    const key = `${slug_}:${provider}`;
+    bindingBusy = key;
+    bindingError = { ...bindingError, [key]: undefined };
+    try {
+      const label = (labelDraft[key] ?? '').trim();
+      await api.bindRepo(org.slug, slug_, provider, {
+        externalRef: (refDraft[key] ?? '').trim(),
+        ...(label ? { triggerLabel: label } : {})
+      });
+      await reloadBindings(slug_);
+    } catch (e) {
+      bindingError = {
+        ...bindingError,
+        [key]: e instanceof ApiError ? e.message : 'Could not save that binding.'
+      };
+    } finally {
+      bindingBusy = undefined;
+    }
+  }
+
+  async function removeBinding(slug_: string, provider: TrackerProvider) {
+    const key = `${slug_}:${provider}`;
+    bindingBusy = key;
+    bindingError = { ...bindingError, [key]: undefined };
+    try {
+      await api.unbindRepo(org.slug, slug_, provider);
+      refDraft[key] = '';
+      labelDraft[key] = '';
+      await reloadBindings(slug_);
+    } catch (e) {
+      bindingError = {
+        ...bindingError,
+        [key]: e instanceof ApiError ? e.message : 'Could not remove that binding.'
+      };
+    } finally {
+      bindingBusy = undefined;
     }
   }
 
@@ -284,6 +382,86 @@
                 <p class="mt-2 text-xs text-faint">
                   Leases are advisory. The server cannot see a git push, so a lease makes a
                   collision visible — it does not prevent one.
+                </p>
+              {/if}
+            </div>
+
+            <div class="border-t border-edge/60 px-4 py-3">
+              <h3 class="text-xs font-semibold tracking-wide text-muted uppercase">Trackers</h3>
+
+              {#if bindings[repo.slug] === 'loading'}
+                <Loading what="Reading tracker bindings" />
+              {:else if bindings[repo.slug] === 'failed'}
+                <Alert>Could not read this repo's tracker bindings.</Alert>
+              {:else}
+                <ul class="mt-2 space-y-3">
+                  {#each PROVIDERS as { provider, name, hint } (provider)}
+                    {@const binding = bindingFor(repo.slug, provider)}
+                    {@const key = `${repo.slug}:${provider}`}
+                    <li>
+                      <div class="flex flex-wrap items-end gap-2">
+                        <span class="w-14 shrink-0 text-sm text-ink">{name}</span>
+
+                        {#if org.isAdmin}
+                          <label class="min-w-0 flex-1">
+                            <span class="sr-only">{name} project</span>
+                            <input
+                              class="df-input df-mono"
+                              placeholder={hint}
+                              bind:value={refDraft[key]}
+                            />
+                          </label>
+                          <label class="w-32 shrink-0">
+                            <span class="sr-only">{name} trigger label</span>
+                            <input
+                              class="df-input df-mono"
+                              placeholder="dark-factory"
+                              bind:value={labelDraft[key]}
+                            />
+                          </label>
+                          <Button
+                            pending={bindingBusy === key}
+                            onclick={() => saveBinding(repo.slug, provider)}
+                          >
+                            {binding ? 'Update' : 'Bind'}
+                          </Button>
+                          {#if binding}
+                            <Button
+                              tone="quiet"
+                              pending={bindingBusy === key}
+                              onclick={() => removeBinding(repo.slug, provider)}
+                            >
+                              Remove
+                            </Button>
+                          {/if}
+                        {:else if binding}
+                          <span class="df-mono text-sm text-muted">{binding.externalRef}</span>
+                          <span class="text-xs text-faint">label {binding.triggerLabel}</span>
+                        {:else}
+                          <span class="text-xs text-faint">not bound</span>
+                        {/if}
+                      </div>
+
+                      {#if binding && !binding.live}
+                        <p class="mt-1 text-xs text-faint">
+                          Stored, but nothing syncs until {name} is connected on the
+                          <a class="underline hover:text-ink" href="/o/{org.slug}/trackers">
+                            Trackers
+                          </a>
+                          page.
+                        </p>
+                      {/if}
+                      {#if bindingError[key]}
+                        <p class="mt-1 text-xs text-rose-400">{bindingError[key]}</p>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
+
+                <p class="mt-3 text-xs text-faint">
+                  An issue in the bound project carrying the trigger label becomes a job in this
+                  repo. GitHub takes <code class="df-mono">owner/repo</code>; JIRA takes a project
+                  key. Both are matched exactly against what the provider sends.
                 </p>
               {/if}
             </div>

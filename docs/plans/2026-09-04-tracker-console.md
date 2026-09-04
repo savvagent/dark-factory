@@ -7,7 +7,7 @@ do not, so this splits into five sub-tasks, server first.
 
 ## Status — 2026-09-04
 
-6.1 ✅ shipped, 6.2 ✅ shipped, 6.3 ✅ shipped, 6.4 ⬜, 6.5 ⬜.
+6.1 ✅ shipped, 6.2 ✅ shipped, 6.3 ✅ shipped, 6.4 ✅ shipped, 6.5 ⬜.
 
 ## Global Constraints
 
@@ -49,6 +49,7 @@ actually collide with:
 | **Modify.** `crates/df-web/tests/console.rs` | route tests: admin-only, cross-org `404`, redaction |
 | **Create.** `web/src/routes/o/[org]/trackers/+page.svelte` | connections page |
 | **Create.** `web/src/routes/trackers/callback/+page.svelte` | provider return page |
+| **Create.** `web/src/lib/trackerState.ts` | the OAuth `state` this browser minted, and the check on return |
 | **Modify.** `web/src/routes/o/[org]/repos/+page.svelte` | per-repo binding editor |
 | **Modify.** `web/src/routes/o/[org]/+layout.svelte` | nav entry |
 | **Modify.** `web/src/lib/api.ts`, `web/src/lib/types.ts` | client methods and types |
@@ -144,21 +145,21 @@ free function taking the OAuth credentials is the likelier shape).
       `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all`. Commit:
       `df-web: tracker connection and binding routes`.
 
-## Task 6.4 — the console UI ⬜
+## Task 6.4 — the console UI ✅
 
 **Files:** `web/src/lib/types.ts`, `web/src/lib/api.ts`,
 `web/src/routes/o/[org]/trackers/+page.svelte` (new),
 `web/src/routes/trackers/callback/+page.svelte` (new),
 `web/src/routes/o/[org]/repos/+page.svelte`, `web/src/routes/o/[org]/+layout.svelte`.
 
-- [ ] Types and `api.ts` methods for the seven endpoints, in the file's existing style.
-- [ ] The trackers page: one card per provider, `org.isAdmin` gating the buttons, the
+- [x] Types and `api.ts` methods for the seven endpoints, in the file's existing style.
+- [x] The trackers page: one card per provider, `org.isAdmin` gating the buttons, the
       deployment's `configured` flag deciding between a connect button and an explanation.
-- [ ] The callback page: nonce check against `sessionStorage` before any `POST`, spinner,
+- [x] The callback page: nonce check against `sessionStorage` before any `POST`, spinner,
       error, then `goto('/o/{org}/trackers')`. Runes only — `$state`/`$derived`/`$effect`.
-- [ ] The repos page: binding editor in the existing row expander, beside the leases.
-- [ ] Nav entry in the org layout.
-- [ ] `npm run check && npm run lint && npm test && npm run build`. Commit:
+- [x] The repos page: binding editor in the existing row expander, beside the leases.
+- [x] Nav entry in the org layout.
+- [x] `npm run check && npm run lint && npm test && npm run build`. Commit:
       `web: connect a tracker and bind a repo to it`.
 
 ## Task 6.5 — drop `trackerBinding` from the console ⬜
