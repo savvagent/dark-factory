@@ -28,7 +28,53 @@ deleted along with TOTP), so no source change is needed there.
 - [x] Update `docs/deploy/cloudflare.md`'s references to emailed links and magic links to
       reflect the current passkey ceremony, annotating the "Verified locally" section as
       predating the removal.
-- [x] Confirm no stale TOTP/magic-link/`LogMailer` comments remain in `crates/df-auth/src/`.
+- [x] Confirm no stale TOTP/magic-link/`LogMailer` comments remain in
+      `crates/df-auth/src/`, `crates/df-core/src/`, `crates/df-web/src/`, and
+      `crates/df-server/src/`. Found and fixed (beyond the task brief's single
+      named file, which no longer exists): stale doc comments in
+      `df-auth::lib`, `df-auth::ratelimit`, `df-auth::error`,
+      `df-core::audit`, `df-core::crypto`, `df-core::invites` (a dead
+      reference to the deleted `df_auth::magic` module), `df-server::config`,
+      `df-web::state`, and `df-web::routes::orgs`; a stale
+      `reset_member_authenticator` name in both the design spec and
+      `CLAUDE.md` (corrected to the actual `reset_member_passkeys`); a stale
+      `df-auth` crate-table entry in `CLAUDE.md`; and a `docs/clients/matrix.md`
+      re-run snippet that would fail today (`enrol TOTP` — no such step
+      exists). All are comment/prose-only; `cargo check --workspace` confirms
+      no behavior changed.
 - [x] `git commit -m "docs: fix doc drift from removing email (#14)"`.
 
-No test/lint/build gate applies — documentation only, no code changed.
+## Task 2 — Fix additional stale comments found by review
+
+The Rust and architecture reviewers on PR #29 found the sweep in Task 1 was incomplete:
+real stale doc comments remained in source outside `docs/`, and the design spec quoted a
+function name (`reset_member_authenticator`) that CLAUDE.md itself still had wrong.
+
+- [x] Fix stale TOTP/magic-link/email doc comments in `crates/df-core/src/audit.rs`,
+      `crates/df-core/src/crypto.rs`, `crates/df-core/src/invites.rs`,
+      `crates/df-server/src/config.rs`, `crates/df-web/src/state.rs`,
+      `crates/df-web/src/routes/orgs.rs`.
+- [x] Fix `reset_member_authenticator` → `reset_member_passkeys` in both
+      `docs/specs/2026-09-01-dark-factory-design.md` and `CLAUDE.md`.
+- [x] Fix the stale `df-auth` crate-table entry in `CLAUDE.md` and the misleading
+      "passkey/token encryption key" phrasing in the design spec.
+- [x] Fix `docs/clients/matrix.md`'s re-run snippet and the milestone plan's "Done means"
+      line, both of which described a TOTP enrollment step that no longer exists.
+- [x] `cargo check --workspace` — confirms the comment-only changes compile.
+- [x] `git commit -m "docs: fix additional stale auth comments found in review (#14)"`.
+
+**Deliberately not fixed here** (flagged as follow-ups, not silently expanded into this
+docs-only change): `crates/df-core/src/audit.rs`'s `action::TOTP_ENROLLED` /
+`action::TOTP_RESET` constants are still emitted by real passkey-enrollment/reset code
+paths, so production audit rows and SIEM exports currently read `auth.totp.enrolled` /
+`auth.totp.reset` for passkey events — renaming them is the file's own definition of a
+breaking change and needs its own spec. `action::MAGIC_LINK_SENT`,
+`action::MAGIC_LINK_CONSUMED`, `action::RECOVERY_CODE_USED`, and `action::EMAIL_VERIFIED`
+appear to be dead code (no remaining callers). `df-auth`'s and `df-web`'s `Cargo.toml` both
+still depend on `totp-rs`, unused by any remaining source. `totp_issuer` config
+(`DF_TOTP_ISSUER`) is plumbed through `df-server` → `df-web` but read by nothing since TOTP
+was replaced by passkeys. All three are dependency/config/audit-trail changes, not
+documentation, and each needs its own decision about backward compatibility.
+
+No test/lint/build gate applies beyond `cargo check --workspace` — documentation and
+comments only, no behavior changed.

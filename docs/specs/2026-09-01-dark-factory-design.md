@@ -249,7 +249,7 @@ Details that matter:
 - **Recovery** is a second passkey: the console pushes for one from the moment there is
   one, and removing a credential is refused when it is the last one. There is no recovery
   code and no emailed link — dark-factory sends no mail at all. An org admin clearing a
-  member's credential (`reset_member_authenticator`) is the only assisted path, and it
+  member's credential (`reset_member_passkeys`) is the only assisted path, and it
   issues a claim code in the same operation it clears the keys, so the account is never
   left both keyless and unclaimed.
 - Nothing is submitted before a ceremony, so there is nothing to answer differently about —
@@ -373,8 +373,8 @@ SvelteKit 2 / Svelte 5 (runes) / Tailwind v4, talking only to `df-web`:
 ## Deployment
 
 A single container image, Postgres, nothing else stateful. Migrations run at startup under
-an advisory lock so concurrent replicas are safe. Secrets (DB URL, passkey/token encryption
-key, OAuth signing key, Stripe key, GitHub App private key) come from the environment. Target:
+an advisory lock so concurrent replicas are safe. Secrets (DB URL, encryption key for
+secrets at rest, OAuth signing key, Stripe key, GitHub App private key) come from the environment. Target:
 Fly.io or ECS behind a TLS terminator; Neon or Aurora for Postgres.
 
 ## Testing

@@ -7,7 +7,7 @@
 //!   transaction as the change itself, so an action and its record commit or
 //!   abort together and the trail can never disagree with reality.
 //! - [`Db::audit_global`] for events that precede any org context: login
-//!   attempts, TOTP enrollment, email verification.
+//!   attempts, passkey enrollment.
 //!
 //! Actions are dotted and stable because they are queried by prefix and because
 //! they end up in customers' SIEM exports. Renaming one is a breaking change.
@@ -181,8 +181,8 @@ impl Tx<'_> {
 }
 
 impl Db {
-    /// Record an event with no org context — a login attempt, a TOTP
-    /// enrollment, an email verification.
+    /// Record an event with no org context — a login attempt, a passkey
+    /// enrollment.
     ///
     /// Best-effort by design: this returns `Result`, but callers on the failed-
     /// login path should log an error and continue rather than turning an audit

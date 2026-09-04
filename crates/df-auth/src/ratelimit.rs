@@ -1,9 +1,10 @@
 //! Attempt throttling with exponential lockout.
 //!
-//! A six-digit TOTP code has a million possibilities and a ~90-second
-//! acceptance window. Without throttling that is guessable by brute force in
-//! minutes; with it, it is not guessable at all. This is not an optional
-//! hardening pass — it is what makes a 6-digit second factor safe.
+//! A passkey ceremony is cryptographic, not a guessable secret, but the login
+//! endpoint that resolves it is still a network-reachable surface: without
+//! throttling nothing stops a flood of forged or replayed authentication
+//! attempts, or spamming a passkey-reset/claim flow. This is not an optional
+//! hardening pass — it is what keeps the surface safe under abuse.
 //!
 //! Buckets are opaque strings so one table serves per-user, per-email, and
 //! per-IP limits. **Always throttle on both an identity key and the source IP**:
