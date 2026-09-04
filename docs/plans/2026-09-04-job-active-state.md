@@ -41,14 +41,15 @@ Not started. All four tasks below are ⬜.
 |---|---|
 | Create. `crates/df-core/migrations/0016_job_active_status.sql` | Adds `'active'` to `job_status`; widens `jobs_org_repo_tracker_ticket_open_idx` to include it. |
 | Modify. `crates/df-core/src/jobs.rs` | `Status::Active`; `activate_job`; `finalize`/`close_from_ticket`/`repend_job` messaging; `get_live_job_by_ticket_for_repo`; `Stats.active` + query; lifecycle doc comment. |
-| Modify. `crates/df-core/tests/queue.rs` | Cover the new transition, the widened finalize/close_from_ticket starting states, the ticket-uniqueness regression, and the `stats` counter. |
+| Modify. `crates/df-core/tests/queue.rs` | Cover the new transition (`activate_job`), the widened `finalize` starting states, and the `stats` counter. |
+| Modify. `crates/df-core/tests/jobs.rs` | Cover the widened `close_from_ticket` starting states and the ticket-uniqueness regression (`link_ticket` against an `active` live holder). |
 | Modify. `crates/df-mcp/src/tools/jobs.rs` | New `activate_job` tool; `sync_ticket`'s `Status` match; tool descriptions naming `active`; lifecycle doc comment. |
 | Modify. `crates/df-mcp/tests/tools.rs` | Add `activate_job` to the advertised-surface list; end-to-end tests for the new tool and the widened `complete_job`/`fail_job` starting states. |
 | Modify. `crates/df-billing/src/classify.rs` | Add `"activate_job"` to `BILLABLE`. |
 | Modify. `crates/df-web/src/routes/jobs.rs` | `ListJobsQuery.status` doc comment. |
-| Modify. `crates/df-web/src/openapi.rs` | Job status `enum`; `Stats` schema `active` property. |
+| Modify. `crates/df-web/src/openapi.rs` | Job status `enum`; `QueueStats` schema `active` property; a unit test asserting both. |
 | Modify. `crates/df-web/tests/console.rs` | A job moved to `active` round-trips through the queue list and stats endpoints. |
-| Modify. `web/src/lib/types.ts` | `JobStatus`, `Stats.active`. |
+| Modify. `web/src/lib/types.ts` | `JobStatus`, `QueueStats.active`. |
 | Modify. `web/src/lib/components/StatusPill.svelte` | `active` tone (`--color-accent`). |
 | Modify. `web/src/routes/o/[org]/queue/+page.svelte` | `STATUSES` list. |
 | Modify. `web/src/routes/o/[org]/+page.svelte` | Overview "Active" stat tile. |
@@ -69,12 +70,14 @@ Not started. All four tasks below are ⬜.
 ## Task 1 — `df-core`: the `active` status ⬜
 
 **Files:** `crates/df-core/migrations/0016_job_active_status.sql`,
-`crates/df-core/src/jobs.rs`, `crates/df-core/tests/queue.rs`
+`crates/df-core/src/jobs.rs`, `crates/df-core/tests/queue.rs`,
+`crates/df-core/tests/jobs.rs`
 
 **Interfaces:**
 - Produces: `Status::Active`; `Tx::activate_job(&mut self, id: &JobId) -> Result<Job>`;
   `Stats.active: i64`.
-- Consumes: existing `Error::WrongStatus`, `Error::JobNotFound`, `JOB_COLS`.
+- Consumes: existing `Error::WrongStatus`, `Error::JobNotFound`, `Error::TicketAlreadyLinked`,
+  `JOB_COLS`.
 
 Steps:
 
@@ -87,25 +90,30 @@ Steps:
   - `completing_or_failing_an_active_job_still_works`: claim, activate, then
     `complete_job` — assert `status == Status::Completed`. Separately (new job),
     claim, activate, then `fail_job` — assert `status == Status::Failed`. Also assert
-    the existing direct `in-progress → completed` path (no `activate_job` call) still
-    works, so the new state is additive rather than a new mandatory gate.
-  - Extend `stats_counts_blocked_separately` (or add a sibling test) to activate one job
-    and assert `stats.active == 1` alongside the existing `pending`/`in_progress`/
-    `completed`/`failed`/`blocked`/`total` assertions.
-  - `an_active_ticket_linked_job_still_blocks_a_duplicate`: create a job with a
-    `ticket_ref`/`tracker` set (mirror `link_ticket_refuses_a_ticket_another_job_already_holds`'s
-    setup, or the equivalent `df-core`-level helper already used in `queue.rs`), claim
-    and activate it, then attempt to insert a second job for the same
-    `(repo_id, tracker, ticket_ref)` and assert the unique-index violation still fires —
-    the regression the spec critique surfaced. If `queue.rs` has no existing ticket-ref
-    helper, add the job directly via `tx.add_job` with `ticket_ref`/`tracker` set on
-    `NewJob` and a second `tx.add_job` call for the conflicting one, asserting the second
-    returns an error (check how `add_job` surfaces a unique-constraint violation today —
-    follow the same pattern `link_ticket`'s equivalent test uses, e.g. via
-    `crates/df-mcp/tests/tools.rs::link_ticket_refuses_a_ticket_another_job_already_holds`
-    for the shape of the expected error if `df-core` doesn't already have one).
+    the existing direct `in-progress → completed` path (no `activate_job` call, as
+    `lifecycle_pending_to_completed` already does) still works unchanged, so the new
+    state is additive rather than a new mandatory gate.
+  - Extend `stats_counts_blocked_separately` (or add a sibling test right after it) to
+    activate one job and assert `stats.active == 1` alongside the existing `pending`/
+    `in_progress`/`completed`/`failed`/`blocked`/`total` assertions.
   - Run `cargo test -p df-core --test queue` — expect compile failures (`Status::Active`,
     `activate_job` don't exist yet) or the new assertions failing.
+- [ ] Write the failing tests first in `crates/df-core/tests/jobs.rs` (this file, not
+      `queue.rs`, is where `close_from_ticket` and the ticket-uniqueness/live-holder tests
+      already live — see `close_from_ticket_allows_pending_and_in_progress` and
+      `link_ticket_conflict_names_the_live_holder_not_a_newer_terminal_job`):
+  - `close_from_ticket_allows_active`: mirror
+    `close_from_ticket_allows_pending_and_in_progress`'s setup, but claim the job, call
+    `tx.activate_job`, then `close_from_ticket(&job.id, Status::Completed, ...)` from
+    `Active` and assert it succeeds.
+  - `link_ticket_on_a_ticket_an_active_job_holds_returns_ticket_already_linked`: mirror
+    `link_ticket_on_a_ticket_another_live_job_holds_returns_ticket_already_linked`'s setup
+    exactly, but claim and `activate_job` the holder before the second job attempts
+    `link_ticket` against the same `ticket_ref`. Assert `Error::TicketAlreadyLinked` names
+    the holder — this is the ticket-dedupe regression the spec critique surfaced: an
+    `active` job must still read as "live" to `get_live_job_by_ticket_for_repo`.
+  - Run `cargo test -p df-core --test jobs` — expect compile/assertion failures until
+    Task 1's `jobs.rs` changes land.
 - [ ] Create `crates/df-core/migrations/0016_job_active_status.sql` exactly as specified
       in the spec's §1 (adds `'active'` to `job_status`; drops and recreates
       `jobs_org_repo_tracker_ticket_open_idx` to include `'active'` in its `WHERE`
@@ -138,7 +146,8 @@ Steps:
     `` `pending → in-progress → completed | failed`, with `repend` returning a `` to
     reflect the new `active` refinement (e.g. mention `in-progress` covers both "claimed"
     and its `active` refinement).
-- [ ] Run `cargo test -p df-core --test queue` — all pass.
+- [ ] Run `cargo test -p df-core --test queue` and `cargo test -p df-core --test jobs` —
+      all pass.
 - [ ] Run `cargo test -p df-core --test isolation` — unaffected, confirm still green (no
       tenant-table shape changed).
 - [ ] `cargo fmt --all && git add -A && git commit -m "df-core: add active job status"`
@@ -179,7 +188,11 @@ Steps:
   - Extend `sync_ticket`'s `match job.status` with
     `Status::Active => (JobTransition::Claimed, job.claimed_by_label.clone())`.
   - Update `ListJobsArgs.status`'s doc comment, `list_jobs`'s tool description, and
-    `stats`'s tool description to list `active` among the valid values.
+    `stats`'s tool description to list `active` among the valid values. Also update
+    `sync_ticket`'s tool description (currently enumerates
+    `"(in-progress, completed, or failed)"` and
+    `"to be in-progress, completed, or failed"`) to include `active`, since
+    `Status::Active` is now a valid starting state for it (§3's match extension).
   - Update the module doc comment (near line 3) the same way as Task 1's `jobs.rs`
     change.
 - [ ] In `crates/df-billing/src/classify.rs`: add `"activate_job"` to the `BILLABLE`
@@ -203,24 +216,28 @@ Steps:
 
 Steps:
 
+- [ ] Write the failing test first in `crates/df-web/src/openapi.rs`'s existing
+      `#[cfg(test)] mod tests` block (alongside its other schema assertions): a test
+      asserting the job status `enum` array in the `Job` schema contains `"active"`, and
+      that the `QueueStats` schema's `properties`/`required` both contain `"active"`.
+      Run `cargo test -p df-web openapi::tests` — fails until the schema is updated below.
 - [ ] Write the failing test first in `crates/df-web/tests/console.rs`:
-  `an_active_job_is_visible_in_the_queue_and_its_stats`: reuse the `enqueue` helper to
-  seed jobs, move one to `active` via `df-core` directly (claim then activate, the same
-  way other console tests seed job state through `df-core` rather than the console API),
-  then assert `GET /api/orgs/{org}/jobs?status=active` returns exactly that job and
-  `GET /api/orgs/{org}/jobs/stats` reports `"active": 1`. Run
-  `cargo test -p df-web --test console an_active_job` — fails (status filter/JSON field
-  don't round-trip through the OpenAPI-documented shape yet only because the value is
-  new, not because of a code bug — confirm the actual failure mode before assuming; if
-  `Status::from_str`/`Stats` already handle it end-to-end from Task 1, this test may pass
-  immediately, which is fine — the assertion is the regression guard going forward, not a
-  new behavior).
+      `an_active_job_is_visible_in_the_queue_and_its_stats`: reuse the `enqueue` helper to
+      seed jobs, move one to `active` via `df-core` directly (claim then `activate_job`,
+      the same way other console tests seed job state through `df-core` rather than the
+      console API), then assert `GET /api/orgs/{org}/jobs?status=active` returns exactly
+      that job and `GET /api/orgs/{org}/jobs/stats` reports `"active": 1`. Run
+      `cargo test -p df-web --test console an_active_job` — this may already pass once
+      Task 1 lands (nothing in `df-web`'s Rust code needs to change for `Status`/`Stats`
+      round-tripping — only the OpenAPI *document*, a separately maintained JSON literal,
+      needs the update below); that is fine, the assertion is the regression guard going
+      forward, and the openapi.rs unit test above is what actually catches schema drift.
 - [ ] Update `crates/df-web/src/routes/jobs.rs`'s `ListJobsQuery.status` doc comment to
       `` `pending` | `in-progress` | `active` | `completed` | `failed` ``.
 - [ ] Update `crates/df-web/src/openapi.rs`: add `"active"` to the job status `enum`
-      array (line ~474); add an `"active": { "type": "integer" }` property to the
-      `Stats` schema and to its `required` array (line ~523/529).
-- [ ] Run `cargo test -p df-web --test console` — all pass.
+      array (in the `Job` schema, ~line 474); add an `"active": { "type": "integer" }`
+      property to the `QueueStats` schema and to its `required` array (~line 523/529).
+- [ ] Run `cargo test -p df-web --test console` and the `openapi` unit tests — all pass.
 - [ ] `cargo fmt --all && git add -A && git commit -m "df-web: document the active job status"`
 
 ## Task 4 — `web/`: console UI ⬜
@@ -234,8 +251,8 @@ Steps:
 Steps:
 
 - [ ] `web/src/lib/types.ts`: add `'active'` to the `JobStatus` union (between
-      `'in-progress'` and `'completed'`); add `active: number;` to the `Stats` interface
-      (between `inProgress` and `completed`).
+      `'in-progress'` and `'completed'`); add `active: number;` to the `QueueStats`
+      interface (between `inProgress` and `completed`).
 - [ ] `web/src/lib/components/StatusPill.svelte`: add
       `active: 'border-accent/50 bg-accent/10 text-accent'` to `tones`, matching the
       existing entries' shape.
@@ -249,9 +266,10 @@ Steps:
 - [ ] Run `cd web && npm run lint` — passes.
 - [ ] Run `cd web && npm test` — passes unchanged (no Worker routing change).
 - [ ] Run `cd web && npm run build` — succeeds.
-- [ ] `cargo fmt --all` is a no-op here (no Rust changed) — skip. Format the `web/`
-      changes with the repo's existing prettier config via `npm run lint -- --write` if
-      needed, then:
+- [ ] No Rust changed in this task, so `cargo fmt --all` is a no-op here — skip it. If
+      the edits need reformatting, run `cd web && npm run format` (prettier --write),
+      matching `web/package.json`'s actual script (not `npm run lint -- --write`, which
+      is not how this repo's formatter is invoked), then:
       `git add -A && git commit -m "web: show the active job status in the console"`
 
 ## Task 5 — Docs ⬜
