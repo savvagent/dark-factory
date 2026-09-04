@@ -13,7 +13,7 @@ no AI attribution, forward-only migrations) intact.
 ## Status — 2026-09-03
 
 Task 1 ✅ shipped (PR #18). Task 2 ✅ shipped (PR #20). Task 3 ✅ shipped (PR #22).
-Task 4 ✅ shipped (PR #24). Tasks 5–6 ⬜, not started.
+Task 4 ✅ shipped (PR #24). Task 5 ✅ shipped (PR #26). Task 6 ⬜, not started.
 
 ## Global Constraints
 
@@ -358,7 +358,7 @@ webhooks.rs` (call the inbound half inside the existing per-request `Tx`);
       `cargo test -p df-web`, `cargo test --workspace`, clippy, fmt.
 - [ ] Commit.
 
-## Task 5 — `link_ticket` / `sync_ticket` MCP tools ⬜
+## Task 5 — `link_ticket` / `sync_ticket` MCP tools ✅ (PR #26)
 
 **Spec:** `docs/specs/2026-09-03-df-trackers-design.md` §7 — read it first, it resolves
 the per-job-vs-repo-binding question and specifies exact error/billing/output shapes.
