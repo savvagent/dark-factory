@@ -57,11 +57,11 @@ response shape. No version bump is required.
   existing single-`job` shape), updated tool descriptions listing `active` among valid
   states, and the `sync_ticket` status match extended to handle `Status::Active`.
 - `crates/df-billing/src/classify.rs`: classify `activate_job` as billable.
-- `crates/df-web`: `openapi.rs` status enum + `Stats` schema, `routes/jobs.rs` doc
+- `crates/df-web`: `openapi.rs` status enum + `QueueStats` schema, `routes/jobs.rs` doc
   comments listing valid `status` query values.
 - `web/`: `JobStatus` type, `StatusPill` tone, queue page's status filter list, and the
   overview page's stat tiles gain an `active` entry.
-- Tests: `crates/df-core/tests/queue.rs`, `crates/df-mcp/tests/tools.rs`,
+- Tests: `crates/df-core/tests/queue.rs` and `tests/jobs.rs`, `crates/df-mcp/tests/tools.rs`,
   `crates/df-web/tests/console.rs`, and `web/` type-checking (`npm run check`) all cover
   the new state.
 - Doc updates: the four lifecycle-diagram comments found in `jobs.rs` (both crates) and
@@ -274,15 +274,16 @@ description are updated to list `active` among the valid values (currently: "pen
 
 - `routes/jobs.rs`'s `ListJobsQuery.status` doc comment: `` `pending` | `in-progress` |
   `active` | `completed` | `failed` ``.
-- `openapi.rs`: the job status `enum` array gains `"active"`; the `Stats` schema gains an
-  `"active": { "type": "integer" }` property, added to `required` alongside the others.
+- `openapi.rs`: the job status `enum` array gains `"active"`; the `QueueStats` schema
+  gains an `"active": { "type": "integer" }` property, added to `required` alongside the
+  others.
 
 No route changes — the console stays read-only over the queue; `active` is just another
 value the existing `GET` endpoints pass through.
 
 ## §6 — `web/`
 
-- `src/lib/types.ts`: `JobStatus` gains `'active'`; the `Stats` interface gains
+- `src/lib/types.ts`: `JobStatus` gains `'active'`; the `QueueStats` interface gains
   `active: number`.
 - `src/lib/components/StatusPill.svelte`: `tones` gains an `active` entry using the
   existing `--color-accent` theme token (`web/src/app.css`) — `border-accent/50
@@ -302,11 +303,14 @@ value the existing `GET` endpoints pass through.
   `complete_job`/`fail_job` succeed directly from `in-progress` (unchanged path) and also
   from `active` (new path); a test that `activate_job` on a `pending` or already-
   `completed`/`failed`/`active` job returns `WrongStatus` naming `"in-progress"` as
-  expected; a `stats()` test asserting the new `active` counter; a test that a
-  ticket-linked job moved to `active` still blocks a second job for the same
-  (repo, tracker, ticket_ref) via `jobs_org_repo_tracker_ticket_open_idx`
-  (a duplicate insert violates the unique index) — the regression the spec critique
-  surfaced.
+  expected; a `stats()` test asserting the new `active` counter.
+- `crates/df-core/tests/jobs.rs` (where `close_from_ticket`'s and the ticket-uniqueness/
+  live-holder tests already live): `close_from_ticket` succeeding from `Active`; and a
+  test that a ticket-linked job moved to `active` still reads as the *live* holder of its
+  `ticket_ref` — `link_ticket` from a second job against the same ref returns
+  `Error::TicketAlreadyLinked` naming the active job, proving
+  `jobs_org_repo_tracker_ticket_open_idx` and `get_live_job_by_ticket_for_repo` both
+  still treat `active` as open — the regression the spec critique surfaced.
 - `crates/df-mcp/tests/tools.rs`: `activate_job` end-to-end (claim → activate → assert
   status), `activate_job` rejected on an unclaimed job, `complete_job`/`fail_job` still
   passing without a prior `activate_job` call, and `activate_job` appearing in the tool
