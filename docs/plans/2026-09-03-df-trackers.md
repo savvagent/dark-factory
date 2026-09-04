@@ -259,7 +259,7 @@ design — verified by signature instead of a session/token) plus its handler mo
 - [ ] `cargo test -p df-core`, `cargo test -p df-trackers`, `cargo test -p df-web`, clippy, fmt.
 - [ ] Commit.
 
-## Task 4 — Two-way sync engine ✅
+## Task 4 — Two-way sync engine ✅ (PR #24)
 
 **Spec:** see §6 ("Two-way sync engine") in `docs/specs/2026-09-03-df-trackers-design.md`
 — read it first. It resolves the design decisions this checklist originally deferred:

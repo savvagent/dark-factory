@@ -1,7 +1,7 @@
 # df-trackers design — Milestone 2: GitHub App + JIRA two-way sync
 
 > **Status:** DRAFT — schema foundation, GitHub App/JIRA clients, webhook ingest
-> (including the org-resolution design in §5a), and the two-way sync engine (§6)
+> (including the org-resolution design in §5a), and the two-way sync engine (§6) are
 > implemented; the `link_ticket`/`sync_ticket` MCP tools and the console UI for
 > connections/bindings remain.
 > **Implements:** the "Tracker integration (two-way)" and "Trackers — `link_ticket`,
