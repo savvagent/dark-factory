@@ -56,6 +56,19 @@ pub struct Config {
     /// Shared secret for GitHub webhook signature verification. Optional
     /// because GitHub integration itself is optional per deployment.
     pub github_app_webhook_secret: Option<String>,
+    /// The GitHub App's URL slug, used to build the installation link the
+    /// console sends an admin to (`github.com/apps/{slug}/installations/new`).
+    /// Optional for the same reason as the rest; the console offers no Connect
+    /// GitHub button without it, rather than linking somewhere that 404s.
+    pub github_app_slug: Option<String>,
+    /// The GitHub App's OAuth client id and secret — the *user*-to-server
+    /// credentials, distinct from `github_app_private_key`, which is the
+    /// server-to-server one. The console needs these to prove that the admin
+    /// binding an installation id actually administers that installation; see
+    /// `docs/specs/2026-09-04-tracker-console-design.md` §2 for why an
+    /// unverified installation id is a cross-tenant escalation.
+    pub github_app_client_id: Option<String>,
+    pub github_app_client_secret: Option<String>,
     /// Atlassian OAuth client id for JIRA tracker sync. Optional because JIRA
     /// integration itself is optional per deployment.
     pub jira_client_id: Option<String>,
@@ -141,6 +154,9 @@ impl Config {
             github_app_private_key: optional("DF_GITHUB_APP_PRIVATE_KEY")
                 .map(normalize_pem_newlines),
             github_app_webhook_secret: optional("DF_GITHUB_APP_WEBHOOK_SECRET"),
+            github_app_slug: optional("DF_GITHUB_APP_SLUG"),
+            github_app_client_id: optional("DF_GITHUB_APP_CLIENT_ID"),
+            github_app_client_secret: optional("DF_GITHUB_APP_CLIENT_SECRET"),
             jira_client_id: optional("DF_JIRA_CLIENT_ID"),
             jira_client_secret: optional("DF_JIRA_CLIENT_SECRET"),
 
@@ -255,6 +271,9 @@ impl Config {
             github_app_id: None,
             github_app_private_key: None,
             github_app_webhook_secret: None,
+            github_app_slug: None,
+            github_app_client_id: None,
+            github_app_client_secret: None,
             jira_client_id: None,
             jira_client_secret: None,
             client_ip_header: None,

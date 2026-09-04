@@ -101,6 +101,13 @@ fn web_config(config: &Config) -> df_web::Config {
     let mut web = df_web::Config::new(&config.public_url, &config.resource_uri);
     web.totp_issuer = config.totp_issuer.clone();
     web.github_app_webhook_secret = config.github_app_webhook_secret.clone();
+    // The tracker console needs all five to take an admin through connecting a
+    // provider: the slug and the OAuth pair for GitHub, the OAuth pair for JIRA.
+    web.github_app_slug = config.github_app_slug.clone();
+    web.github_app_client_id = config.github_app_client_id.clone();
+    web.github_app_client_secret = config.github_app_client_secret.clone();
+    web.jira_client_id = config.jira_client_id.clone();
+    web.jira_client_secret = config.jira_client_secret.clone();
     web.client_ip_header = config.client_ip_header.clone();
     // The console reports this as `enforced` on the usage endpoint. It has to be
     // the same value `df-mcp` is refusing calls with, or a customer whose agent
@@ -181,6 +188,11 @@ mod tests {
         let mut config = Config::for_test();
         config.totp_issuer = "acme-factory".into();
         config.github_app_webhook_secret = Some("webhook-secret".into());
+        config.github_app_slug = Some("dark-factory".into());
+        config.github_app_client_id = Some("gh-client".into());
+        config.github_app_client_secret = Some("gh-secret".into());
+        config.jira_client_id = Some("jira-client".into());
+        config.jira_client_secret = Some("jira-secret".into());
         config.client_ip_header = Some("cf-connecting-ip".into());
         config.enforce_quotas = true;
 
@@ -192,6 +204,10 @@ mod tests {
             Some("webhook-secret")
         );
         assert_eq!(web.client_ip_header.as_deref(), Some("cf-connecting-ip"));
+        assert!(
+            web.github_tracker_configured() && web.jira_tracker_configured(),
+            "the tracker console cannot connect a provider it was never told the credentials for"
+        );
         assert!(
             web.enforce_quotas,
             "df-web was left with the default while df-mcp refuses billable calls"

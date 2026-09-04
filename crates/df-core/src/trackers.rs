@@ -289,6 +289,23 @@ pub async fn get_connection(
     row.map(validate_connection).transpose()
 }
 
+/// Every tracker connection this org holds, ordered by provider.
+///
+/// The console's tracker page renders one card per provider, and a listing that
+/// came back in Postgres's row order would reorder those cards whenever a row
+/// was rewritten. Ordering here rather than in the console keeps the two
+/// providers' cards in one place instead of two.
+pub async fn list_connections(tx: &mut Tx<'_>) -> Result<Vec<TrackerConnection>> {
+    let rows: Vec<TrackerConnectionRow> = sqlx::query_as(&format!(
+        "SELECT {CONNECTION_COLS} FROM tracker_connections WHERE org_id = $1 ORDER BY provider"
+    ))
+    .bind(tx.org())
+    .fetch_all(tx.conn())
+    .await?;
+
+    rows.into_iter().map(validate_connection).collect()
+}
+
 pub async fn delete_connection(tx: &mut Tx<'_>, provider: Provider) -> Result<()> {
     sqlx::query("DELETE FROM tracker_connection_index WHERE org_id = $1 AND provider = $2")
         .bind(tx.org())
@@ -376,6 +393,28 @@ pub async fn get_binding(
     .fetch_optional(tx.conn())
     .await?;
     Ok(binding)
+}
+
+/// Every binding on one repo, ordered by provider.
+///
+/// `org_id` is bound alongside `repo_id` even though `UNIQUE (repo_id, provider)`
+/// makes the repo id alone unambiguous: a repo id is a uuid, and a console
+/// caller who guessed one would otherwise read back the JIRA project key of
+/// another tenant's repo. Guard 1 does not get to lean on the fact that
+/// guessing is hard.
+pub async fn list_bindings_for_repo(
+    tx: &mut Tx<'_>,
+    repo_id: RepoId,
+) -> Result<Vec<TrackerBinding>> {
+    let bindings = sqlx::query_as(&format!(
+        "SELECT {BINDING_COLS} FROM tracker_bindings \
+         WHERE org_id = $1 AND repo_id = $2 ORDER BY provider"
+    ))
+    .bind(tx.org())
+    .bind(repo_id)
+    .fetch_all(tx.conn())
+    .await?;
+    Ok(bindings)
 }
 
 pub async fn delete_binding(tx: &mut Tx<'_>, binding_id: uuid::Uuid) -> Result<()> {
