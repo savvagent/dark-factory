@@ -1,6 +1,6 @@
 # Job `active` state design
 
-> **Status:** DRAFT — adds an `active` job state between `in-progress` (claimed) and
+> **Status:** IMPLEMENTED — adds an `active` job state between `in-progress` (claimed) and
 > `completed`/`failed`, closing savvagent/dark-factory#13.
 
 ## Goal & Success Criteria

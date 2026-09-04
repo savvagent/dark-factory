@@ -12,7 +12,7 @@ claim apart from real progress. `completed`/`failed` remain the only terminal st
 
 ## Status — 2026-09-04
 
-Not started. All four tasks below are ⬜.
+Implemented. All five tasks and the final gate are ✅.
 
 ## Global Constraints
 
@@ -294,7 +294,7 @@ Steps:
 
 ## Final gate (all tasks)
 
-- [ ] `cargo test --workspace`
-- [ ] `cargo clippy --all-targets -- -D warnings`
-- [ ] `cargo fmt --all --check`
-- [ ] `cd web && npm run check && npm run lint && npm test && npm run build`
+- [x] `cargo test --workspace`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo fmt --all --check`
+- [x] `cd web && npm run check && npm run lint && npm test && npm run build`
