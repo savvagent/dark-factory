@@ -96,6 +96,7 @@ async fn tracker_connections_and_bindings_round_trip(pool: PgPool) {
         Some(github.id),
         Provider::Github,
         "acme/api",
+        "dark-factory",
     )
     .await
     .unwrap();
@@ -162,9 +163,16 @@ async fn binding_rejects_a_connection_of_the_wrong_provider(pool: PgPool) {
         .await
         .unwrap();
 
-    let err = upsert_binding(&mut tx, t.repo, Some(jira.id), Provider::Github, "acme/api")
-        .await
-        .unwrap_err();
+    let err = upsert_binding(
+        &mut tx,
+        t.repo,
+        Some(jira.id),
+        Provider::Github,
+        "acme/api",
+        "dark-factory",
+    )
+    .await
+    .unwrap_err();
     assert!(
         err.to_string().contains("not found in this org"),
         "unexpected error: {err}"
@@ -196,6 +204,7 @@ async fn binding_rejects_a_connection_from_another_org(pool: PgPool) {
         Some(globex_connection.id),
         Provider::Github,
         "acme/api",
+        "dark-factory",
     )
     .await
     .unwrap_err();
@@ -216,13 +225,42 @@ async fn binding_rejects_a_repo_from_another_org(pool: PgPool) {
     let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
 
     let mut tx = db.begin(a.org).await.unwrap();
-    let err = upsert_binding(&mut tx, b.repo, None, Provider::Github, "acme/api")
-        .await
-        .unwrap_err();
+    let err = upsert_binding(
+        &mut tx,
+        b.repo,
+        None,
+        Provider::Github,
+        "acme/api",
+        "dark-factory",
+    )
+    .await
+    .unwrap_err();
     assert!(
         err.to_string().contains("repo not found"),
         "unexpected error: {err}"
     );
+}
+
+#[sqlx::test]
+async fn trigger_label_round_trips_through_bindings(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let binding = upsert_binding(
+        &mut tx,
+        t.repo,
+        None,
+        Provider::Github,
+        "acme/api",
+        "ship-it",
+    )
+    .await
+    .unwrap();
+    let fetched = get_binding(&mut tx, binding.id).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(fetched.trigger_label, "ship-it");
 }
 
 /// This is deliberately not an `rls_scopes_*` test: `tracker_connection_index`

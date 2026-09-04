@@ -51,6 +51,11 @@ pub struct Config {
     /// Shared secret for GitHub webhook signature verification. Optional
     /// because GitHub integration itself is optional per deployment.
     pub github_app_webhook_secret: Option<String>,
+    /// Atlassian OAuth client id for JIRA tracker sync. Optional because JIRA
+    /// integration itself is optional per deployment.
+    pub jira_client_id: Option<String>,
+    /// Atlassian OAuth client secret for JIRA tracker sync.
+    pub jira_client_secret: Option<String>,
 
     /// See `df_web::Config::client_ip_header` — the header a trusted proxy
     /// writes the client address into, if any.
@@ -131,6 +136,8 @@ impl Config {
             github_app_private_key: optional("DF_GITHUB_APP_PRIVATE_KEY")
                 .map(normalize_pem_newlines),
             github_app_webhook_secret: optional("DF_GITHUB_APP_WEBHOOK_SECRET"),
+            jira_client_id: optional("DF_JIRA_CLIENT_ID"),
+            jira_client_secret: optional("DF_JIRA_CLIENT_SECRET"),
 
             client_ip_header: optional("DF_CLIENT_IP_HEADER")
                 .map(|v| v.trim().to_ascii_lowercase())
@@ -243,6 +250,8 @@ impl Config {
             github_app_id: None,
             github_app_private_key: None,
             github_app_webhook_secret: None,
+            jira_client_id: None,
+            jira_client_secret: None,
             client_ip_header: None,
             enforce_quotas: false,
             upgrade_url: "https://factory.example.com/settings/billing".into(),

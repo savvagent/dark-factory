@@ -78,6 +78,19 @@ pub struct Config {
     /// Where a caller who has run out is sent. Named in the refusal itself,
     /// because an error that says "upgrade" without saying where is a dead end.
     pub upgrade_url: String,
+    /// GitHub App id for outbound tracker sync. Optional because tracker sync
+    /// itself is optional per deployment.
+    pub github_app_id: Option<i64>,
+    /// PEM-encoded GitHub App private key for installation-token minting.
+    pub github_app_private_key: Option<String>,
+    /// Atlassian OAuth client id for JIRA write-back.
+    pub jira_client_id: Option<String>,
+    /// Atlassian OAuth client secret for JIRA write-back.
+    pub jira_client_secret: Option<String>,
+    /// Encryption key for decrypting stored tracker credentials. Not used by
+    /// most tool calls; carried here so the JIRA sync path can open the stored
+    /// refresh token when tracker sync is enabled.
+    pub encryption_key: Option<String>,
 }
 
 impl Config {
@@ -94,6 +107,11 @@ impl Config {
             allowed_origins: vec![],
             enforce_quotas: false,
             upgrade_url: format!("{}/settings/billing", public_url.trim_end_matches('/')),
+            github_app_id: None,
+            github_app_private_key: None,
+            jira_client_id: None,
+            jira_client_secret: None,
+            encryption_key: None,
             public_url,
         }
     }
@@ -168,10 +186,18 @@ pub fn mcp_endpoint(db: Db, watcher: Arc<Watcher>, config: Config) -> Router {
     transport.allowed_hosts = config.allowed_hosts;
     transport.allowed_origins = config.allowed_origins;
 
-    let factory = Factory::new(
+    let tracker_sync = crate::server::TrackerSyncConfig {
+        github_app_id: config.github_app_id,
+        github_app_private_key: config.github_app_private_key.clone(),
+        jira_client_id: config.jira_client_id.clone(),
+        jira_client_secret: config.jira_client_secret.clone(),
+        encryption_key: config.encryption_key.clone(),
+    };
+    let factory = Factory::new_with_tracker_sync(
         db,
         watcher,
         df_billing::Meter::new(config.enforce_quotas, config.upgrade_url),
+        tracker_sync,
     );
     let service = StreamableHttpService::new(
         // Called per session. `Factory` is cheap to clone — a pool handle, an

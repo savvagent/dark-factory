@@ -357,6 +357,42 @@ async fn the_full_loop_from_remote_url_to_completed_job(pool: PgPool) {
     assert_eq!(stats["stats"]["pending"], 0);
 }
 
+/// Most jobs have no linked ticket. Their hot path must stay the same cheap
+/// queue transition it was before tracker write-back existed.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn ticketless_job_transitions_still_succeed(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+
+    let job = env.add_job(&caller, "plain queue work").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    let claimed = ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: Some("agent-one".into()),
+            }),
+        )
+        .await);
+    assert_eq!(claimed["jobs"][0]["status"], "in-progress");
+
+    let failed = ok(env
+        .factory
+        .fail_job(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::FailJobArgs {
+                job: id,
+                error: Some("failed locally".into()),
+            }),
+        )
+        .await);
+    assert_eq!(failed["job"]["status"], "failed");
+    assert_eq!(failed["job"]["error"], "failed locally");
+}
+
 /// Dependencies gate claiming, and the surface has to report the gate rather
 /// than letting an agent take work whose prerequisites are unfinished.
 #[sqlx::test(migrations = "../df-core/migrations")]

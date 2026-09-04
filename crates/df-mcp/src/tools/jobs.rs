@@ -8,7 +8,15 @@
 //! writing the same file.
 
 use df_core::ids::JobId;
-use df_core::jobs::{JobFilter, NewJob, Status};
+use df_core::jobs::{Job, JobFilter, NewJob, Status, Tracker};
+use df_core::trackers::{
+    decode_stored_secret, get_connection, resolve_binding, upsert_connection, Provider,
+};
+use df_trackers::github::GithubAppClient;
+use df_trackers::jira::JiraClient;
+use df_trackers::sync::{
+    normalize_remote_revision, outbound_decision, select_jira_transition, JobTransition,
+};
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::ErrorData;
@@ -21,6 +29,25 @@ use crate::server::{Factory, McpResult};
 /// Turn caller-supplied job ids into the domain type.
 fn ids(raw: Vec<String>) -> Vec<JobId> {
     raw.into_iter().map(JobId::from).collect()
+}
+
+fn provider_of(tracker: Tracker) -> Provider {
+    match tracker {
+        Tracker::Github => Provider::Github,
+        Tracker::Jira => Provider::Jira,
+    }
+}
+
+fn parse_github_ticket_ref(ticket_ref: &str) -> Option<(&str, &str, i64)> {
+    let (owner_repo, issue) = ticket_ref.split_once('#')?;
+    let (owner, repo) = owner_repo.split_once('/')?;
+    let issue_number = issue.parse().ok()?;
+    Some((owner, repo, issue_number))
+}
+
+struct JiraSyncOutcome {
+    remote_revision: Option<String>,
+    rotated_credentials: Option<df_core::crypto::Sealed>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -152,6 +179,282 @@ pub struct SetDependenciesArgs {
 
 #[tool_router(router = jobs_router, vis = "pub(crate)")]
 impl Factory {
+    async fn sync_jobs_after_transition(
+        &self,
+        jobs: &[Job],
+        transition: JobTransition,
+        detail: Option<&str>,
+    ) {
+        for job in jobs {
+            if let Err(error) = self
+                .sync_job_after_transition(job, transition, detail)
+                .await
+            {
+                tracing::error!(job_id = %job.id, error = %error, "tracker write-back failed");
+            }
+        }
+    }
+
+    async fn sync_job_after_transition(
+        &self,
+        job: &Job,
+        transition: JobTransition,
+        detail: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(tracker) = job.tracker else {
+            return Ok(());
+        };
+        let Some(ticket_ref) = job.ticket_ref.as_deref() else {
+            return Ok(());
+        };
+
+        let provider = provider_of(tracker);
+        let (binding, connection) = {
+            let mut tx = self
+                .db()
+                .begin(job.org_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let binding = resolve_binding(&mut tx, job.repo_id, provider)
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(binding) = binding else {
+                tx.commit().await.map_err(|error| error.to_string())?;
+                return Ok(());
+            };
+            if binding.connection_id.is_none() {
+                tx.commit().await.map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            let connection = get_connection(&mut tx, provider)
+                .await
+                .map_err(|error| error.to_string())?;
+            tx.commit().await.map_err(|error| error.to_string())?;
+            let Some(connection) = connection else {
+                return Ok(());
+            };
+            (binding, connection)
+        };
+
+        let plan = outbound_decision(transition, tracker, detail);
+        match tracker {
+            Tracker::Github => {
+                let outcome = self
+                    .sync_github_job(job, ticket_ref, &connection.external_id, &plan)
+                    .await?;
+                if let Some(remote_revision) = outcome {
+                    let mut tx = self
+                        .db()
+                        .begin(job.org_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    tx.set_remote_revision(&job.id, &remote_revision)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    tx.commit().await.map_err(|error| error.to_string())?;
+                }
+            }
+            Tracker::Jira => {
+                let outcome = self
+                    .sync_jira_job(job, ticket_ref, &binding.external_ref, &connection, &plan)
+                    .await?;
+                if outcome.remote_revision.is_some() || outcome.rotated_credentials.is_some() {
+                    let mut tx = self
+                        .db()
+                        .begin(job.org_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if let Some(remote_revision) = outcome.remote_revision.as_deref() {
+                        tx.set_remote_revision(&job.id, remote_revision)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    if let Some(rotated) = outcome.rotated_credentials.as_ref() {
+                        let webhook_secret = connection
+                            .encrypted_webhook_secret
+                            .as_deref()
+                            .map(decode_stored_secret)
+                            .transpose()
+                            .map_err(|error| error.to_string())?;
+                        upsert_connection(
+                            &mut tx,
+                            Provider::Jira,
+                            &connection.external_id,
+                            Some(rotated),
+                            webhook_secret.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
+                    tx.commit().await.map_err(|error| error.to_string())?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn sync_github_job(
+        &self,
+        job: &Job,
+        ticket_ref: &str,
+        external_id: &str,
+        plan: &df_trackers::sync::OutboundDecision,
+    ) -> Result<Option<String>, String> {
+        let app_id = self
+            .tracker_sync()
+            .github_app_id
+            .ok_or_else(|| "GitHub tracker sync is not configured (missing App id)".to_string())?;
+        let private_key = self
+            .tracker_sync()
+            .github_app_private_key
+            .clone()
+            .ok_or_else(|| {
+                "GitHub tracker sync is not configured (missing App private key)".to_string()
+            })?;
+        let installation_id = external_id.parse::<i64>().map_err(|error| {
+            format!(
+                "tracker connection for job {} has a non-numeric GitHub installation id {external_id:?}: {error}",
+                job.id
+            )
+        })?;
+        let (owner, repo, issue_number) = parse_github_ticket_ref(ticket_ref).ok_or_else(|| {
+            format!(
+                "job {} has an invalid GitHub ticket_ref {ticket_ref:?}",
+                job.id
+            )
+        })?;
+        let client =
+            GithubAppClient::new(app_id, private_key).map_err(|error| error.to_string())?;
+
+        client
+            .post_comment(installation_id, owner, repo, issue_number, &plan.comment)
+            .await
+            .map_err(|error| error.to_string())?;
+        let remote_revision = if let Some(close) = plan.github_close.as_ref() {
+            match client
+                .set_issue_state(
+                    installation_id,
+                    owner,
+                    repo,
+                    issue_number,
+                    "closed",
+                    Some(&close.state_reason),
+                )
+                .await
+            {
+                Ok(updated_at) => updated_at,
+                Err(error) => return Err(error.to_string()),
+            }
+        } else {
+            client
+                .get_issue_updated_at(installation_id, owner, repo, issue_number)
+                .await
+                .map_err(|error| error.to_string())?
+        };
+
+        Ok(normalize_remote_revision(remote_revision.as_deref()))
+    }
+
+    async fn sync_jira_job(
+        &self,
+        job: &Job,
+        ticket_ref: &str,
+        binding_external_ref: &str,
+        connection: &df_core::trackers::TrackerConnection,
+        plan: &df_trackers::sync::OutboundDecision,
+    ) -> Result<JiraSyncOutcome, String> {
+        let client_id =
+            self.tracker_sync().jira_client_id.clone().ok_or_else(|| {
+                "JIRA tracker sync is not configured (missing client id)".to_string()
+            })?;
+        let client_secret = self
+            .tracker_sync()
+            .jira_client_secret
+            .clone()
+            .ok_or_else(|| {
+                "JIRA tracker sync is not configured (missing client secret)".to_string()
+            })?;
+        let encryption_key = self
+            .tracker_sync()
+            .encryption_key
+            .as_deref()
+            .ok_or_else(|| {
+                "JIRA tracker sync is not configured (missing encryption key)".to_string()
+            })?;
+        let cipher = df_core::crypto::Cipher::from_base64_key(encryption_key)
+            .map_err(|error| error.to_string())?;
+        let encoded = connection.encrypted_credentials.as_deref().ok_or_else(|| {
+            format!(
+                "JIRA connection for job {} is missing stored credentials",
+                job.id
+            )
+        })?;
+        let sealed = decode_stored_secret(encoded).map_err(|error| error.to_string())?;
+        let refresh_token =
+            JiraClient::open_refresh_token(&cipher, &sealed).map_err(|error| error.to_string())?;
+        let client = JiraClient::new(client_id, client_secret);
+        let tokens = client
+            .refresh_access_token(&refresh_token)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        client
+            .post_comment(
+                &tokens.access_token,
+                &connection.external_id,
+                ticket_ref,
+                &plan.comment,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        if let Some(target) = plan.jira_transition.as_ref() {
+            let transitions = client
+                .list_transitions(&tokens.access_token, &connection.external_id, ticket_ref)
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(transition) = select_jira_transition(target, &transitions) {
+                client
+                    .transition_issue(
+                        &tokens.access_token,
+                        &connection.external_id,
+                        ticket_ref,
+                        &transition.id,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                tracing::warn!(
+                    job_id = %job.id,
+                    provider = "jira",
+                    external_ref = %binding_external_ref,
+                    ticket_ref = %ticket_ref,
+                    "no reachable JIRA transition matched the requested target; comment posted only"
+                );
+            }
+        }
+
+        let remote_revision = client
+            .get_issue_updated_at(&tokens.access_token, &connection.external_id, ticket_ref)
+            .await
+            .map_err(|error| error.to_string())?;
+        let rotated_credentials = if tokens.refresh_token != refresh_token {
+            Some(
+                tokens
+                    .seal_refresh_token(&cipher)
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+
+        Ok(JiraSyncOutcome {
+            remote_revision: normalize_remote_revision(remote_revision.as_deref()),
+            rotated_credentials,
+        })
+    }
+
     #[tool(
         name = "add_job",
         description = "Queue a new job against a repository. Give it a specific title and \
@@ -328,8 +631,11 @@ impl Factory {
             .await
             .mcp()?;
         tx.commit().await.mcp()?;
+        let out = Json(out::JobsOut { jobs: jobs.clone() });
+        self.sync_jobs_after_transition(&jobs, JobTransition::Claimed, args.agent.as_deref())
+            .await;
 
-        Ok(Json(out::JobsOut { jobs }))
+        Ok(out)
     }
 
     #[tool(
@@ -352,8 +658,15 @@ impl Factory {
             .await
             .mcp()?;
         tx.commit().await.mcp()?;
+        let out = Json(out::JobOut { job: job.clone() });
+        self.sync_jobs_after_transition(
+            std::slice::from_ref(&job),
+            JobTransition::Completed,
+            args.result.as_deref(),
+        )
+        .await;
 
-        Ok(Json(out::JobOut { job }))
+        Ok(out)
     }
 
     #[tool(
@@ -377,8 +690,15 @@ impl Factory {
             .await
             .mcp()?;
         tx.commit().await.mcp()?;
+        let out = Json(out::JobOut { job: job.clone() });
+        self.sync_jobs_after_transition(
+            std::slice::from_ref(&job),
+            JobTransition::Failed,
+            args.error.as_deref(),
+        )
+        .await;
 
-        Ok(Json(out::JobOut { job }))
+        Ok(out)
     }
 
     #[tool(

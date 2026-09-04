@@ -29,7 +29,7 @@ const GCM_TAG_BYTES: usize = 16;
 const CONNECTION_COLS: &str = "id, org_id, provider, external_id, encrypted_credentials, \
                                encrypted_webhook_secret, created_at, updated_at";
 const BINDING_COLS: &str = "id, org_id, repo_id, connection_id, provider, external_ref, \
-                            created_at, updated_at";
+                            trigger_label, created_at, updated_at";
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, schemars::JsonSchema,
@@ -89,6 +89,7 @@ pub struct TrackerBinding {
     pub connection_id: Option<uuid::Uuid>,
     pub provider: Provider,
     pub external_ref: String,
+    pub trigger_label: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -332,6 +333,7 @@ pub async fn upsert_binding(
     connection_id: Option<uuid::Uuid>,
     provider: Provider,
     external_ref: &str,
+    trigger_label: &str,
 ) -> Result<TrackerBinding> {
     let org_id = tx.org();
     require_repo_in_org(tx, repo_id).await?;
@@ -340,11 +342,13 @@ pub async fn upsert_binding(
     }
 
     let binding = sqlx::query_as(&format!(
-        "INSERT INTO tracker_bindings (org_id, repo_id, connection_id, provider, external_ref) \
-         VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO tracker_bindings \
+         (org_id, repo_id, connection_id, provider, external_ref, trigger_label) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (repo_id, provider) DO UPDATE SET \
            connection_id = EXCLUDED.connection_id, \
            external_ref = EXCLUDED.external_ref, \
+           trigger_label = EXCLUDED.trigger_label, \
            updated_at = now() \
          RETURNING {BINDING_COLS}"
     ))
@@ -353,6 +357,7 @@ pub async fn upsert_binding(
     .bind(connection_id)
     .bind(provider)
     .bind(external_ref)
+    .bind(trigger_label)
     .fetch_one(tx.conn())
     .await?;
 

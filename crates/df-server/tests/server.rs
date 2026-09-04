@@ -30,6 +30,8 @@ fn config(static_dir: &str) -> Config {
         github_app_id: None,
         github_app_private_key: None,
         github_app_webhook_secret: None,
+        jira_client_id: None,
+        jira_client_secret: None,
         client_ip_header: None,
         enforce_quotas: false,
         upgrade_url: format!("{PUBLIC}/settings/billing"),

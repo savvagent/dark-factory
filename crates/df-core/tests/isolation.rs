@@ -516,6 +516,7 @@ async fn rls_scopes_tracker_bindings(pool: PgPool) {
         Some(connection.id),
         Provider::Github,
         "acme/api",
+        "dark-factory",
     )
     .await
     .unwrap();

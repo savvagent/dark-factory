@@ -56,6 +56,12 @@ struct Label {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct IssueRecord {
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
 pub struct GithubAppClient {
     app_id: i64,
     key: EncodingKey,
@@ -132,6 +138,27 @@ impl GithubAppClient {
         .await
     }
 
+    pub async fn get_issue_updated_at(
+        &self,
+        installation_id: i64,
+        owner: &str,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<Option<String>> {
+        let token = self.installation_token(installation_id).await?;
+        let url = format!(
+            "{}/repos/{owner}/{repo}/issues/{issue_number}",
+            self.api_base
+        );
+        let issue: IssueRecord = self
+            .send_json(
+                self.github_request(&token, reqwest::Method::GET, &url),
+                "fetching an issue revision",
+            )
+            .await?;
+        Ok(issue.updated_at)
+    }
+
     pub async fn list_labels(
         &self,
         installation_id: i64,
@@ -160,7 +187,8 @@ impl GithubAppClient {
         repo: &str,
         issue_number: i64,
         state: &str,
-    ) -> Result<()> {
+        state_reason: Option<&str>,
+    ) -> Result<Option<String>> {
         if !matches!(state, "open" | "closed") {
             return Err(Error::InvalidGithubIssueState(state.to_string()));
         }
@@ -170,12 +198,17 @@ impl GithubAppClient {
             "{}/repos/{owner}/{repo}/issues/{issue_number}",
             self.api_base
         );
-        self.send_without_response(
-            self.github_request(&token, reqwest::Method::PATCH, &url)
-                .json(&serde_json::json!({ "state": state })),
-            "setting an issue state",
-        )
-        .await
+        let issue: IssueRecord = self
+            .send_json(
+                self.github_request(&token, reqwest::Method::PATCH, &url)
+                    .json(&serde_json::json!({
+                        "state": state,
+                        "state_reason": state_reason,
+                    })),
+                "setting an issue state",
+            )
+            .await?;
+        Ok(issue.updated_at)
     }
 
     fn cached_installation_token(&self, installation_id: i64) -> Result<Option<String>> {
@@ -495,7 +528,14 @@ mod tests {
             200,
             serde_json::json!([{ "name": "bug" }, { "name": "help wanted" }]),
         ));
-        server.push(MockResponse::json(200, serde_json::json!({ "ok": true })));
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({ "updated_at": "2026-09-03T18:12:00Z" }),
+        ));
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({ "updated_at": "2026-09-03T18:13:00Z" }),
+        ));
 
         let client = GithubAppClient::new(42, TEST_KEY.into())
             .expect("client")
@@ -509,12 +549,18 @@ mod tests {
             .list_labels(17, "octo", "repo", 7)
             .await
             .expect("labels succeed");
-        client
-            .set_issue_state(17, "octo", "repo", 7, "closed")
+        let closed_at = client
+            .set_issue_state(17, "octo", "repo", 7, "closed", Some("completed"))
             .await
             .expect("state succeeds");
+        let updated_at = client
+            .get_issue_updated_at(17, "octo", "repo", 7)
+            .await
+            .expect("issue fetch succeeds");
 
         assert_eq!(labels, vec!["bug", "help wanted"]);
+        assert_eq!(closed_at.as_deref(), Some("2026-09-03T18:12:00Z"));
+        assert_eq!(updated_at.as_deref(), Some("2026-09-03T18:13:00Z"));
         let requests = server.requests();
         assert_eq!(requests[1].method, "POST");
         assert_eq!(requests[1].path, "/repos/octo/repo/issues/7/comments");
@@ -533,8 +579,10 @@ mod tests {
         assert_eq!(requests[3].path, "/repos/octo/repo/issues/7");
         assert_eq!(
             serde_json::from_slice::<Value>(&requests[3].body).expect("patch body"),
-            serde_json::json!({ "state": "closed" })
+            serde_json::json!({ "state": "closed", "state_reason": "completed" })
         );
+        assert_eq!(requests[4].method, "GET");
+        assert_eq!(requests[4].path, "/repos/octo/repo/issues/7");
         server.shutdown().await;
     }
 
@@ -558,7 +606,7 @@ mod tests {
             .with_api_base(server.base_url.clone());
 
         let error = client
-            .set_issue_state(17, "octo", "repo", 7, "closed")
+            .set_issue_state(17, "octo", "repo", 7, "closed", Some("completed"))
             .await
             .expect_err("request should fail");
 
