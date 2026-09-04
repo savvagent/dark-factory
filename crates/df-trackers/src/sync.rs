@@ -207,7 +207,13 @@ fn has_trigger_label(event: &WebhookEvent, trigger_label: &str) -> bool {
         .any(|label| label.eq_ignore_ascii_case(trigger_label))
 }
 
-fn ticket_ref(event: &WebhookEvent) -> String {
+/// The `ticket_ref` a webhook event resolves to, in the same
+/// `"{repo}#{number}"` / `"PROJ-123"` convention `add_job` documents. Exported
+/// so callers doing their own job lookup before `inbound_decision` runs (the
+/// webhook route needs the existing job to decide create-vs-update) derive
+/// the identical string instead of risking silent drift between two
+/// hand-written formats.
+pub fn ticket_ref(event: &WebhookEvent) -> String {
     match event.provider {
         Provider::Github => format!("{}#{}", event.binding_external_ref, event.issue.reference),
         Provider::Jira => event.issue.reference.clone(),

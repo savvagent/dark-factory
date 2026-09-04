@@ -191,12 +191,7 @@ pub async fn receive(
                             Provider::Github => Tracker::Github,
                             Provider::Jira => Tracker::Jira,
                         };
-                        let ticket_ref = match provider {
-                            Provider::Github => {
-                                format!("{}#{}", event.binding_external_ref, event.issue.reference)
-                            }
-                            Provider::Jira => event.issue.reference.clone(),
-                        };
+                        let ticket_ref = df_trackers::sync::ticket_ref(event);
                         let existing = tx
                             .get_job_by_ticket_for_repo(binding.repo_id, tracker, &ticket_ref)
                             .await
