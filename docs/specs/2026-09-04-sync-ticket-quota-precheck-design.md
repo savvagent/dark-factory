@@ -171,6 +171,13 @@ error code every other tool already returns when refused, mapped through the sam
 `error::from_billing`. A caller does not need to learn a new error shape for this one
 tool.
 
+No new `df-billing::classify` entry is needed: `sync_ticket` is already classified as
+billable, and this change only adds a pre-check on that existing tool's path — it neither
+adds a tool nor changes its class. Likewise, this is a non-breaking behavioral tightening
+of an existing refusal path: the tool's caller-visible contract only gets stricter about
+*when* it refuses, using the same `quota_exceeded` error shape every other tool already
+returns.
+
 ## §5 — Testing
 
 - `crates/df-billing/src/meter.rs`: no new unit tests needed beyond what's there — the
