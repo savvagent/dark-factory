@@ -22,7 +22,7 @@
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post, put, MethodRouter};
 
-use crate::routes::{auth, jobs, orgs, repos, teams, tokens, usage, webhooks};
+use crate::routes::{auth, jobs, orgs, repos, teams, tokens, trackers, usage, webhooks};
 use crate::state::AppState;
 use crate::{oauth, openapi};
 
@@ -592,6 +592,74 @@ pub fn catalog() -> Vec<Endpoint> {
                 "Absent fields are left alone. The slug cannot be changed — agents \
                  name it, so renaming would break every skill that does.",
             ),
+        // -------------------------------------------------------- trackers
+        Endpoint::get(
+            "/api/orgs/{org}/tracker-connections",
+            trackers::list_tracker_connections,
+        )
+        .auth(Auth::OrgAdmin)
+        .returns("TrackerConnections")
+        .summary("Tracker connections, and what this deployment can connect")
+        .describe(
+            "Stored ciphertext is never returned; `hasCredentials` says whether there is \
+             any. The per-provider `configured` flag is the conjunction of every credential \
+             the connect flow needs, so a console never offers a flow the server cannot \
+             finish.",
+        ),
+        Endpoint::post(
+            "/api/orgs/{org}/tracker-connections/{provider}",
+            trackers::connect_tracker,
+        )
+        .auth(Auth::OrgAdmin)
+        .takes("ConnectTrackerRequest")
+        .returns("TrackerConnection")
+        .summary("Redeem a provider authorization and record the connection")
+        .describe(
+            "A POST because the body carries a single-use authorization code: a link \
+             preview following the provider's redirect must burn nothing. GitHub also \
+             requires `installationId`, and it is verified against the installations the \
+             authorizing account actually administers — an unverified installation id \
+             would let one org drive another's issues.",
+        ),
+        Endpoint::delete(
+            "/api/orgs/{org}/tracker-connections/{provider}",
+            trackers::disconnect_tracker,
+        )
+        .auth(Auth::OrgAdmin)
+        .status(204)
+        .summary("Disconnect a tracker")
+        .describe(
+            "Bindings pointing at it go inert rather than invalid. Removing the connection \
+             also releases the provider's external id, so another org can connect it.",
+        ),
+        Endpoint::get(
+            "/api/orgs/{org}/repos/{repo}/tracker-bindings",
+            trackers::list_repo_bindings,
+        )
+        .auth(Auth::OrgMember)
+        .returns("TrackerBindingList")
+        .summary("Which tracker projects this repo maps to")
+        .describe("`live` is false while the org has no connection for that provider."),
+        Endpoint::put(
+            "/api/orgs/{org}/repos/{repo}/tracker-bindings/{provider}",
+            trackers::bind_repo,
+        )
+        .auth(Auth::OrgAdmin)
+        .takes("BindRepoRequest")
+        .returns("TrackerBinding")
+        .summary("Point a repo at a tracker project")
+        .describe(
+            "`externalRef` is `owner/repo` for GitHub and a project key for JIRA — the \
+             exact strings webhook ingest matches on, so anything else is refused rather \
+             than stored inert. The connection is looked up from the org, never supplied.",
+        ),
+        Endpoint::delete(
+            "/api/orgs/{org}/repos/{repo}/tracker-bindings/{provider}",
+            trackers::unbind_repo,
+        )
+        .auth(Auth::OrgAdmin)
+        .status(204)
+        .summary("Stop mapping a repo to a tracker project"),
         Endpoint::get("/api/orgs/{org}/repos/{repo}/leases", repos::list_leases)
             .auth(Auth::OrgMember)
             .returns("LeaseList")

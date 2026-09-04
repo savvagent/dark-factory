@@ -132,15 +132,21 @@ before any handler body runs.
 | Verb | Path | Body | Answers |
 |---|---|---|---|
 | `GET` | `/api/orgs/{org}/tracker-connections` | — | `TrackerConnectionsView` |
-| `POST` | `/api/orgs/{org}/tracker-connections/github` | `{installationId, code}` | `TrackerConnectionView` |
-| `POST` | `/api/orgs/{org}/tracker-connections/jira` | `{code}` | `TrackerConnectionView` |
+| `POST` | `/api/orgs/{org}/tracker-connections/{provider}` | `{code, installationId?}` | `TrackerConnectionView` |
 | `DELETE` | `/api/orgs/{org}/tracker-connections/{provider}` | — | `204` |
-| `PUT` | `/api/orgs/{org}/repos/{repo}/tracker-binding` | `{provider, externalRef, triggerLabel?}` | `TrackerBindingView` |
+| `GET` | `/api/orgs/{org}/repos/{repo}/tracker-bindings` | — | `TrackerBindingView[]` |
+| `PUT` | `/api/orgs/{org}/repos/{repo}/tracker-bindings/{provider}` | `{externalRef, triggerLabel?}` | `TrackerBindingView` |
 | `DELETE` | `/api/orgs/{org}/repos/{repo}/tracker-bindings/{provider}` | — | `204` |
 
-A repo's bindings are read from `GET /api/orgs/{org}/repos/{repo}/tracker-bindings`
-(`Auth::OrgMember`, since it is a read of repo metadata a member may already see) — seven
-endpoints in total, six of them admin-only.
+Six endpoints, five of them admin-only; the bindings `GET` is `Auth::OrgMember`, since it
+is a read of repo metadata a member may already see.
+
+**The provider is a path segment on every one of them, including the two `POST`s.** An
+earlier draft gave each provider its own connect path and each a body of its own shape.
+One route with one `ConnectTrackerRequest` — `code` always, `installationId` for GitHub —
+is a single place for the two flows to stay in step, and an unknown segment gets
+`Provider::from_str`'s error, which names the providers that do exist rather than 404ing
+into silence.
 
 **`TrackerConnectionView` is a `df-web` type, not `df_core::TrackerConnection`.** The domain
 row carries `encrypted_credentials` and `encrypted_webhook_secret` and `#[derive(Serialize)]`
@@ -159,7 +165,7 @@ production App. `configured: false` (the operator set no GitHub or no JIRA crede
 what the page renders as "this deployment does not offer JIRA sync", instead of a button
 that leads to a 500.
 
-**A binding is auto-linked to the org's connection.** `PUT …/tracker-binding` looks up the
+**A binding is auto-linked to the org's connection.** `PUT …/tracker-bindings/{provider}` looks up the
 org's connection for the named provider and passes its id as `connection_id`, rather than
 taking one from the request. A binding pointing at another provider's connection is not a
 shape any caller should be able to construct, and the parent spec's "a repo may declare a

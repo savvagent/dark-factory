@@ -178,14 +178,17 @@ fn tag_for(path: &str) -> &'static str {
 
 /// The component schemas the catalog refers to by name.
 ///
-/// Split across three functions because `serde_json::json!` is recursive and one
-/// literal this size exhausts the macro recursion limit — a compile error, not a
-/// runtime one, but a confusing enough compile error to be worth avoiding.
+/// Split across several functions because `serde_json::json!` is recursive and
+/// one literal this size exhausts the macro recursion limit — a compile error,
+/// not a runtime one, but a confusing enough compile error to be worth avoiding.
+/// A new group of schemas goes in a new function for the same reason; adding
+/// them to an existing one is how the limit gets hit again.
 fn components() -> Value {
     let mut all = serde_json::Map::new();
     for group in [
         entity_schemas(),
         queue_schemas(),
+        tracker_schemas(),
         response_schemas(),
         request_schemas(),
     ] {
@@ -195,6 +198,139 @@ fn components() -> Value {
         all.extend(map);
     }
     Value::Object(all)
+}
+
+/// Tracker connections and bindings — the console's half of Milestone 2.
+///
+/// Its own group rather than an addition to [`entity_schemas`]: that literal is
+/// already at the `json!` recursion limit, and these carry both entities and
+/// request bodies anyway.
+fn tracker_schemas() -> Value {
+    let uuid = json!({ "type": "string", "format": "uuid" });
+    let timestamp = json!({ "type": "string", "format": "date-time" });
+    let provider = json!({ "type": "string", "enum": ["github", "jira"] });
+
+    let tracker_connection = json!({
+        "type": "object",
+        "description":
+            "One org's connection to a tracker. Stored credentials are never returned — \
+             `hasCredentials` says only whether any exist.",
+        "properties": {
+            "id": uuid,
+            "provider": provider,
+            "externalId": {
+                "type": "string",
+                "description":
+                    "GitHub: the App installation id. JIRA: the cloud site id. Neither is \
+                     secret; both are globally unique across orgs, so connecting one \
+                     another org already holds is refused.",
+            },
+            "hasCredentials": { "type": "boolean" },
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+        },
+        "required": ["id", "provider", "externalId", "hasCredentials"],
+    });
+
+    let provider_setup = json!({
+        "type": "object",
+        "description":
+            "What this deployment can take an admin through for one provider. \
+             `configured` is the conjunction of every credential the flow needs, so a \
+             console never offers a flow the server cannot finish.",
+        "properties": {
+            "configured": { "type": "boolean" },
+            "startUrl": {
+                "type": ["string", "null"],
+                "description":
+                    "Where to send the browser to begin, minus its `state`. Null whenever \
+                     `configured` is false.",
+            },
+        },
+        "required": ["configured"],
+    });
+
+    let tracker_binding = json!({
+        "type": "object",
+        "description": "Which external project or repository one repo's jobs map to.",
+        "properties": {
+            "id": uuid,
+            "repoId": uuid,
+            "provider": provider,
+            "externalRef": {
+                "type": "string",
+                "description":
+                    "GitHub: \"owner/repo\", matched against repository.full_name. JIRA: a \
+                     project key, matched against fields.project.key.",
+            },
+            "triggerLabel": {
+                "type": "string",
+                "description": "The label inbound sync watches for. Defaults to dark-factory.",
+            },
+            "live": {
+                "type": "boolean",
+                "description":
+                    "False while the org has no connection for this provider. The binding \
+                     is stored and inert rather than refused.",
+            },
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+        },
+        "required": ["id", "repoId", "provider", "externalRef", "triggerLabel", "live"],
+    });
+
+    json!({
+        "TrackerConnection": tracker_connection,
+        "ProviderSetup": provider_setup,
+        "TrackerConnections": {
+            "type": "object",
+            "properties": {
+                "connections": { "type": "array", "items": reference("TrackerConnection") },
+                "github": reference("ProviderSetup"),
+                "jira": reference("ProviderSetup"),
+            },
+            "required": ["connections", "github", "jira"],
+        },
+        "TrackerBinding": tracker_binding,
+        "TrackerBindingList": { "type": "array", "items": reference("TrackerBinding") },
+        "ConnectTrackerRequest": {
+            "type": "object",
+            "description":
+                "The single-use artifact the provider handed the browser. A POST body and \
+                 never a query string: a link preview following the provider's redirect \
+                 must burn nothing.",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The provider's authorization code. Redeemable once.",
+                },
+                "installationId": {
+                    "type": ["integer", "null"],
+                    "description":
+                        "GitHub only, and required there. Verified against the \
+                         installations the authorizing account administers before \
+                         anything is written.",
+                },
+            },
+            "required": ["code"],
+        },
+        "BindRepoRequest": {
+            "type": "object",
+            "properties": {
+                "externalRef": {
+                    "type": "string",
+                    "description":
+                        "\"owner/repo\" for GitHub, a project key for JIRA. Anything else \
+                         is refused rather than stored inert.",
+                },
+                "triggerLabel": {
+                    "type": ["string", "null"],
+                    "description": "Defaults to dark-factory when absent or blank.",
+                },
+            },
+            "required": ["externalRef"],
+        },
+    })
 }
 
 /// The domain objects — what `df-core` returns, as the wire sees it.

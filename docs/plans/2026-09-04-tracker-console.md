@@ -7,7 +7,7 @@ do not, so this splits into five sub-tasks, server first.
 
 ## Status — 2026-09-04
 
-6.1 ✅ shipped, 6.2 ✅ shipped, 6.3 ⬜, 6.4 ⬜, 6.5 ⬜.
+6.1 ✅ shipped, 6.2 ✅ shipped, 6.3 ✅ shipped, 6.4 ⬜, 6.5 ⬜.
 
 ## Global Constraints
 
@@ -119,28 +119,28 @@ free function taking the OAuth credentials is the likelier shape).
       `cargo fmt --all`. Commit: `df-trackers: verify a GitHub installation belongs to the
       admin binding it`.
 
-## Task 6.3 — the console REST surface ⬜
+## Task 6.3 — the console REST surface ✅
 
 **Files:** `crates/df-web/src/routes/trackers.rs` (new), `crates/df-web/src/routes/mod.rs`,
 `crates/df-web/src/catalog.rs`, `crates/df-web/src/openapi.rs`,
 `crates/df-web/tests/console.rs`.
 
-**Interfaces:** produces the seven endpoints in spec §3 for 6.4 to call.
+**Interfaces:** produces the six endpoints in spec §3 for 6.4 to call.
 
-- [ ] Write failing tests in `crates/df-web/tests/console.rs` first, following the file's
+- [x] Write failing tests in `crates/df-web/tests/console.rs` first, following the file's
       existing helpers: a member (non-admin) gets `403` on each admin route; an admin of
       another org gets `404` (never `403`) on all seven; `PUT …/tracker-binding` with a
       malformed `owner/repo` or project key is refused; a `GET` of the connections list
       never contains the string `encrypted`; `DELETE` answers `204`.
-- [ ] Add the view types (`TrackerConnectionView`, `TrackerConnectionsView`,
+- [x] Add the view types (`TrackerConnectionView`, `TrackerConnectionsView`,
       `TrackerBindingView`) and the seven handlers. Every handler: `ctx.require_admin()?`
       (except the bindings `GET`), one `state.db.begin(ctx.org.id)`, one `tx.commit()`.
-- [ ] Audit entries for the four mutating routes, following `repos.rs`'s `Entry::new(...)`
+- [x] Audit entries for the four mutating routes, following `repos.rs`'s `Entry::new(...)`
       usage. Add the action constants to `df_core::audit::action` if they do not exist.
-- [ ] `external_ref` validation per provider (spec §3), with errors naming the expected shape.
-- [ ] Register all seven in `catalog.rs` with `Auth::OrgAdmin`/`OrgMember`, summaries,
+- [x] `external_ref` validation per provider (spec §3), with errors naming the expected shape.
+- [x] Register all seven in `catalog.rs` with `Auth::OrgAdmin`/`OrgMember`, summaries,
       descriptions, `.status(204)` on the deletes, and components in `openapi.rs`.
-- [ ] `cargo test -p df-web`, `cargo test --workspace`,
+- [x] `cargo test -p df-web`, `cargo test --workspace`,
       `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all`. Commit:
       `df-web: tracker connection and binding routes`.
 

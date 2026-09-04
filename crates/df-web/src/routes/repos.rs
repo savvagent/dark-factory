@@ -124,7 +124,11 @@ async fn visible_repos(
 /// caller may not see is reported as not found, not forbidden — the same
 /// "an org you are not in is 404" rule this file already applies to orgs
 /// extends to a team-scoped repo a non-member should not learn exists.
-async fn require_visible(tx: &mut df_core::Tx<'_>, ctx: &OrgCtx, repo: Repo) -> ApiResult<Repo> {
+pub(crate) async fn require_visible(
+    tx: &mut df_core::Tx<'_>,
+    ctx: &OrgCtx,
+    repo: Repo,
+) -> ApiResult<Repo> {
     if ctx.role.can_administer() {
         return Ok(repo);
     }
