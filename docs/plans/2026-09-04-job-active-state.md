@@ -280,13 +280,13 @@ Steps:
       is not how this repo's formatter is invoked), then:
       `git add -A && git commit -m "web: show the active job status in the console"`
 
-## Task 5 — Docs ⬜
+## Task 5 — Docs ✅
 
 **Files:** `docs/specs/2026-09-01-dark-factory-design.md`
 
 Steps:
 
-- [ ] Update the job-model lifecycle line (currently
+- [x] Update the job-model lifecycle line (currently
       `` | Job model + lifecycle (`pending → in-progress → completed/failed`) | The TUI, the PTY host, and every hook | ``)
       to mention `active` as a refinement of `in-progress`, without implying it is a
       fifth terminal or mandatory state.
