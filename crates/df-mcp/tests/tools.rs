@@ -9,8 +9,10 @@
 
 use df_auth::tokens::{Principal, TokenKind};
 use df_billing::Meter;
-use df_core::ids::{OrgId, UserId};
+use df_core::ids::{OrgId, RepoId, UserId};
+use df_core::jobs::Tracker;
 use df_core::orgs::Role;
+use df_core::trackers::{upsert_binding, upsert_connection, Provider};
 use df_core::watch::Watcher;
 use df_core::Db;
 use df_mcp::server::Factory;
@@ -916,6 +918,8 @@ fn the_advertised_surface_is_exactly_what_the_design_specifies() {
         "ready",
         "blocked",
         "stats",
+        "link_ticket",
+        "sync_ticket",
         // Coordination
         "acquire_lease",
         "renew_lease",
@@ -1329,4 +1333,366 @@ async fn usage_is_counted_per_org(pool: PgPool) {
         ours["billableUsed"], 3,
         "register_repo plus two add_jobs; reading usage itself is free"
     );
+}
+
+// ------------------------------------------------------------- link_ticket
+
+/// The ordinary case: a job queued by hand gets a tracker ticket attached
+/// after the fact, and the loop-safety `remote_revision` a stale echo would
+/// have relied on is cleared so the ticket's first real webhook is not
+/// mistaken for one.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn link_ticket_attaches_a_tracker_and_ticket_ref(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+    let job = env.add_job(&caller, "wire up the webhook").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    let linked = ok(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id,
+                tracker: Tracker::Github,
+                ticket_ref: "acme/api#42".into(),
+            }),
+        )
+        .await);
+
+    assert_eq!(linked["job"]["tracker"], "github");
+    assert_eq!(linked["job"]["ticketRef"], "acme/api#42");
+}
+
+/// A blank `ticket_ref` is rejected before it ever reaches the database —
+/// storing one would make every job that hasn't been linked yet
+/// indistinguishable from one deliberately linked to nothing.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn link_ticket_rejects_a_blank_ticket_ref(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+    let job = env.add_job(&caller, "needs a ticket").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    let e = err(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id,
+                tracker: Tracker::Jira,
+                ticket_ref: "   ".into(),
+            }),
+        )
+        .await);
+
+    assert!(e.message.contains("ticket_ref"), "{}", e.message);
+}
+
+/// Two jobs cannot both claim the same ticket — that is a genuine conflict
+/// between two explicit calls, not a race to converge on, so it is named
+/// rather than silently resolved.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn link_ticket_refuses_a_ticket_another_job_already_holds(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+    let first = env.add_job(&caller, "first job").await;
+    let second = env.add_job(&caller, "second job").await;
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let second_id = second["id"].as_str().unwrap().to_string();
+
+    ok(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: first_id,
+                tracker: Tracker::Github,
+                ticket_ref: "acme/api#7".into(),
+            }),
+        )
+        .await);
+
+    let e = err(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: second_id,
+                tracker: Tracker::Github,
+                ticket_ref: "acme/api#7".into(),
+            }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "ticket_already_linked");
+}
+
+/// The tool requires the `trackers` scope, and the error names it — the same
+/// discipline every other write tool follows.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn link_ticket_requires_the_trackers_scope(pool: PgPool) {
+    let (env, owner) = env(pool).await;
+    env.register(&owner).await;
+    let job = env.add_job(&owner, "needs a scope check").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    let reader = principal(
+        owner.user_id,
+        owner.org_id,
+        vec!["jobs:read".into(), "jobs:write".into(), "repos:read".into()],
+    );
+
+    let e = err(env
+        .factory
+        .link_ticket(
+            Extension(parts(&reader)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id,
+                tracker: Tracker::Github,
+                ticket_ref: "acme/api#1".into(),
+            }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "insufficient_scope");
+    assert!(e.message.contains("trackers"), "{}", e.message);
+}
+
+// ------------------------------------------------------------- sync_ticket
+
+/// `sync_ticket` is a caller-facing action: a job that has never been linked
+/// gets a clear "call link_ticket first" error rather than silently doing
+/// nothing.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn sync_ticket_requires_a_tracker_link(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+    let job = env.add_job(&caller, "not linked yet").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    let e = err(env
+        .factory
+        .sync_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+
+    assert!(e.message.contains("link_ticket"), "{}", e.message);
+}
+
+/// A job that is still `pending` has nothing to report yet — there is no
+/// status change to reflect on the ticket.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn sync_ticket_refuses_a_still_pending_job(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+    let job = env.add_job(&caller, "still pending").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    ok(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id.clone(),
+                tracker: Tracker::Github,
+                ticket_ref: "acme/api#9".into(),
+            }),
+        )
+        .await);
+
+    let e = err(env
+        .factory
+        .sync_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+
+    assert!(e.message.contains("pending"), "{}", e.message);
+}
+
+/// A linked job whose repo has no tracker binding at all gets a
+/// configuration error naming what to do next, not a silent no-op — unlike
+/// the automatic post-transition sync, this call exists to talk to the
+/// tracker, so nothing happening is itself the failure to report.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn sync_ticket_without_a_binding_reports_not_configured(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    env.register(&caller).await;
+    let job = env.add_job(&caller, "linked but unbound").await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    ok(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id.clone(),
+                tracker: Tracker::Github,
+                ticket_ref: "acme/api#11".into(),
+            }),
+        )
+        .await);
+
+    ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: Some("agent-one".into()),
+            }),
+        )
+        .await);
+
+    let e = err(env
+        .factory
+        .sync_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "invalid_argument");
+    assert_eq!(e.data.as_ref().unwrap()["retriable"], false);
+    assert!(e.message.contains("no active"), "{}", e.message);
+}
+
+/// A linked job whose repo has an active binding, but whose outbound call
+/// cannot go through (here: the server has no GitHub App configured at all),
+/// is reported as a distinct, retriable failure — unlike the fixed,
+/// non-retriable configuration errors above, this is exactly the case
+/// `sync_ticket`'s own description promises a caller can retry after.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn sync_ticket_reports_an_outbound_failure_as_retriable(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    let repo = env.register(&caller).await;
+    let repo_id: RepoId = repo["id"].as_str().unwrap().parse().unwrap();
+
+    let mut tx = env.db.begin(caller.org_id).await.unwrap();
+    let connection = upsert_connection(&mut tx, Provider::Github, "999999", None, None)
+        .await
+        .unwrap();
+    upsert_binding(
+        &mut tx,
+        repo_id,
+        Some(connection.id),
+        Provider::Github,
+        "acme/api",
+        "trackers",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let job = env
+        .add_job(&caller, "linked and bound, but no App configured")
+        .await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    ok(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id.clone(),
+                tracker: Tracker::Github,
+                ticket_ref: "acme/api#13".into(),
+            }),
+        )
+        .await);
+
+    ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: Some("agent-one".into()),
+            }),
+        )
+        .await);
+
+    let e = err(env
+        .factory
+        .sync_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "tracker_sync_failed");
+    assert_eq!(e.data.as_ref().unwrap()["retriable"], true);
+}
+
+/// A ticket_ref that isn't a valid GitHub issue reference ("owner/repo#N")
+/// will never succeed no matter how many times it's retried — it must not
+/// share the outbound-call path's retriable bucket, or an agent could poll
+/// `sync_ticket` forever against a call that can never work. `link_ticket`
+/// only rejects a blank ticket_ref, not a malformed one, so this shape is
+/// reachable through the normal tool surface.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn sync_ticket_reports_a_malformed_github_ticket_ref_as_non_retriable(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    let repo = env.register(&caller).await;
+    let repo_id: RepoId = repo["id"].as_str().unwrap().parse().unwrap();
+
+    let mut tx = env.db.begin(caller.org_id).await.unwrap();
+    let connection = upsert_connection(&mut tx, Provider::Github, "999999", None, None)
+        .await
+        .unwrap();
+    upsert_binding(
+        &mut tx,
+        repo_id,
+        Some(connection.id),
+        Provider::Github,
+        "acme/api",
+        "trackers",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let job = env
+        .add_job(&caller, "linked to a malformed ticket_ref")
+        .await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    ok(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id.clone(),
+                tracker: Tracker::Github,
+                ticket_ref: "not-a-valid-github-ref".into(),
+            }),
+        )
+        .await);
+
+    ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: Some("agent-one".into()),
+            }),
+        )
+        .await);
+
+    let e = err(env
+        .factory
+        .sync_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "invalid_argument");
+    assert_eq!(e.data.as_ref().unwrap()["retriable"], false);
+    assert!(e.message.contains("not a valid GitHub"), "{}", e.message);
 }

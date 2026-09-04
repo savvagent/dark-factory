@@ -11,6 +11,7 @@ use df_core::ids::JobId;
 use df_core::jobs::{Job, JobFilter, NewJob, Status, Tracker};
 use df_core::trackers::{
     decode_stored_secret, get_connection, resolve_binding, upsert_connection, Provider,
+    TrackerBinding, TrackerConnection,
 };
 use df_trackers::github::GithubAppClient;
 use df_trackers::jira::JiraClient;
@@ -36,6 +37,25 @@ fn provider_of(tracker: Tracker) -> Provider {
         Tracker::Github => Provider::Github,
         Tracker::Jira => Provider::Jira,
     }
+}
+
+/// Turn a transient tracker-sync failure (a `String` error from the shared
+/// binding-resolution step or an outbound `sync_github_job`/`sync_jira_job`
+/// call) into the tool's own error, distinct from the fixed, non-retriable
+/// `Error::Invalid` messages `sync_ticket` returns for a configuration
+/// problem it can already name precisely (`NotConfigured`/`Broken`). Every
+/// site this wraps is something a later retry can plausibly fix — a
+/// database hiccup resolving the binding, a tracker outage, a rate limit —
+/// which is what `retriable: true` promises the caller.
+fn tracker_sync_error(message: impl Into<String>, retriable: bool) -> ErrorData {
+    ErrorData::new(
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        message.into(),
+        Some(serde_json::json!({
+            "code": "tracker_sync_failed",
+            "retriable": retriable,
+        })),
+    )
 }
 
 fn parse_github_ticket_ref(ticket_ref: &str) -> Option<(&str, &str, i64)> {
@@ -177,8 +197,102 @@ pub struct SetDependenciesArgs {
     pub remove: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkTicketArgs {
+    /// The job to attach a tracker ticket to.
+    pub job: String,
+    /// Which tracker the ticket lives in: "jira" or "github".
+    pub tracker: Tracker,
+    /// The ticket's reference in that tracker, e.g. "PROJ-123" or
+    /// "acme/api#42". Recorded, not resolved.
+    pub ticket_ref: String,
+}
+
+/// The outcome of looking up whether a job's repo actually has somewhere to
+/// sync to. Kept three-way rather than collapsing to `Option` so a broken
+/// invariant (a binding whose `connection_id` points at no
+/// `tracker_connections` row) never gets reported the same way as an
+/// ordinary "nothing configured yet" gap — the two need different messages
+/// wherever a caller can see them (`sync_ticket`), and the same distinction
+/// is worth preserving even where nothing is currently surfaced
+/// (`sync_job_after_transition`, which maps both to a silent no-op).
+enum BindingLookup {
+    /// No `tracker_bindings` row for this repo/provider, or one exists but
+    /// `connection_id IS NULL` (configured, not yet activated). Both mean the
+    /// same thing to a caller: nothing is wired up yet.
+    NotConfigured,
+    /// The binding's `connection_id` names a connection that no longer
+    /// exists — a data-integrity problem, not a configuration gap. Already
+    /// logged as the invariant violation it is by the time this is returned.
+    Broken,
+    Ready(Box<TrackerBinding>, TrackerConnection),
+}
+
 #[tool_router(router = jobs_router, vis = "pub(crate)")]
 impl Factory {
+    /// Resolve the connection a job's repo should sync outbound writes
+    /// through, in its own short transaction (no HTTP call is ever made while
+    /// holding one open). Shared by the fire-and-forget post-transition sync
+    /// and `sync_ticket`, which react to the three-way result differently —
+    /// see [`BindingLookup`].
+    async fn resolve_tracker_binding(
+        &self,
+        org_id: df_core::ids::OrgId,
+        repo_id: df_core::ids::RepoId,
+        provider: Provider,
+    ) -> Result<BindingLookup, String> {
+        let mut tx = self
+            .db()
+            .begin(org_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let binding = resolve_binding(&mut tx, repo_id, provider)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(binding) = binding else {
+            tx.commit().await.map_err(|error| error.to_string())?;
+            return Ok(BindingLookup::NotConfigured);
+        };
+        let Some(connection_id) = binding.connection_id else {
+            tx.commit().await.map_err(|error| error.to_string())?;
+            return Ok(BindingLookup::NotConfigured);
+        };
+        let connection = get_connection(&mut tx, provider)
+            .await
+            .map_err(|error| error.to_string())?;
+        tx.commit().await.map_err(|error| error.to_string())?;
+        // `get_connection` looks up by (org, provider), not by id.
+        // `tracker_bindings.connection_id` has `ON DELETE SET NULL` against
+        // `tracker_connections`, and `tracker_connections` carries
+        // `UNIQUE (org_id, provider)` — together those mean a non-null
+        // `connection_id` is, today, always the id of the one connection row
+        // `get_connection` would return for this provider; there is no
+        // current write path that leaves it pointing at a since-replaced
+        // row. Comparing ids explicitly costs nothing and keeps that true
+        // even if a future change (a differently-behaved delete path, a
+        // relaxed constraint) would otherwise let this resolve silently
+        // through the wrong connection instead of surfacing `Broken`.
+        let connection = match connection {
+            Some(connection) if connection.id == connection_id => connection,
+            _ => {
+                // Reachable today only if the invariant above stops holding.
+                // Log it as the invariant violation it would be instead of
+                // letting outbound sync silently vanish with no operator
+                // signal, matching how the inbound webhook route treats the
+                // same broken-invariant shape.
+                tracing::error!(
+                    repo_id = %repo_id,
+                    provider = %provider,
+                    "tracker binding names a connection id that no longer matches this org's \
+                     tracker_connections row for this provider"
+                );
+                return Ok(BindingLookup::Broken);
+            }
+        };
+        Ok(BindingLookup::Ready(Box::new(binding), connection))
+    }
+
     async fn sync_jobs_after_transition(
         &self,
         jobs: &[Job],
@@ -209,43 +323,16 @@ impl Factory {
         };
 
         let provider = provider_of(tracker);
-        let (binding, connection) = {
-            let mut tx = self
-                .db()
-                .begin(job.org_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            let binding = resolve_binding(&mut tx, job.repo_id, provider)
-                .await
-                .map_err(|error| error.to_string())?;
-            let Some(binding) = binding else {
-                tx.commit().await.map_err(|error| error.to_string())?;
-                return Ok(());
-            };
-            if binding.connection_id.is_none() {
-                tx.commit().await.map_err(|error| error.to_string())?;
-                return Ok(());
-            }
-            let connection = get_connection(&mut tx, provider)
-                .await
-                .map_err(|error| error.to_string())?;
-            tx.commit().await.map_err(|error| error.to_string())?;
-            let Some(connection) = connection else {
-                // Should be unreachable: a binding only ever carries a
-                // `connection_id` alongside the `tracker_connections` row it
-                // points at. Log it as the invariant violation it is instead
-                // of letting outbound sync silently vanish with no operator
-                // signal, matching how the inbound webhook route treats the
-                // same broken-invariant shape.
-                tracing::error!(
-                    job_id = %job.id,
-                    repo_id = %job.repo_id,
-                    provider = %provider,
-                    "tracker binding resolved a connection id with no matching tracker_connections row"
-                );
-                return Ok(());
-            };
-            (binding, connection)
+        let (binding, connection) = match self
+            .resolve_tracker_binding(job.org_id, job.repo_id, provider)
+            .await?
+        {
+            // Nothing to sync to yet, or a broken binding an operator needs
+            // to fix — neither is a failure of the queue transition that
+            // just happened, so both are a silent no-op here exactly as
+            // before this helper was extracted.
+            BindingLookup::NotConfigured | BindingLookup::Broken => return Ok(()),
+            BindingLookup::Ready(binding, connection) => (binding, connection),
         };
 
         let plan = outbound_decision(transition, tracker, detail);
@@ -830,5 +917,208 @@ impl Factory {
         tx.commit().await.mcp()?;
 
         Ok(Json(out::StatsOut { stats }))
+    }
+
+    #[tool(
+        name = "link_ticket",
+        description = "Attach a tracker ticket to a job so future transitions (claim, complete, \
+                       fail) post updates to it, and so sync_ticket can force a write-back on \
+                       demand. Use this for a job that was queued by hand (add_job) or claimed \
+                       before anyone thought to link it — a job created from an inbound webhook \
+                       already has this set. Fails with ticket_already_linked if another live \
+                       job in this repo already owns that ticket_ref."
+    )]
+    pub async fn link_ticket(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<LinkTicketArgs>,
+    ) -> Result<Json<out::JobOut>, ErrorData> {
+        let caller = self.caller(&parts)?;
+        caller.require_scope(scope::TRACKERS).mcp()?;
+
+        let mut tx = self.tx(&caller).await?;
+        self.charge(&mut tx, &caller, "link_ticket").await?;
+        let job = tx
+            .link_ticket(&JobId::from(args.job), args.tracker, &args.ticket_ref)
+            .await
+            .mcp()?;
+        tx.commit().await.mcp()?;
+
+        Ok(Json(out::JobOut { job }))
+    }
+
+    #[tool(
+        name = "sync_ticket",
+        description = "Force an immediate outbound write-back to the ticket a job is linked to, \
+                       reflecting the job's current status (in-progress, completed, or failed) \
+                       as a comment and, where the tracker supports it, a status transition. \
+                       Use this after link_ticket, when nothing has been posted yet because no \
+                       transition has fired since the link was made, or to retry after a \
+                       tracker outage — unlike the automatic write-back after claim_jobs, \
+                       complete_job and fail_job, this call surfaces a tracker failure as its \
+                       own error rather than swallowing it, because talking to the tracker is \
+                       the entire point of calling it. Requires the job to already be linked \
+                       via link_ticket and to be in-progress, completed, or failed."
+    )]
+    pub async fn sync_ticket(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<JobArgs>,
+    ) -> Result<Json<out::JobOut>, ErrorData> {
+        let caller = self.caller(&parts)?;
+        caller.require_scope(scope::TRACKERS).mcp()?;
+
+        // Reading the job costs nothing to bill for: the outbound call is the
+        // entire point of this tool, and whether it succeeds is not known
+        // until after it returns. Charging here, before that call, would bill
+        // a request whose tracker round trip then fails — charging happens
+        // later, only on success, alongside the write-back (see below).
+        let mut tx = self.tx(&caller).await?;
+        let job = tx.get_job(&JobId::from(args.job)).await.mcp()?;
+        tx.commit().await.mcp()?;
+
+        let Some(tracker) = job.tracker else {
+            return Err(df_core::Error::Invalid(format!(
+                "job {} has no tracker linked — call link_ticket first",
+                job.id
+            )))
+            .mcp();
+        };
+        let Some(ticket_ref) = job.ticket_ref.clone() else {
+            return Err(df_core::Error::Invalid(format!(
+                "job {} has no ticket_ref linked — call link_ticket first",
+                job.id
+            )))
+            .mcp();
+        };
+        let (transition, detail) = match job.status {
+            Status::Pending => {
+                return Err(df_core::Error::Invalid(format!(
+                    "job {} is still pending — nothing has happened to it yet to sync to its ticket",
+                    job.id
+                )))
+                .mcp();
+            }
+            Status::InProgress => (JobTransition::Claimed, job.claimed_by_label.clone()),
+            Status::Completed => (JobTransition::Completed, job.result.clone()),
+            Status::Failed => (JobTransition::Failed, job.error.clone()),
+        };
+
+        let provider = provider_of(tracker);
+        let (binding, connection) = match self
+            .resolve_tracker_binding(job.org_id, job.repo_id, provider)
+            .await
+            .map_err(|error| tracker_sync_error(error, true))?
+        {
+            BindingLookup::NotConfigured => {
+                return Err(df_core::Error::Invalid(format!(
+                    "this repo has no active {provider} binding — configure one before \
+                     calling sync_ticket"
+                )))
+                .mcp();
+            }
+            BindingLookup::Broken => {
+                return Err(df_core::Error::Invalid(format!(
+                    "this repo's {provider} binding points at a connection that no longer \
+                     exists — this needs an operator to fix, not a retry"
+                )))
+                .mcp();
+            }
+            BindingLookup::Ready(binding, connection) => (binding, connection),
+        };
+
+        let plan = outbound_decision(transition, tracker, detail.as_deref());
+        let job = match tracker {
+            Tracker::Github => {
+                // A malformed ticket_ref (anything not "owner/repo#N") is
+                // caller input, not a tracker outage: it will never succeed
+                // no matter how many times it's retried. Catching it here,
+                // ahead of the outbound call, keeps it out of
+                // `tracker_sync_error`'s retriable bucket — the parse
+                // failure inside `sync_github_job` itself is a `String`
+                // with no room to carry that distinction, so it must not be
+                // the thing this checks.
+                if parse_github_ticket_ref(&ticket_ref).is_none() {
+                    return Err(df_core::Error::Invalid(format!(
+                        "job {} has a ticket_ref {ticket_ref:?} that is not a valid GitHub \
+                         issue reference (expected \"owner/repo#number\") — relink it with \
+                         link_ticket before calling sync_ticket again",
+                        job.id
+                    )))
+                    .mcp();
+                }
+                let outcome = self
+                    .sync_github_job(&job, &ticket_ref, &connection.external_id, &plan)
+                    .await
+                    .map_err(|error| tracker_sync_error(error, true))?;
+                // The write-back commits on its own, before charging is even
+                // attempted: this is loop-safety state for a call to the
+                // tracker that has already happened, and it must survive
+                // regardless of whether billing this call succeeds. Charging
+                // in the same Tx as the write-back would roll the write-back
+                // back on a quota refusal, leaving remote_revision stale and
+                // making a caller's retry re-post to the tracker a second
+                // time for a sync that already went through.
+                let mut tx = self.tx(&caller).await?;
+                let job = if let Some(remote_revision) = outcome {
+                    tx.set_remote_revision(&job.id, &remote_revision)
+                        .await
+                        .mcp()?;
+                    let job = tx.get_job(&job.id).await.mcp()?;
+                    tx.commit().await.mcp()?;
+                    job
+                } else {
+                    tx.commit().await.mcp()?;
+                    job
+                };
+                let mut charge_tx = self.tx(&caller).await?;
+                self.charge(&mut charge_tx, &caller, "sync_ticket").await?;
+                charge_tx.commit().await.mcp()?;
+                job
+            }
+            Tracker::Jira => {
+                let outcome = self
+                    .sync_jira_job(&job, &ticket_ref, &binding.external_ref, &connection, &plan)
+                    .await
+                    .map_err(|error| tracker_sync_error(error, true))?;
+                // Same reasoning as the GitHub arm above: the write-back (the
+                // revision and any rotated JIRA credentials) commits before
+                // charging is attempted, so a quota refusal never erases
+                // loop-safety state for a tracker call that already happened.
+                let mut tx = self.tx(&caller).await?;
+                let job = if let Some(remote_revision) = outcome.remote_revision.as_deref() {
+                    tx.set_remote_revision(&job.id, remote_revision)
+                        .await
+                        .mcp()?;
+                    tx.get_job(&job.id).await.mcp()?
+                } else {
+                    job
+                };
+                if let Some(rotated) = outcome.rotated_credentials.as_ref() {
+                    let webhook_secret = connection
+                        .encrypted_webhook_secret
+                        .as_deref()
+                        .map(decode_stored_secret)
+                        .transpose()
+                        .mcp()?;
+                    upsert_connection(
+                        &mut tx,
+                        Provider::Jira,
+                        &connection.external_id,
+                        Some(rotated),
+                        webhook_secret.as_ref(),
+                    )
+                    .await
+                    .mcp()?;
+                }
+                tx.commit().await.mcp()?;
+                let mut charge_tx = self.tx(&caller).await?;
+                self.charge(&mut charge_tx, &caller, "sync_ticket").await?;
+                charge_tx.commit().await.mcp()?;
+                job
+            }
+        };
+
+        Ok(Json(out::JobOut { job }))
     }
 }
