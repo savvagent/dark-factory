@@ -12,9 +12,9 @@ GitHub/JIRA write-back is attempted, without disturbing the existing loop-safety
 
 ## Status — 2026-09-04
 
-Task 1 implemented in this PR (savvagent/dark-factory#30) and covered by
+Shipped in savvagent/dark-factory#30. Task 1 complete, covered by
 `sync_ticket_refuses_before_the_outbound_call_when_over_budget` in
-`crates/df-mcp/tests/tools.rs`. Marked complete once that PR merges.
+`crates/df-mcp/tests/tools.rs`.
 
 ## Global Constraints
 
