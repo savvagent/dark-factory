@@ -973,8 +973,16 @@ impl Factory {
         // until after it returns. Charging here, before that call, would bill
         // a request whose tracker round trip then fails — charging happens
         // later, only on success, alongside the write-back (see below).
+        //
+        // The quota *check*, unlike the charge, does belong here: it is
+        // read-only, and running it ahead of both tracker arms' outbound
+        // calls means an org on a hard-stop plan already over its bucket is
+        // refused before this tool posts anything to GitHub or JIRA, rather
+        // than only finding out afterwards via the eventual `charge` call
+        // below (see `Factory::would_refuse`'s doc comment).
         let mut tx = self.tx(&caller).await?;
         let job = tx.get_job(&JobId::from(args.job)).await.mcp()?;
+        self.would_refuse(&mut tx, "sync_ticket").await?;
         tx.commit().await.mcp()?;
 
         let Some(tracker) = job.tracker else {

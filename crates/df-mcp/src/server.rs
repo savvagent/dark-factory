@@ -168,6 +168,19 @@ impl Factory {
             .map_err(|e| error::from_billing(&e))
     }
 
+    /// Read-only quota check for `sync_ticket`'s two-transaction charging
+    /// shape — see [`Self::charge`]'s doc comment for why that tool cannot
+    /// charge before its outbound call the way every other tool does. This
+    /// runs the same enforcement/hard-stop/bucket check `charge` does,
+    /// without recording usage, so `sync_ticket` can refuse before making
+    /// that call.
+    pub async fn would_refuse(&self, tx: &mut Tx<'_>, tool: &str) -> Result<(), ErrorData> {
+        self.meter
+            .would_refuse(tx, tool)
+            .await
+            .map_err(|e| error::from_billing(&e))
+    }
+
     /// The principal for the HTTP request this tool call arrived on.
     pub fn caller(&self, parts: &http::request::Parts) -> Result<Principal, ErrorData> {
         crate::auth::principal_from(parts).ok_or_else(error::unauthenticated)

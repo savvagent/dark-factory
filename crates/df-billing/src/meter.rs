@@ -64,11 +64,46 @@ impl Meter {
     pub async fn charge(&self, tx: &mut Tx<'_>, user: UserId, tool: &str) -> Result<Charge> {
         let class = classify::classify(tool);
         let limits = tx.plan_limits().await?;
+        self.check_quota(tx, tool, class, &limits).await?;
 
-        // The check reads the count *before* this call is added, so the call
-        // that lands exactly on the limit is allowed and the next one is not.
-        // An off-by-one here is the difference between a plan advertised as 500
-        // operations delivering 500 or 499.
+        let usage = tx
+            .record_usage(Some(user), tool, class.is_billable())
+            .await?;
+
+        Ok(Charge::new(class, usage, limits))
+    }
+
+    /// Check whether a call would be refused, without recording any usage.
+    ///
+    /// Used by `sync_ticket` (`df_mcp::tools::jobs`), whose "work" is an
+    /// outbound tracker write that has already happened by the time `charge`
+    /// runs (see `Factory::charge`'s doc comment) — without this, an org on a
+    /// hard-stop plan already over its bucket gets that write posted anyway,
+    /// only to be told afterwards that it wasn't billed. This reads the same
+    /// counters `charge` re-checks before recording usage, so the two can
+    /// disagree only if the count changes in between — a narrow, acceptable
+    /// race no different from any other check-then-act gap, and strictly
+    /// better than not checking at all.
+    pub async fn would_refuse(&self, tx: &mut Tx<'_>, tool: &str) -> Result<()> {
+        let class = classify::classify(tool);
+        let limits = tx.plan_limits().await?;
+        self.check_quota(tx, tool, class, &limits).await
+    }
+
+    /// The enforcement/hard-stop/bucket check shared by [`Self::charge`] and
+    /// [`Self::would_refuse`].
+    ///
+    /// The check reads the count *before* this call is added, so the call
+    /// that lands exactly on the limit is allowed and the next one is not. An
+    /// off-by-one here is the difference between a plan advertised as 500
+    /// operations delivering 500 or 499.
+    async fn check_quota(
+        &self,
+        tx: &mut Tx<'_>,
+        tool: &str,
+        class: Class,
+        limits: &PlanLimits,
+    ) -> Result<()> {
         if self.enforce && class.is_billable() && limits.hard_stop {
             let before = tx.current_usage().await?;
             if before.billable_count >= limits.included_ops {
@@ -76,17 +111,12 @@ impl Meter {
                     tool: tool.to_string(),
                     used: before.billable_count,
                     included: limits.included_ops,
-                    plan: limits.display_name,
+                    plan: limits.display_name.clone(),
                     upgrade_url: self.upgrade_url.clone(),
                 });
             }
         }
-
-        let usage = tx
-            .record_usage(Some(user), tool, class.is_billable())
-            .await?;
-
-        Ok(Charge::new(class, usage, limits))
+        Ok(())
     }
 
     /// Report an org's standing without charging for anything.
