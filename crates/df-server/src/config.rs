@@ -28,14 +28,19 @@ pub struct Config {
     pub database_url: String,
     pub bind: SocketAddr,
 
-    /// Public origin a browser sees. Everything emailed, the OAuth issuer, and
-    /// the discovery documents are built from it.
+    /// Public origin a browser sees. The OAuth issuer and the discovery
+    /// documents are built from it.
     pub public_url: String,
     /// Canonical MCP resource URI, and the audience every token carries.
     pub resource_uri: String,
 
-    /// 32 bytes, base64. Encrypts TOTP secrets at rest.
+    /// 32 bytes, base64. Encrypts secrets at rest (currently tracker webhook
+    /// secrets and JIRA OAuth credentials — see `df_core::trackers` and
+    /// `df_trackers::jira`).
     pub encryption_key: String,
+    /// Unused since passkeys replaced TOTP (see `CLAUDE.md`'s Authentication
+    /// section) — kept only because `DF_TOTP_ISSUER` is still read from the
+    /// environment below and threaded through to `df-web`'s `AppState`.
     pub totp_issuer: String,
 
     /// GitHub App id for tracker integration. Optional because deployments

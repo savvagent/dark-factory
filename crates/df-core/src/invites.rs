@@ -31,8 +31,9 @@ use uuid::Uuid;
 /// How long an invitation is good for.
 ///
 /// Long enough to survive a holiday, short enough that a mailbox breached next
-/// quarter is not a way into the org. Deliberately far longer than a magic link
-/// ([`crate::super`] — `df_auth::magic::TTL_MINUTES`): a magic link is clicked
+/// quarter is not a way into the org. Deliberately far longer than the
+/// single-use links this product used to email (removed along with email
+/// entirely — see `CLAUDE.md`'s Authentication section): those were clicked
 /// within minutes of being requested, while an invitation waits on a human who
 /// did not ask for it.
 pub const TTL_DAYS: i64 = 14;

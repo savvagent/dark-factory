@@ -23,8 +23,7 @@ pub struct Config {
     /// an audience derived from one is not an audience check.
     pub resource_uri: String,
 
-    /// The label an authenticator app shows next to the code. Changing it after
-    /// launch orphans every enrolled device, so it is set once.
+    /// Unused since passkeys replaced TOTP — see `df_server::Config::totp_issuer`.
     pub totp_issuer: String,
 
     /// Shared secret for GitHub webhook signature verification. Optional
@@ -115,7 +114,9 @@ pub struct AppState {
     /// would make a configuration change silently invalidate credentials
     /// instead of failing at boot.
     pub webauthn: Arc<df_auth::passkeys::Webauthn>,
-    /// Decrypts TOTP secrets. Held as an `Arc` because the key material is
+    /// Decrypts secrets at rest (currently tracker webhook secrets and JIRA
+    /// OAuth credentials — see `df_core::trackers` and `df_trackers::jira`).
+    /// Held as an `Arc` because the key material is
     /// loaded once at startup and shared by every request.
     pub cipher: Arc<Cipher>,
     pub config: Arc<Config>,

@@ -3,9 +3,9 @@
 //! Two audiences, and they must not see the same thing:
 //!
 //! - **The caller** gets [`AuthError::public`] — a deliberately vague string.
-//!   Login failures are constant-shape whether the email is unknown, the
-//!   account has no TOTP, the code is wrong, or the code was replayed. Any
-//!   distinction between those is an account-enumeration oracle.
+//!   Login failures are constant-shape whether the address is unknown, the
+//!   account has no passkey, or the passkey ceremony failed. Any distinction
+//!   between those is an account-enumeration oracle.
 //! - **The log and the audit trail** get the full variant, which says exactly
 //!   what happened, because an operator debugging a failed login should not
 //!   have to guess.

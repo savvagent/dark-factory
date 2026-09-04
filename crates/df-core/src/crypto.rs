@@ -13,8 +13,8 @@ use rand::RngCore;
 use crate::error::{Error, Result};
 
 /// Authenticated encryption for secrets that must be *recoverable* rather than
-/// merely verifiable — TOTP shared secrets, IdP client secrets, tracker refresh
-/// tokens. Everything else is hashed, not encrypted.
+/// merely verifiable — IdP client secrets, tracker webhook/refresh secrets.
+/// Everything else is hashed, not encrypted.
 ///
 /// The key comes from `DF_ENCRYPTION_KEY` in the environment (or KMS) and never
 /// from the database, so a database dump alone yields no usable secret.

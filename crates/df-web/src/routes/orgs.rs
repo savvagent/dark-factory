@@ -485,11 +485,13 @@ pub async fn revoke_invite(
     Ok(http::StatusCode::NO_CONTENT.into_response())
 }
 
-/// `POST /api/orgs/{org}/invites/accept` — join, using the emailed token.
+/// `POST /api/orgs/{org}/invites/accept` — join, using the invite token the
+/// admin delivered.
 ///
-/// **A `POST`, like every other credential redemption here** — the emailed URL
-/// points at a page that renders a button, and mail scanners that follow the
-/// link find a page rather than a spent invitation.
+/// **A `POST`, like every other credential redemption here** — the link an
+/// admin pastes into chat or a ticket points at a page that renders a button,
+/// and a link-preview fetcher or mail scanner that follows it finds a page
+/// rather than a spent invitation.
 ///
 /// Requires a session whose address matches the one invited. Signing in is what
 /// proves the address — a session exists only for an account holding a confirmed

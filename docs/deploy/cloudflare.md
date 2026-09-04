@@ -62,7 +62,7 @@ Three environment variables on `df-server`, and none of them is optional.
 
 | Variable | Value | Why |
 |---|---|---|
-| `DF_PUBLIC_URL` | `https://console.example.com` | The Worker's hostname, never the origin's. Every emailed link, the OAuth issuer, and both discovery documents are built from it. Point it at the origin and the console tells agents to connect to a host the browser never uses. |
+| `DF_PUBLIC_URL` | `https://console.example.com` | The Worker's hostname, never the origin's. The OAuth issuer and both discovery documents are built from it. Point it at the origin and the console tells agents to connect to a host the browser never uses. |
 | `DF_ALLOWED_HOSTS` | the origin's hostname, e.g. `dark-factory-mcp.fly.dev` | **See the trap below.** Without it every authenticated MCP call fails. |
 | `DF_CLIENT_IP_HEADER` | `cf-connecting-ip` | Cloudflare overwrites this header inbound. `fly-client-ip` would now hold a Cloudflare edge address, and every per-IP throttle would count all of Cloudflare as one caller. |
 
@@ -92,8 +92,9 @@ any port, which is what the local verification below relies on.
 
 `DF_CLIENT_IP_HEADER=cf-connecting-ip` is safe only because Cloudflare overwrites that
 header. Anyone who can reach the Fly app directly sets it themselves, and then every
-per-IP throttle — on login, on magic links, on client registration — counts a value the
-attacker chose, which is worse than having no throttle because it looks like it is working.
+per-IP throttle — on login, on passkey ceremonies, on client registration — counts a value
+the attacker chose, which is worse than having no throttle because it looks like it is
+working.
 
 Lock the origin to Cloudflare. In rough order of strength:
 
@@ -132,9 +133,11 @@ What that run established:
 - **The session cookie survives the edge intact** — `__Host-df_session; Path=/; HttpOnly;
   Secure; SameSite=Lax; Max-Age=1209600`, which is the whole of issue #2's third checkbox.
   Sign-up, emailed verification link, TOTP enrolment, org creation and PAT minting were all
-  driven through the Worker.
-- **Emailed links and the OAuth issuer name the edge**, because they are built from
-  `DF_PUBLIC_URL`. The minted PAT's audience came back as `http://localhost:8788/mcp`.
+  driven through the Worker. (This run predates the removal of email and TOTP — see the
+  milestone plan's Task 6 for what replaced them; a re-run today would drive a passkey
+  ceremony instead.)
+- **The OAuth issuer names the edge**, because it is built from `DF_PUBLIC_URL`. The minted
+  PAT's audience came back as `http://localhost:8788/mcp`.
 - **`303`s pass through.** `POST /oauth/authorize` returned `303` with
   `Location: http://localhost:3118/callback?code=…` rather than a followed body — the Worker
   sets `redirect: 'manual'`, without which Cloudflare would fetch the client's callback

@@ -116,7 +116,7 @@ compile-time layering discipline, not separate services.
 | Crate | Responsibility |
 |---|---|
 | `df-core` | Domain + **all** SQL. No HTTP, no auth. Every tenant fn takes an `OrgId`. |
-| `df-auth` | OAuth 2.1 AS, TOTP, enterprise OIDC federation, personal access tokens. |
+| `df-auth` | OAuth 2.1 AS, passkeys, enterprise OIDC federation, personal access tokens. |
 | `df-mcp` | `rmcp` Streamable HTTP server, tool surface, resource-server middleware. |
 | `df-billing` | Usage recording, period counters, tier limits. |
 | `df-trackers` | GitHub App + JIRA clients, webhook ingest, two-way sync. |
@@ -173,9 +173,9 @@ why it lives here and not in `df-mcp`. Four conventions:
   drop the cookie on the top-level navigation into `/oauth/authorize`.
 
 **There is no mailer, and adding one is a product decision, not a convenience.** Nothing in
-this product sends email: an authenticator app is the only factor, recovery codes are the
-only self-service way back in, an org admin clearing a member's credential
-(`reset_member_authenticator`) is the only assisted one, and invitations are codes the admin
+this product sends email: a passkey is the only factor, a second passkey is the only
+self-service way back in, an org admin clearing a member's passkeys
+(`reset_member_passkeys`) is the only assisted one, and invitations are codes the admin
 delivers themselves. `users.email` is a unique key and a label in the audit trail — never a
 destination. A `Mailer` trait reappearing here means somebody has reintroduced a dependency
 the design removed on purpose.

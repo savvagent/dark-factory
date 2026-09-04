@@ -192,7 +192,7 @@ refuses an unrequested version would fail, and the fix belongs upstream in `rmcp
 
 ```bash
 cargo run -p df-server                      # .env, DF_PUBLIC_URL=http://localhost:8080
-# console: sign up, verify, enrol TOTP, create an org, register a repo, mint a PAT
+# console: sign up with a passkey, create an org, register a repo, mint a PAT
 claude mcp add --transport http dark-factory http://localhost:8080/mcp
 claude mcp login dark-factory                # interactive terminal required
 copilot --additional-mcp-config @copilot.json --allow-all-tools -p "call whoami"

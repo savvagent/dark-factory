@@ -99,7 +99,7 @@ skill can use to record whatever it wants to measure.
                    ├────────────────────────────────────────────┤
   browser ────────▶│  df-web     console API (/api) + OAuth AS   │
                    ├────────────────────────────────────────────┤
-                   │  df-auth    OAuth 2.1 AS · TOTP · OIDC fed  │
+                   │  df-auth    OAuth 2.1 AS · passkeys · OIDC  │
                    │  df-billing metering · tiers · Stripe       │
                    │  df-trackers GitHub App · JIRA 3LO · hooks  │
                    ├────────────────────────────────────────────┤
@@ -117,7 +117,7 @@ compile-time layering discipline, not separate services. Split later if load dem
 | Crate | Responsibility |
 |---|---|
 | `df-core` | Domain model + all SQL: orgs, teams, repos, jobs, leases, messages. Every public function takes an `OrgId`. No HTTP, no auth. |
-| `df-auth` | OAuth 2.1 authorization server, TOTP enrollment/verification, enterprise OIDC federation, personal access tokens, token issuance + introspection. |
+| `df-auth` | OAuth 2.1 authorization server, passkey (WebAuthn) registration/authentication, enterprise OIDC federation, personal access tokens, token issuance + introspection. |
 | `df-mcp` | `rmcp` Streamable HTTP server, the tool surface, the OAuth resource-server middleware. |
 | `df-billing` | Usage event recording, period counters, tier limits, Stripe sync. |
 | `df-trackers` | GitHub App + JIRA OAuth clients, webhook ingest, two-way sync engine. |
@@ -232,25 +232,36 @@ Scopes: `jobs:read`, `jobs:write`, `repos:read`, `repos:write`, `messages`, `tra
 This is what happens *inside* `/oauth/authorize`, and it is where the two customer
 segments diverge.
 
-**Individual team members — passwordless TOTP.** At signup the user verifies their email,
-then enrolls an authenticator app from a provisioning URI (`otpauth://totp/…`) rendered as
-a QR code. Login is email + a 6-digit code. No password is ever set, stored, or reset.
+**Individual team members — passwordless passkeys.** A passkey (WebAuthn) both creates the
+account and authenticates it: signup issues no session and takes no request body at all,
+and the address is a profile field set afterwards by someone already holding the key. Login
+is usernameless — credentials are discoverable, `allowCredentials` is empty, and the
+browser resolves the account from the key it offers. No password, TOTP secret, or other
+static credential is ever set, stored, or reset.
 
 Details that matter:
-- Shared secrets encrypted at rest (AES-256-GCM, key from environment/KMS, never in the DB).
-- ±1 step (30 s) drift window; a used `(user, step)` pair is recorded and refused, so a
-  code phished in-window cannot be replayed.
-- Rate limited per user and per IP, with exponential lockout.
-- **Recovery**: 10 single-use recovery codes at enrollment (hashed at rest), plus a signed,
-  single-use, 10-minute email magic link. Without this a lost phone is a lost account —
-  TOTP alone is not a shippable auth system.
-- Login responses are constant-shape whether or not the email exists (no enumeration).
+- The server stores only public keys and signature counters (`passkeys`); losing the whole
+  table lets an attacker sign in as nobody, unlike a shared secret at rest.
+- A passkey signs over the origin it was registered to (`DF_PUBLIC_URL`), which is what
+  makes it phishing-resistant — nobody can be talked into producing a signature their
+  authenticator will only make for the real origin.
+- Rate limited per account and per IP, with exponential lockout.
+- **Recovery** is a second passkey: the console pushes for one from the moment there is
+  one, and removing a credential is refused when it is the last one. There is no recovery
+  code and no emailed link — dark-factory sends no mail at all. An org admin clearing a
+  member's credential (`reset_member_passkeys`) is the only assisted path, and it
+  issues a claim code in the same operation it clears the keys, so the account is never
+  left both keyless and unclaimed.
+- Nothing is submitted before a ceremony, so there is nothing to answer differently about —
+  the enumeration oracle a password or a returned TOTP secret used to leak through is
+  closed by construction.
 
 **Enterprises — OIDC federation.** An org admin binds an IdP (Okta, Entra ID, Google
 Workspace, any OIDC provider) with issuer, client id, and secret, then claims email
 domains and proves control via a DNS TXT record. A login for a claimed domain redirects to
-that IdP instead of the TOTP prompt; the returned `sub` is pinned to the user row on first
-use. Admins can set `enforce_sso`, disabling TOTP for that org's members.
+that IdP instead of the passkey ceremony; the returned `sub` is pinned to the user row on
+first use. Admins can set `enforce_sso`, disabling individual passkey login for that org's
+members.
 
 ## Client compatibility
 
@@ -362,8 +373,8 @@ SvelteKit 2 / Svelte 5 (runes) / Tailwind v4, talking only to `df-web`:
 ## Deployment
 
 A single container image, Postgres, nothing else stateful. Migrations run at startup under
-an advisory lock so concurrent replicas are safe. Secrets (DB URL, TOTP encryption key,
-OAuth signing key, Stripe key, GitHub App private key) come from the environment. Target:
+an advisory lock so concurrent replicas are safe. Secrets (DB URL, encryption key for
+secrets at rest, OAuth signing key, Stripe key, GitHub App private key) come from the environment. Target:
 Fly.io or ECS behind a TLS terminator; Neon or Aurora for Postgres.
 
 ## Testing
@@ -373,8 +384,8 @@ Fly.io or ECS behind a TLS terminator; Neon or Aurora for Postgres.
   asserting org B cannot see or mutate org A's row.
 - Repo resolution: a table-driven test over remote-URL forms (SSH, HTTPS, with and without
   `.git`, with embedded credentials, host aliases) proving they normalize to one row.
-- `df-auth`: TOTP drift/replay, PKCE, token audience enforcement, PAT scoping, and the
-  enumeration-resistant login shape.
+- `df-auth`: passkey ceremony correctness (challenge/response, resident-key overrides),
+  PKCE, token audience enforcement, PAT scoping, and the enumeration-resistant signup shape.
 - `df-billing`: counter arithmetic, bucket boundaries, the free/billable split.
 - `df-trackers`: recorded-fixture tests for webhook signature verification and loop
   suppression.

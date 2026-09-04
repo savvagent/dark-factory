@@ -31,8 +31,8 @@ async fn main() -> Result<()> {
 
     // Validate the key before anything else can be built with it. `Cipher`
     // construction is infallible from here on, and a bad key is a startup
-    // error naming the variable rather than a panic on the first TOTP enrolment
-    // hours later.
+    // error naming the variable rather than a panic the first time something
+    // needs to encrypt a secret hours later.
     df_core::crypto::Cipher::from_base64_key(&config.encryption_key)
         .context("DF_ENCRYPTION_KEY is not a valid 32-byte base64 key")?;
 

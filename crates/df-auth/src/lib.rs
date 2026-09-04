@@ -2,18 +2,20 @@
 //!
 //! Two layers that must not be conflated:
 //!
-//! - **Layer 2, who the human is**: [`login`] is the front door, over [`totp`]
-//!   (passwordless TOTP with replay refusal, throttling, and recovery codes)
-//!   and [`sessions`] (the console's browser cookie). Enterprise OIDC
+//! - **Layer 2, who the human is**: [`login`] is the front door, over
+//!   [`passkeys`] (WebAuthn, usernameless, phishing-resistant) and
+//!   [`sessions`] (the console's browser cookie). Enterprise OIDC
 //!   federation joins this layer later.
 //!
 //!   **No email, anywhere.** There is no verification link, no recovery link,
-//!   and no mailer — an authenticator app is the only factor, recovery codes
-//!   are the only self-service way back in, and an org admin resetting a
-//!   member's credential is the only assisted one. That is a product decision
-//!   with a consequence worth stating plainly: signup has to hand the TOTP
-//!   secret back in its own response, so it cannot also pretend not to know
-//!   whether an address is already registered. See `df_web::routes::auth`.
+//!   and no mailer — a passkey is the only factor, a second passkey is the
+//!   only self-service way back in, and an org admin resetting a member's
+//!   passkeys (`df_web::routes::orgs::reset_member_passkeys`) is the only
+//!   assisted one. That is a product decision with a consequence worth
+//!   stating plainly: signup takes no request body at all, so there is
+//!   nothing submitted before a ceremony to answer differently about — the
+//!   account-enumeration oracle a password or a returned secret used to leak
+//!   through is closed by construction. See `df_web::routes::auth`.
 //! - **Layer 1, what a client may do**: the OAuth 2.1 authorization server and
 //!   the token model.
 //!
