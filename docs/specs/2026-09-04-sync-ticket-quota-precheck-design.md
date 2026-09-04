@@ -1,7 +1,7 @@
 # sync_ticket quota pre-check design
 
-> **Status:** DRAFT — adds a read-only quota check to `sync_ticket` ahead of its outbound
-> tracker call.
+> **Status:** IMPLEMENTED — the read-only quota check shipped in
+> savvagent/dark-factory#30.
 > **Depends on:** `docs/specs/2026-09-03-df-trackers-design.md` §7 (`link_ticket`/
 > `sync_ticket`) — merged in PR #26.
 
