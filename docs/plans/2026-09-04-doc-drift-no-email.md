@@ -3,6 +3,12 @@
 **Fast-path: no design spec per dark-factory-development trivial-task criteria** — this is a
 documentation-only correction with no code or interface change, closing GitHub issue #14.
 
+## Status — 2026-09-04
+
+Complete. All three tasks below landed; both mandatory-trio reviewers on PR #29 (`rust-pro`,
+`architect-reviewer`) confirmed their findings were resolved after the review-response
+commits.
+
 ## Goal
 
 `docs/plans/2026-09-01-milestone-1.md` (Tasks 6, 10, 11, 13),
@@ -78,3 +84,15 @@ documentation, and each needs its own decision about backward compatibility.
 
 No test/lint/build gate applies beyond `cargo check --workspace` — documentation and
 comments only, no behavior changed.
+
+## Task 3 — Address automated + human review feedback
+
+- [x] Fix `crates/df-server/src/main.rs`'s stale "first TOTP enrolment" comment, flagged by
+      the `rust-pro` reviewer.
+- [x] Fix `docs/deploy/cloudflare.md`'s internal inconsistency flagged by
+      `copilot-pull-request-reviewer`: the "Verified locally" bullet had dropped "emailed
+      verification link" from its historical description while the adjacent parenthetical
+      still referenced it.
+- [x] `cargo check -p df-server` — confirms the comment-only change compiles.
+- [x] `git commit -m "docs: fix stale TOTP comment in df-server main"` /
+      `git commit -m "docs: fix cloudflare.md historical narrative inconsistency"`.

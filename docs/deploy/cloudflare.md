@@ -132,10 +132,10 @@ What that run established:
   it is a legal org slug, and a prefix test that is not segment-aware sends it to the origin.
 - **The session cookie survives the edge intact** — `__Host-df_session; Path=/; HttpOnly;
   Secure; SameSite=Lax; Max-Age=1209600`, which is the whole of issue #2's third checkbox.
-  Sign-up, TOTP enrolment, org creation and PAT minting were all driven through the Worker.
-  (This run predates the removal of email and TOTP — see the milestone plan's Task 6 for
-  what replaced them; a re-run today would drive a passkey ceremony instead of an emailed
-  verification link and TOTP enrolment.)
+  Sign-up, emailed verification link, TOTP enrolment, org creation and PAT minting were all
+  driven through the Worker. (This run predates the removal of email and TOTP — see the
+  milestone plan's Task 6 for what replaced them; a re-run today would drive a passkey
+  ceremony instead.)
 - **The OAuth issuer names the edge**, because it is built from `DF_PUBLIC_URL`. The minted
   PAT's audience came back as `http://localhost:8788/mcp`.
 - **`303`s pass through.** `POST /oauth/authorize` returned `303` with
