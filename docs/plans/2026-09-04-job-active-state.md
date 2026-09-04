@@ -248,7 +248,7 @@ Steps:
 - [x] Run `cargo test -p df-web --test console` and the `openapi` unit tests — all pass.
 - [ ] `cargo fmt --all && git add -A && git commit -m "df-web: document the active job status"`
 
-## Task 4 — `web/`: console UI ⬜
+## Task 4 — `web/`: console UI ✅
 
 **Files:** `web/src/lib/types.ts`, `web/src/lib/components/StatusPill.svelte`,
 `web/src/routes/o/[org]/queue/+page.svelte`, `web/src/routes/o/[org]/+page.svelte`
@@ -258,22 +258,22 @@ Steps:
 
 Steps:
 
-- [ ] `web/src/lib/types.ts`: add `'active'` to the `JobStatus` union (between
+- [x] `web/src/lib/types.ts`: add `'active'` to the `JobStatus` union (between
       `'in-progress'` and `'completed'`); add `active: number;` to the `QueueStats`
       interface (between `inProgress` and `completed`).
-- [ ] `web/src/lib/components/StatusPill.svelte`: add
+- [x] `web/src/lib/components/StatusPill.svelte`: add
       `active: 'border-accent/50 bg-accent/10 text-accent'` to `tones`, matching the
       existing entries' shape.
-- [ ] `web/src/routes/o/[org]/queue/+page.svelte`: add `'active'` to the `STATUSES` array
+- [x] `web/src/routes/o/[org]/queue/+page.svelte`: add `'active'` to the `STATUSES` array
       between `'in-progress'` and `'completed'`.
-- [ ] `web/src/routes/o/[org]/+page.svelte`: add an "Active" tile to the overview stat
+- [x] `web/src/routes/o/[org]/+page.svelte`: add an "Active" tile to the overview stat
       tiles, next to `'In progress'`, reading `stats.active` (reuse the same tile shape
       the existing `'In progress'` entry uses; pick a `tone` distinct from `text-busy`,
       e.g. `text-accent`, matching the `StatusPill` choice above).
-- [ ] Run `cd web && npm run check` — passes (type additions satisfy `svelte-check`).
-- [ ] Run `cd web && npm run lint` — passes.
-- [ ] Run `cd web && npm test` — passes unchanged (no Worker routing change).
-- [ ] Run `cd web && npm run build` — succeeds.
+- [x] Run `cd web && npm run check` — passes (type additions satisfy `svelte-check`).
+- [x] Run `cd web && npm run lint` — passes.
+- [x] Run `cd web && npm test` — passes unchanged (no Worker routing change).
+- [x] Run `cd web && npm run build` — succeeds.
 - [ ] No Rust changed in this task, so `cargo fmt --all` is a no-op here — skip it. If
       the edits need reformatting, run `cd web && npm run format` (prettier --write),
       matching `web/package.json`'s actual script (not `npm run lint -- --write`, which

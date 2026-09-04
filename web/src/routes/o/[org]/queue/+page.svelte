@@ -28,7 +28,7 @@
 
   const org = useOrg();
 
-  const STATUSES: JobStatus[] = ['pending', 'in-progress', 'completed', 'failed'];
+  const STATUSES: JobStatus[] = ['pending', 'in-progress', 'active', 'completed', 'failed'];
 
   const status = $derived(
     (STATUSES as string[]).includes(page.url.searchParams.get('status') ?? '')

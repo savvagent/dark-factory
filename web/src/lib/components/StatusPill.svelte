@@ -14,6 +14,7 @@
   const tones: Record<JobStatus, string> = {
     pending: 'border-faint/40 bg-faint/10 text-muted',
     'in-progress': 'border-busy/50 bg-busy/10 text-busy',
+    active: 'border-accent/50 bg-accent/10 text-accent',
     completed: 'border-ok/50 bg-ok/10 text-ok',
     failed: 'border-bad/50 bg-bad/10 text-bad'
   };
