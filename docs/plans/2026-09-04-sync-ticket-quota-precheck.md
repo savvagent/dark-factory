@@ -12,7 +12,9 @@ GitHub/JIRA write-back is attempted, without disturbing the existing loop-safety
 
 ## Status — 2026-09-04
 
-Not started. Single task.
+Task 1 implemented in this PR (savvagent/dark-factory#30) and covered by
+`sync_ticket_refuses_before_the_outbound_call_when_over_budget` in
+`crates/df-mcp/tests/tools.rs`. Marked complete once that PR merges.
 
 ## Global Constraints
 
@@ -45,7 +47,7 @@ One task: the change is small and cuts across three files in a single call chain
 (`Meter` → `Factory` → `sync_ticket`), so splitting it into sub-tasks would only fragment
 a change that has to land together to compile and to be meaningfully tested.
 
-## Task 1 — Quota pre-check for `sync_ticket` ⬜
+## Task 1 — Quota pre-check for `sync_ticket` ✅
 
 **Files:** `crates/df-billing/src/meter.rs`, `crates/df-mcp/src/server.rs`,
 `crates/df-mcp/src/tools/jobs.rs`, `crates/df-mcp/tests/tools.rs`

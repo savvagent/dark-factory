@@ -80,7 +80,7 @@ impl Meter {
     /// runs (see `Factory::charge`'s doc comment) — without this, an org on a
     /// hard-stop plan already over its bucket gets that write posted anyway,
     /// only to be told afterwards that it wasn't billed. This reads the same
-    /// counters `charge` re-checks before recording usage, so the two can
+    /// counters `charge` checks before recording usage, so the two can
     /// disagree only if the count changes in between — a narrow, acceptable
     /// race no different from any other check-then-act gap, and strictly
     /// better than not checking at all.
