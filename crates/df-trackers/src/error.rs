@@ -33,6 +33,25 @@ pub enum Error {
     #[error("GitHub issue state must be \"open\" or \"closed\", got {0:?}")]
     InvalidGithubIssueState(String),
 
+    /// The admin came back from GitHub claiming an installation their own
+    /// GitHub account cannot see. Refusing here is what stops an org admin
+    /// binding an installation id belonging to somebody else — see
+    /// `docs/specs/2026-09-04-tracker-console-design.md` §2.
+    #[error(
+        "the signed-in GitHub account does not administer installation {installation_id}. \
+         Run Connect GitHub again from the account that installed the App on that organization."
+    )]
+    GithubInstallationNotAdministered { installation_id: i64 },
+
+    /// GitHub answers a spent, forged, or mismatched authorization code with
+    /// HTTP 200 and an `error` field, so this is not reachable through
+    /// [`Error::Api`] and needs saying separately.
+    #[error(
+        "GitHub rejected the authorization code ({0}). Run Connect GitHub again — a code can \
+         only be redeemed once, so reloading the page after connecting reuses a spent one."
+    )]
+    GithubUserCodeRejected(String),
+
     #[error("JIRA returned a refresh token that was not valid UTF-8")]
     InvalidJiraRefreshTokenEncoding,
 

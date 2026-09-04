@@ -7,7 +7,7 @@ do not, so this splits into five sub-tasks, server first.
 
 ## Status — 2026-09-04
 
-6.1 ✅ shipped, 6.2 ⬜, 6.3 ⬜, 6.4 ⬜, 6.5 ⬜.
+6.1 ✅ shipped, 6.2 ✅ shipped, 6.3 ⬜, 6.4 ⬜, 6.5 ⬜.
 
 ## Global Constraints
 
@@ -95,7 +95,7 @@ jira_client_id, jira_client_secret}` for 6.3 to consume.
       `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all`. Commit:
       `df-core: list tracker connections and a repo's bindings`.
 
-## Task 6.2 — GitHub user-to-server verification ⬜
+## Task 6.2 — GitHub user-to-server verification ✅
 
 **Files:** `crates/df-trackers/src/github.rs`.
 
@@ -104,18 +104,18 @@ client_secret, code, installation_id)` (or a small `GithubUserAuth` alongside th
 — whichever reads better once written; the App client's JWT machinery is not involved, so a
 free function taking the OAuth credentials is the likelier shape).
 
-- [ ] Write failing unit tests first, against the crate's existing mock-server pattern (see
+- [x] Write failing unit tests first, against the crate's existing mock-server pattern (see
       `jira.rs`'s tests for the shape): a code that exchanges to a token whose
       `/user/installations` contains the id → `Ok`; one that does not contain it → the
       "does not administer" error; an exchange that returns GitHub's `{"error": ...}` body →
       the "re-run the connect flow" error.
-- [ ] Implement the exchange (`POST https://github.com/login/oauth/access_token`,
+- [x] Implement the exchange (`POST https://github.com/login/oauth/access_token`,
       `Accept: application/json`) and `GET /user/installations`, paginating only as far as
       GitHub's default page — an account with >30 installations is not a case to engineer for
       now, but the code must not silently miss one, so follow `Link: rel="next"` if present.
-- [ ] Error text is written for the admin reading it in a browser, not for a log: say what
+- [x] Error text is written for the admin reading it in a browser, not for a log: say what
       failed, and that the next step is to re-run Connect GitHub.
-- [ ] `cargo test -p df-trackers`, `cargo clippy --all-targets -- -D warnings`,
+- [x] `cargo test -p df-trackers`, `cargo clippy --all-targets -- -D warnings`,
       `cargo fmt --all`. Commit: `df-trackers: verify a GitHub installation belongs to the
       admin binding it`.
 
