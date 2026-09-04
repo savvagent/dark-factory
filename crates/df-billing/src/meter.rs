@@ -85,10 +85,10 @@ impl Meter {
     /// race no different from any other check-then-act gap, and strictly
     /// better than not checking at all.
     ///
-    /// Short-circuits before touching the database when enforcement is off
-    /// (the milestone-1 default) or the tool isn't billable — unlike
-    /// `charge`, this has no `Status` to report back, so there is nothing
-    /// `plan_limits()` needs to be queried for in that case.
+    /// Short-circuits before querying `plan_limits()`/`current_usage()` when
+    /// enforcement is off (the milestone-1 default) or the tool isn't
+    /// billable — unlike `charge`, this has no `Status` to report back, so
+    /// there is nothing those queries are needed for in that case.
     pub async fn would_refuse(&self, tx: &mut Tx<'_>, tool: &str) -> Result<()> {
         let class = classify::classify(tool);
         if !self.enforce || !class.is_billable() {
