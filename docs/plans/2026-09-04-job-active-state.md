@@ -21,7 +21,10 @@ Not started. All four tasks below are ⬜.
 - Every SQL statement lives in `df-core` — `df-mcp`/`df-web` call `df-core` functions,
   never issue their own queries.
 - Migrations are forward-only: `0003_jobs.sql` and `0015_jobs_ticket_ref_uniqueness.sql`
-  are never edited. This plan's one migration (`0016_job_active_status.sql`) is additive.
+  are never edited. This plan's two migrations (`0016_job_active_status.sql`,
+  `0017_job_active_ticket_index.sql`) are additive and must stay in separate files —
+  Postgres refuses to use a brand-new enum value (even as a string literal) in the same
+  transaction that added it, and sqlx runs each migration file in its own transaction.
 - Tests need a real Postgres: `podman compose up -d` (Postgres 16 on host port 15433) and
   a `.env` with `DATABASE_URL` (`cp .env.example .env` if not already present).
 - `activate_job` (Task 2) must be added to `df-billing::classify`'s `BILLABLE` list in the
@@ -39,7 +42,8 @@ Not started. All four tasks below are ⬜.
 
 | File | Responsibility |
 |---|---|
-| Create. `crates/df-core/migrations/0016_job_active_status.sql` | Adds `'active'` to `job_status`; widens `jobs_org_repo_tracker_ticket_open_idx` to include it. |
+| Create. `crates/df-core/migrations/0016_job_active_status.sql` | Adds `'active'` to `job_status`. |
+| Create. `crates/df-core/migrations/0017_job_active_ticket_index.sql` | Widens `jobs_org_repo_tracker_ticket_open_idx` to include `'active'`. Must be a separate file/transaction from 0016. |
 | Modify. `crates/df-core/src/jobs.rs` | `Status::Active`; `activate_job`; `finalize`/`close_from_ticket`/`repend_job` messaging; `get_live_job_by_ticket_for_repo`; `Stats.active` + query; lifecycle doc comment. |
 | Modify. `crates/df-core/tests/queue.rs` | Cover the new transition (`activate_job`), the widened `finalize` starting states, and the `stats` counter. |
 | Modify. `crates/df-core/tests/jobs.rs` | Cover the widened `close_from_ticket` starting states and the ticket-uniqueness regression (`link_ticket` against an `active` live holder). |
@@ -67,9 +71,10 @@ Not started. All four tasks below are ⬜.
 4. **`web/`** last — the console UI is the outermost layer and only needs the API shape
    Task 3 already exposes.
 
-## Task 1 — `df-core`: the `active` status ⬜
+## Task 1 — `df-core`: the `active` status ✅
 
 **Files:** `crates/df-core/migrations/0016_job_active_status.sql`,
+`crates/df-core/migrations/0017_job_active_ticket_index.sql`,
 `crates/df-core/src/jobs.rs`, `crates/df-core/tests/queue.rs`,
 `crates/df-core/tests/jobs.rs`
 
@@ -81,7 +86,7 @@ Not started. All four tasks below are ⬜.
 
 Steps:
 
-- [ ] Write the failing tests first in `crates/df-core/tests/queue.rs`:
+- [x] Write the failing tests first in `crates/df-core/tests/queue.rs`:
   - `activating_a_claimed_job_moves_it_to_active`: add a job, `claim_jobs` it, call
     `tx.activate_job(&j.id)`, assert `status == Status::Active` and
     `!status.is_terminal()`.
@@ -98,7 +103,7 @@ Steps:
     `in_progress`/`completed`/`failed`/`blocked`/`total` assertions.
   - Run `cargo test -p df-core --test queue` — expect compile failures (`Status::Active`,
     `activate_job` don't exist yet) or the new assertions failing.
-- [ ] Write the failing tests first in `crates/df-core/tests/jobs.rs` (this file, not
+- [x] Write the failing tests first in `crates/df-core/tests/jobs.rs` (this file, not
       `queue.rs`, is where `close_from_ticket` and the ticket-uniqueness/live-holder tests
       already live — see `close_from_ticket_allows_pending_and_in_progress` and
       `link_ticket_conflict_names_the_live_holder_not_a_newer_terminal_job`):
@@ -114,11 +119,14 @@ Steps:
     `active` job must still read as "live" to `get_live_job_by_ticket_for_repo`.
   - Run `cargo test -p df-core --test jobs` — expect compile/assertion failures until
     Task 1's `jobs.rs` changes land.
-- [ ] Create `crates/df-core/migrations/0016_job_active_status.sql` exactly as specified
-      in the spec's §1 (adds `'active'` to `job_status`; drops and recreates
+- [x] Create `crates/df-core/migrations/0016_job_active_status.sql` exactly as specified
+      in the spec's §1 (adds `'active'` to `job_status`).
+- [x] Create `crates/df-core/migrations/0017_job_active_ticket_index.sql` exactly as
+      specified in the spec's §1 (drops and recreates
       `jobs_org_repo_tracker_ticket_open_idx` to include `'active'` in its `WHERE`
-      clause).
-- [ ] In `crates/df-core/src/jobs.rs`:
+      clause). Must be a separate migration file from 0016 — Postgres rejects using a
+      new enum value in the same transaction it was added in, even as a string literal.
+- [x] In `crates/df-core/src/jobs.rs`:
   - Add `Active` to `enum Status` between `InProgress` and `Completed`, with
     `#[sqlx(rename = "active")]`/`#[serde(rename = "active")]` if needed (kebab-case
     already lowercases `active` identically, so an explicit rename attribute is only
@@ -146,11 +154,11 @@ Steps:
     `` `pending → in-progress → completed | failed`, with `repend` returning a `` to
     reflect the new `active` refinement (e.g. mention `in-progress` covers both "claimed"
     and its `active` refinement).
-- [ ] Run `cargo test -p df-core --test queue` and `cargo test -p df-core --test jobs` —
+- [x] Run `cargo test -p df-core --test queue` and `cargo test -p df-core --test jobs` —
       all pass.
-- [ ] Run `cargo test -p df-core --test isolation` — unaffected, confirm still green (no
+- [x] Run `cargo test -p df-core --test isolation` — unaffected, confirm still green (no
       tenant-table shape changed).
-- [ ] `cargo fmt --all && git add -A && git commit -m "df-core: add active job status"`
+- [x] `cargo fmt --all && git add -A && git commit -m "df-core: add active job status"`
 
 ## Task 2 — `df-mcp` + `df-billing`: `activate_job` tool ⬜
 

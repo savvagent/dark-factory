@@ -50,9 +50,11 @@ response shape. No version bump is required.
   `Tx::activate_job` transition method, `finalize`/`close_from_ticket` accepting `Active`
   as a valid starting state, `Stats.active` counter and its query, and widening
   `get_live_job_by_ticket_for_repo`'s open-status filter to include `active`.
-- New migration also recreates `jobs_org_repo_tracker_ticket_open_idx`
-  (`0015_jobs_ticket_ref_uniqueness.sql`) to treat `active` as an open status, so the
-  ticket-dedupe guarantee does not regress for a job that has moved past `in-progress`.
+- A second migration, `crates/df-core/migrations/0017_job_active_ticket_index.sql`,
+  recreates `jobs_org_repo_tracker_ticket_open_idx` (`0015_jobs_ticket_ref_uniqueness.sql`)
+  to treat `active` as an open status, so the ticket-dedupe guarantee does not regress for
+  a job that has moved past `in-progress`. This must be a separate migration file from
+  0016 — see §1 for why.
 - `crates/df-mcp/src/tools/jobs.rs`: new `activate_job` tool (`ActivateJobArgs` reuses the
   existing single-`job` shape), updated tool descriptions listing `active` among valid
   states, and the `sync_ticket` status match extended to handle `Status::Active`.
@@ -102,7 +104,11 @@ response shape. No version bump is required.
 -- enum values can only be appended, and ordering here does not matter because
 -- nothing compares job_status by its enum ordinal.
 ALTER TYPE job_status ADD VALUE 'active';
+```
 
+`crates/df-core/migrations/0017_job_active_ticket_index.sql`:
+
+```sql
 -- 0015_jobs_ticket_ref_uniqueness.sql's partial unique index enforces at most
 -- one *open* (non-terminal) job per (repo, tracker, ticket_ref), scoped to
 -- 'pending'/'in-progress'. An active job is still open — it must keep
@@ -116,15 +122,15 @@ CREATE UNIQUE INDEX jobs_org_repo_tracker_ticket_open_idx
     WHERE ticket_ref IS NOT NULL AND status IN ('pending', 'in-progress', 'active');
 ```
 
-Postgres requires `ALTER TYPE ... ADD VALUE` to run outside an explicit transaction
-block in older versions but sqlx's migrator runs each migration file in its own
-transaction; as of Postgres 12+ this specific form (adding a value, not using it in the
-same transaction) is allowed inside a transaction, which is what sqlx uses. The new
-enum value is not referenced by the index-recreation statements above (they reference it
-only as a string literal in a `WHERE` clause, not a cast), so there is no
-add-value-then-use-it-in-the-same-transaction conflict. Confirmed against the same
-Postgres 16 the test suite runs against, matching the version pinned in
-`podman-compose.yml`.
+These must be two separate migration files, not one. Postgres refuses to let a new enum
+value be *used* — even as a string literal in a partial index's `WHERE` clause, not just
+a cast — in the same transaction that added it: `unsafe use of new value "active" of
+enum type job_status ... New enum values must be committed before they can be used.`
+sqlx's migrator runs each migration file in its own transaction, so 0016 must commit
+before 0017's index rebuild can reference `'active'`. This was verified empirically
+against the same Postgres 16 the test suite runs against (matching the version pinned in
+`podman-compose.yml`) — combining them into one file fails every test that exercises a
+fresh migration run.
 
 `get_live_job_by_ticket_for_repo` (`crates/df-core/src/jobs.rs`) backs the conflict
 lookup callers make after losing a race against this index — its own `status IN

@@ -423,6 +423,87 @@ async fn close_from_ticket_rejects_terminal_jobs(pool: PgPool) {
     assert_eq!(err.code(), "wrong_status");
 }
 
+#[sqlx::test]
+async fn close_from_ticket_allows_active(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let active = tx
+        .create_from_ticket(
+            t.repo,
+            Tracker::Github,
+            "acme/api#18",
+            "will be active",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    tx.claim_jobs(std::slice::from_ref(&active.id), t.user, None)
+        .await
+        .unwrap();
+    tx.activate_job(&active.id).await.unwrap();
+
+    let completed = tx
+        .close_from_ticket(
+            &active.id,
+            Status::Completed,
+            Some("remote complete"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(completed.status, Status::Completed);
+}
+
+/// An `active` job is still the *live* holder of its `ticket_ref` for
+/// `get_live_job_by_ticket_for_repo` and the partial unique index behind it
+/// (`jobs_org_repo_tracker_ticket_open_idx`) — mirrors
+/// `link_ticket_on_a_ticket_another_live_job_holds_returns_ticket_already_linked`,
+/// but the holder has moved past `in-progress` into `active` before the
+/// second job tries to link the same ref.
+#[sqlx::test]
+async fn link_ticket_on_a_ticket_an_active_job_holds_returns_ticket_already_linked(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let holder = tx
+        .create_from_ticket(
+            t.repo,
+            Tracker::Github,
+            "acme/api#19",
+            "already linked and active",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    tx.claim_jobs(std::slice::from_ref(&holder.id), t.user, None)
+        .await
+        .unwrap();
+    tx.activate_job(&holder.id).await.unwrap();
+
+    let other = tx.add_job(job(&t, "wants the same ticket")).await.unwrap();
+    let err = tx
+        .link_ticket(&other.id, Tracker::Github, "acme/api#19")
+        .await
+        .unwrap_err();
+    tx.commit().await.unwrap();
+
+    match err {
+        Error::TicketAlreadyLinked { ticket_ref, job } => {
+            assert_eq!(ticket_ref, "acme/api#19");
+            assert_eq!(job, holder.id);
+        }
+        other => panic!("expected TicketAlreadyLinked, got {other:?}"),
+    }
+}
+
 /// `close_from_ticket`'s `remote_revision` param folds the revision stamp
 /// into the same UPDATE as the status transition (mirroring
 /// `update_from_ticket`'s COALESCE), so a ticket close can never leave the

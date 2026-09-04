@@ -280,6 +280,100 @@ async fn stats_counts_blocked_separately(pool: PgPool) {
     assert_eq!(s.blocked, 1);
 }
 
+#[sqlx::test]
+async fn stats_counts_active_separately_from_in_progress(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let claimed_only = tx.add_job(job(&t, "claimed")).await.unwrap();
+    let claimed_and_active = tx.add_job(job(&t, "active")).await.unwrap();
+    tx.claim_jobs(
+        &[claimed_only.id.clone(), claimed_and_active.id.clone()],
+        t.user,
+        None,
+    )
+    .await
+    .unwrap();
+    tx.activate_job(&claimed_and_active.id).await.unwrap();
+
+    let s = tx.stats(None).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(s.total, 2);
+    assert_eq!(s.in_progress, 1);
+    assert_eq!(s.active, 1);
+}
+
+#[sqlx::test]
+async fn activating_a_claimed_job_moves_it_to_active(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let j = tx.add_job(job(&t, "ship it")).await.unwrap();
+    tx.claim_jobs(std::slice::from_ref(&j.id), t.user, None)
+        .await
+        .unwrap();
+
+    let activated = tx.activate_job(&j.id).await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(activated.status, Status::Active);
+    assert!(!activated.status.is_terminal());
+}
+
+#[sqlx::test]
+async fn activating_a_job_that_was_never_claimed_is_refused(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+    let j = tx.add_job(job(&t, "still pending")).await.unwrap();
+    let err = tx.activate_job(&j.id).await.unwrap_err();
+    tx.rollback().await.unwrap();
+
+    assert_eq!(err.code(), "wrong_status");
+}
+
+#[sqlx::test]
+async fn completing_or_failing_an_active_job_still_works(pool: PgPool) {
+    let db = db(pool);
+    let t = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+
+    let mut tx = db.begin(t.org).await.unwrap();
+
+    let will_complete = tx.add_job(job(&t, "will complete")).await.unwrap();
+    tx.claim_jobs(std::slice::from_ref(&will_complete.id), t.user, None)
+        .await
+        .unwrap();
+    tx.activate_job(&will_complete.id).await.unwrap();
+    let completed = tx
+        .complete_job(&will_complete.id, Some("done"))
+        .await
+        .unwrap();
+    assert_eq!(completed.status, Status::Completed);
+
+    let will_fail = tx.add_job(job(&t, "will fail")).await.unwrap();
+    tx.claim_jobs(std::slice::from_ref(&will_fail.id), t.user, None)
+        .await
+        .unwrap();
+    tx.activate_job(&will_fail.id).await.unwrap();
+    let failed = tx.fail_job(&will_fail.id, Some("nope")).await.unwrap();
+    assert_eq!(failed.status, Status::Failed);
+
+    // The direct in-progress -> completed path (no activate_job call) is
+    // unchanged — activation is optional, never a mandatory gate.
+    let direct = tx.add_job(job(&t, "direct")).await.unwrap();
+    tx.claim_jobs(std::slice::from_ref(&direct.id), t.user, None)
+        .await
+        .unwrap();
+    let direct_done = tx.complete_job(&direct.id, Some("done")).await.unwrap();
+    assert_eq!(direct_done.status, Status::Completed);
+
+    tx.commit().await.unwrap();
+}
+
 // --------------------------------------------------------------------- repos
 
 #[sqlx::test]
