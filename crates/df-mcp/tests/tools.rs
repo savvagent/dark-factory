@@ -1696,3 +1696,72 @@ async fn sync_ticket_reports_a_malformed_github_ticket_ref_as_non_retriable(pool
     assert_eq!(e.data.as_ref().unwrap()["retriable"], false);
     assert!(e.message.contains("not a valid GitHub"), "{}", e.message);
 }
+
+/// Same shape as the GitHub case above, for JIRA's own `PROJECT-123`
+/// grammar: `link_ticket` doesn't validate the ticket_ref's format, only
+/// that it's non-blank, so a caller can link a job to a key that will never
+/// resolve against JIRA's API. The pre-check runs ahead of
+/// `sync_jira_job`, so this never needs a working JIRA App configuration to
+/// exercise.
+#[sqlx::test(migrations = "../df-core/migrations")]
+async fn sync_ticket_reports_a_malformed_jira_ticket_ref_as_non_retriable(pool: PgPool) {
+    let (env, caller) = env(pool).await;
+    let repo = env.register(&caller).await;
+    let repo_id: RepoId = repo["id"].as_str().unwrap().parse().unwrap();
+
+    let mut tx = env.db.begin(caller.org_id).await.unwrap();
+    let connection = upsert_connection(&mut tx, Provider::Jira, "acme.atlassian.net", None, None)
+        .await
+        .unwrap();
+    upsert_binding(
+        &mut tx,
+        repo_id,
+        Some(connection.id),
+        Provider::Jira,
+        "ACME",
+        "trackers",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let job = env
+        .add_job(&caller, "linked to a malformed jira ticket_ref")
+        .await;
+    let id = job["id"].as_str().unwrap().to_string();
+
+    ok(env
+        .factory
+        .link_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::LinkTicketArgs {
+                job: id.clone(),
+                tracker: Tracker::Jira,
+                ticket_ref: "not-a-valid-jira-key".into(),
+            }),
+        )
+        .await);
+
+    ok(env
+        .factory
+        .claim_jobs(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::ClaimJobsArgs {
+                jobs: vec![id.clone()],
+                agent: Some("agent-one".into()),
+            }),
+        )
+        .await);
+
+    let e = err(env
+        .factory
+        .sync_ticket(
+            Extension(parts(&caller)),
+            Parameters(tools::jobs::JobArgs { job: id }),
+        )
+        .await);
+
+    assert_eq!(code_of(&e), "invalid_argument");
+    assert_eq!(e.data.as_ref().unwrap()["retriable"], false);
+    assert!(e.message.contains("not a valid JIRA"), "{}", e.message);
+}

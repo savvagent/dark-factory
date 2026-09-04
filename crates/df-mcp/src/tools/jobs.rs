@@ -1077,6 +1077,25 @@ impl Factory {
                 job
             }
             Tracker::Jira => {
+                // Same reasoning as the GitHub arm's pre-parse above: an
+                // issue key that doesn't match JIRA's own `PROJECT-123`
+                // grammar is caller input, not a tracker outage, and will
+                // never succeed no matter how many times it's retried.
+                // `sync_jira_job` also validates this (`Client::*` calls
+                // `validate_jira_issue_key` before building a request), but
+                // that failure comes back as a `String` with no room to
+                // mark it non-retriable — checking it here, ahead of the
+                // call, is what keeps it out of `tracker_sync_error`'s
+                // retriable bucket.
+                if df_trackers::jira::validate_jira_issue_key(&ticket_ref).is_err() {
+                    return Err(df_core::Error::Invalid(format!(
+                        "job {} has a ticket_ref {ticket_ref:?} that is not a valid JIRA \
+                         issue key (expected \"PROJECT-123\") — relink it with link_ticket \
+                         before calling sync_ticket again",
+                        job.id
+                    )))
+                    .mcp();
+                }
                 let outcome = self
                     .sync_jira_job(&job, &ticket_ref, &binding.external_ref, &connection, &plan)
                     .await

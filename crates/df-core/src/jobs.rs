@@ -366,6 +366,21 @@ impl Tx<'_> {
                     job: holder.id,
                 });
             }
+            // The job named by `id` existed for the `SELECT repo_id` lookup
+            // above but is gone by the time this `UPDATE ... RETURNING`
+            // runs — e.g. `delete_job` ran concurrently in between. Report
+            // it as the not-found it now is rather than letting `Error::Db`
+            // redact it into an opaque "retry shortly": there is nothing to
+            // retry, the job is gone.
+            Err(sqlx::Error::RowNotFound) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT link_ticket")
+                    .execute(self.conn())
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT link_ticket")
+                    .execute(self.conn())
+                    .await?;
+                return Err(Error::JobNotFound(id.clone()));
+            }
             Err(error) => return Err(Error::Db(error)),
         };
 
