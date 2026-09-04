@@ -695,24 +695,33 @@ link was made.
 - **Reuses `sync_job_after_transition`'s binding-resolution and per-provider outbound
   helpers (`sync_github_job`/`sync_jira_job`), but not its "no binding" no-op and not its
   fire-and-forget wrapper.** §6's `sync_job_after_transition` returns `Ok(())` — a silent
-  success — when the repo has no `tracker_bindings` row for the provider, when the binding
-  has `connection_id IS NULL` (configured but not yet activated), or (the broken-invariant
-  case, log-and-return) when the connection row is missing. That silence is correct for
-  the automatic post-transition callers: the queue transition already happened and is the
-  billed action, and there being nothing to sync to yet is not a failure of *that*. It is
-  wrong for `sync_ticket`: an agent that explicitly asks "sync this ticket now" and gets a
-  quiet `{"job": …}` back with nothing having happened cannot tell success from a no-op —
-  exactly the ambiguity this tool exists to remove. Implementation therefore factors the
-  shared resolution step (`resolve_binding` + `get_connection`) out of
-  `sync_job_after_transition` into its own helper returning
-  `Result<Option<(TrackerBinding, TrackerConnection)>, String>`; `sync_job_after_transition`
-  keeps mapping `None` to `Ok(())` exactly as today, while `sync_ticket` maps `None` to a
-  new `Error::Invalid` naming the missing piece ("this repo has no active {provider}
-  binding — configure one before calling sync_ticket"). The per-provider network calls and
-  their write-back (`sync_github_job`/`sync_jira_job`, and the `set_remote_revision` /
+  success — for three distinct situations today: no `tracker_bindings` row for the
+  provider, a binding with `connection_id IS NULL` (configured but not yet activated), and
+  (the broken-invariant case, logged as an error before returning) a binding whose
+  `connection_id` points at no matching `tracker_connections` row. Collapsing all three to
+  a single `Ok(())` is correct for the automatic post-transition callers — the queue
+  transition already happened and is the billed action, and none of the three is a failure
+  of *that*. It is wrong for `sync_ticket` in a second way beyond silence: the third case
+  is an operator-facing data-integrity problem, not a caller-facing configuration gap, and
+  the two need different messages. Implementation therefore factors the shared resolution
+  step (`resolve_binding` + `get_connection`) out of `sync_job_after_transition` into its
+  own helper returning a three-way
+  `enum BindingLookup { NotConfigured, Broken, Ready(TrackerBinding, TrackerConnection) }`
+  (`NotConfigured` covers "no binding" and "`connection_id IS NULL`" together — both mean
+  the same thing to a caller, "nothing is wired up yet"; `Broken` is the existing
+  log-and-continue invariant-violation case, kept distinct rather than flattened into
+  `NotConfigured` so it is not misreported as an ordinary configuration gap).
+  `sync_job_after_transition` keeps mapping both `NotConfigured` and `Broken` to `Ok(())`
+  exactly as today (still logging `Broken` as it already does), while `sync_ticket` maps
+  `NotConfigured` to `Error::Invalid` naming the missing piece ("this repo has no active
+  {provider} binding — configure one before calling sync_ticket") and `Broken` to a
+  separate `Error::Invalid` message flagging the data-integrity problem instead ("this
+  repo's {provider} binding points at a connection that no longer exists — this needs an
+  operator to fix, not a retry"), so the caller is never told to "configure a binding" when
+  one already exists and is merely corrupt. The per-provider network calls and their
+  write-back (`sync_github_job`/`sync_jira_job`, and the `set_remote_revision` /
   `upsert_connection` write-back already inside them) are unchanged and shared by both
-  paths — only the "is there anywhere to sync to" branch and the top-level error handling
-  differ.
+  paths — only the binding-lookup branch and the top-level error handling differ.
 - **Surfaces a tracker/network failure as the tool's own error, unlike the fire-and-forget
   wrapper.** §6's automatic write-back after `claim_jobs`/`complete_job`/`fail_job` must
   never fail the tool call, because the queue transition it follows already succeeded and

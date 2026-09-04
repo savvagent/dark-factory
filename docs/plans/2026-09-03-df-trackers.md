@@ -389,12 +389,14 @@ the per-job-vs-repo-binding question and specifies exact error/billing/output sh
       already RLS-governed, no new policy needed, just the test).
 - [ ] Run the Task 5 `df-core` tests above; confirm green.
 - [ ] Refactor `crates/df-mcp/src/tools/jobs.rs`: factor `sync_job_after_transition`'s
-      binding-resolution block (the `resolve_binding` + `get_connection` step, currently
-      returning `Ok(())` inline on `None`) into its own private helper returning
-      `Result<Option<(TrackerBinding, TrackerConnection)>, String>`. Update
-      `sync_job_after_transition` to call it and keep mapping `None` → `Ok(())` exactly as
-      today (no behavior change for `claim_jobs`/`complete_job`/`fail_job`) — run
-      `cargo test -p df-mcp --test tools` to confirm no regression before proceeding.
+      binding-resolution block (the `resolve_binding` + `get_connection` step) into its own
+      private helper returning `enum BindingLookup { NotConfigured, Broken,
+      Ready(TrackerBinding, TrackerConnection) }` (`Broken` keeps the existing
+      log-and-continue invariant-violation case distinct from an ordinary "nothing
+      configured" gap). Update `sync_job_after_transition` to call it and keep mapping both
+      `NotConfigured` and `Broken` to `Ok(())` exactly as today (no behavior change for
+      `claim_jobs`/`complete_job`/`fail_job`) — run `cargo test -p df-mcp --test tools` to
+      confirm no regression before proceeding.
 - [ ] New `#[tool(...)]` method `link_ticket` in the same `impl` block: args
       `{job: JobId, tracker: Tracker, ticket_ref: String}`, `scope::TRACKERS` (add
       `pub const TRACKERS: &str = "trackers";` to `crates/df-mcp/src/tools/mod.rs`'s
@@ -404,9 +406,10 @@ the per-job-vs-repo-binding question and specifies exact error/billing/output sh
 - [ ] New `#[tool(...)]` method `sync_ticket`: args `{job: JobId}`. Reads the job in an
       uncharged `Tx`; `Error::Invalid` if `tracker`/`ticket_ref` unset (pointing at
       `link_ticket`) or if `Status` is `Pending`; maps current `Status` →
-      `JobTransition`/`detail` per §7's table; calls the shared binding-resolution helper
-      and returns `Error::Invalid` naming the missing binding/connection if `None`
-      (diverging from `sync_job_after_transition`'s silent no-op, per §7); calls
+      `JobTransition`/`detail` per §7's table; calls the shared `BindingLookup` helper and
+      returns `Error::Invalid` on `NotConfigured` (pointing at binding setup) or `Broken`
+      (naming it a data-integrity problem needing an operator, not a retry) rather than
+      the silent no-op `sync_job_after_transition` uses; calls
       `sync_github_job`/`sync_jira_job` and propagates their `Err` as the tool's error;
       on success, writes back `remote_revision`/rotated credentials in its own short `Tx`,
       which commits unconditionally *before* charging is attempted, then charges in a
