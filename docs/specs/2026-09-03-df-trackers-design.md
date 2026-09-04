@@ -349,6 +349,240 @@ test (there is no policy to probe). This is the same distinction `CLAUDE.md` dra
 guard-1-only tests and true RLS tests — name it in the test's own comment so a future
 reader does not mistake the missing RLS test for an oversight.
 
+## §6 Two-way sync engine (Task 4)
+
+This section is the Task 4 design: the concrete rules "an issue labelled for dark-factory
+creates or updates a job" and "job transitions write back" resolve to, and the concrete
+loop-safety mechanism. Read alongside §5a — Task 4 is the first consumer of
+`WebhookEvent` (parsed there) and the first place a live `Tx` exists around a tracker
+client call (closing Task 2's deferred JIRA-refresh-token write-back and GitHub
+`installation_id` bridging, per the plan's Task 2 "Remaining" note).
+
+**Where this lives.** `crates/df-trackers/src/sync.rs` holds the pure inbound-mapping
+logic (`WebhookEvent` → what job operation, if any) and the pure outbound-mapping logic
+(a job transition → what comment text and target ticket state) — no SQL, no HTTP, per
+`df-trackers`'s existing shape. The `df-web` webhook handler calls the inbound half inside
+its existing per-request `Tx` (§5a already opens one after `resolve_connection_org`). The
+outbound half is called from `df-mcp`'s `claim_jobs`/`complete_job`/`fail_job` handlers,
+but — see "Outbound" below — **after** that `Tx` commits, not inside it: an external HTTP
+call has no place holding a Postgres transaction open, and a tracker outage must not be
+able to block an agent from claiming or finishing work it already owns in this server's
+own queue.
+
+**Trigger label is per-binding config, not a hardcoded string.** `tracker_bindings` gains
+`trigger_label TEXT NOT NULL DEFAULT 'dark-factory'` (additive column, sane default —
+every binding created before this migration behaves exactly as if it had been set
+explicitly). The *mechanism* — "a label on the ticket is what makes the sync engine
+notice it" — is the substrate decision this design makes; the specific string is
+admin-configured per repo binding, so no org is forced to spell their trigger convention
+the same way another org does, and a customer who wants zero label-driven creation can
+set it to a value they will never apply. This is the substrate/workflow line drawn
+correctly: dark-factory ships the "labels gate inbound job creation" mechanism, not an
+opinion about what any specific label should be named.
+
+**Inbound — job creation and update.** On a GitHub `issues` event with `action` in
+`{opened, edited, labeled}` (JIRA: any Automation "issue updated"-shaped event), where
+`event.issue.labels` contains the resolved binding's `trigger_label`
+(case-insensitive exact match):
+
+1. Resolve the repo binding via `df_core::trackers::find_binding_by_external_ref(tx,
+   event.provider, &event.binding_external_ref)` (already exists, Task 3's
+   loud-on-ambiguity version — this is a `tracker_bindings` lookup by the *webhook's*
+   external reference, distinct from `resolve_binding`, which looks up by `repo_id`
+   for the outbound direction; both already exist in `df-core::trackers` and neither is
+   duplicated by this task). No binding, or a binding with `connection_id IS NULL`
+   (declared but not yet activated, per the existing Assumptions section), or a binding
+   whose `trigger_label` the event's labels do not contain → the event is acknowledged
+   (still `200`, matching the existing "verified but not actionable" shape) and silently
+   dropped; this is not an error, since an org may label issues in a repo it has not
+   finished configuring, or with a label that means nothing to dark-factory.
+2. Compute the job-lookup `ticket_ref`: for JIRA, `event.issue.reference` directly
+   (`"PROJ-123"` — already matches the format `add_job`'s doc comment names). **For
+   GitHub, `format!("{}#{}", event.binding_external_ref, event.issue.reference)`**
+   (`"acme/api#42"`) — `IssueSnapshot::reference` alone is bare `"42"`
+   (`payload.issue.number.to_string()` in `parse_github`), which does not match the
+   `acme/api#42` convention `add_job`'s own doc comment already documents for
+   manually-queued GitHub jobs; constructing the full form here is what makes an issue a
+   customer already queued by hand (`add_job` with `ticket_ref: "acme/api#42"`) and the
+   same issue arriving over the webhook resolve to the same job instead of silently
+   creating a duplicate.
+3. **New accessor**, scoped correctly (existing `get_job_by_ticket` takes only
+   `ticket_ref`, org-wide, with no `repo_id`/`tracker` filter — safe for its current
+   caller but not for this one, since ticket refs are never guaranteed unique across
+   repos in one org): `df_core::jobs::get_job_by_ticket_for_repo(tx, repo_id, tracker,
+   ticket_ref) -> Result<Option<Job>>`, `WHERE org_id = $1 AND repo_id = $2 AND tracker =
+   $3 AND ticket_ref = $4 ORDER BY created_at DESC LIMIT 1` — same "newest wins on a
+   duplicate" tolerance the existing function already documents, just properly scoped.
+4. **No existing job** → `add_job`-equivalent creation: `title = event.issue.title`,
+   `description = event.issue.body`, `ticket_ref` = the value from step 2, `tracker =
+   event.provider`, `metadata = {}`. New function `df_core::jobs::create_from_ticket`
+   (thin wrapper around the existing insert path `NewJob` already uses — no new SQL
+   shape, just a constructor that also sets `tracker`/`remote_revision`, which `add_job`'s
+   MCP-facing `NewJob` intentionally leaves unset today).
+5. **Existing job, status `Pending` or `InProgress`** → update `title`/`description` from
+   the current snapshot. A terminal job (`completed`/`failed`) is left alone — a closed
+   ticket re-edited afterward does not resurrect a job the agent already finished;
+   scope's "no conflict-resolution UI" applies here too.
+6. **GitHub `action == "closed"`, or JIRA event where `event.issue.state`
+   case-insensitively matches one of a small fixed closed-vocabulary set** (see below) —
+   resolve the existing job (step 3); if found and its status is `Pending` or
+   `InProgress` (a job already `Completed`/`Failed` is left alone, same as step 5):
+   - GitHub: `event.issue.state_reason == Some("not_planned")` → `fail_job`-equivalent;
+     otherwise (`Some("completed")` or `None`) → `complete_job`-equivalent.
+   - JIRA: `event.issue.state` case-insensitively matching `{"done", "closed", "resolved"}`
+     → `complete_job`-equivalent; matching `{"won't do", "wont do", "cancelled",
+     "rejected", "declined"}` → `fail_job`-equivalent. JIRA workflow status names are
+     per-project-configurable, so this is a fixed heuristic vocabulary, not an exhaustive
+     enum — an unrecognized-but-closed-looking status is scope for a future task, not
+     silently guessed at here; **an unrecognized status is treated as "not a close event"
+     and step 6 is skipped entirely** (the job is left as-is, having already had steps
+     1–5 applied), rather than defaulting to either complete or fail, which would be
+     exactly the kind of guess `CLAUDE.md` prohibits.
+   - **A resolved job whose current status is `Pending`** (nobody ever claimed it before
+     the ticket closed) cannot go through the existing `complete_job`/`fail_job` MCP-tool
+     functions — both require `Status::InProgress` (`crates/df-core/src/jobs.rs`'s
+     `finalize`), a precondition this design does not relax for those two public
+     functions. **New `df-core` function `jobs::close_from_ticket(tx, id, to: Status,
+     result: Option<&str>, error: Option<&str>) -> Result<Job>`** allows the transition
+     from `Pending` *or* `InProgress` to `Completed`/`Failed`, used only by this sync
+     path — the `claim_jobs`/`complete_job`/`fail_job` MCP tools keep their existing
+     preconditions unchanged, since "claiming is what makes work yours" (this repo's own
+     framing) must still hold for every *agent-driven* transition; a ticket closing out
+     from under an unclaimed job is the one case where the ticket itself is authoritative
+     over a state the queue had not yet observed any agent activity on.
+   - **`IssueSnapshot` gains a new `state_reason: Option<String>` field** (GitHub's
+     `issue.state_reason`; unused for JIRA, which uses `state` directly per above) —
+     additive to a type introduced in Task 3 that has exactly one caller (`df-web`'s
+     webhook route) and zero external consumers, so this is a same-task extension, not a
+     breaking change to a shipped interface.
+7. Every apply in steps 4–6 also writes `jobs.remote_revision` to the normalized form of
+   `event.issue.updated_at` (see below) in the same `Tx` as the job mutation — one write,
+   not two. Step 5 alone (an edit with no close) still writes it, so a later close event
+   for the same edit is correctly seen as not-newer and would be dropped if redelivered.
+
+**`issue_comment` events are not applied by this task.** They arrive (Task 3 already
+parses them) and are acknowledged, but the sync engine's steps above only fire on
+`WebhookEventKind::Issue`. Comment-triggered job actions are not asked for by the design
+doc's own wording ("An issue labelled for dark-factory creates or updates a job; closing
+the ticket cancels or completes the job") and adding one would be speculative scope.
+
+**Loop-safety: `jobs.remote_revision`.** A new nullable `TEXT` column on `jobs`
+(migration `crates/df-core/migrations/0013_jobs_remote_revision.sql`, additive — a new
+optional field on an already-public type per Non-Negotiable Rule 6, no version bump, no
+breaking-change writeup needed; no new RLS policy needed either, since `jobs` is already a
+tenant table under an existing policy that governs the whole row, not per-column). Holds
+the last remote timestamp this server either *observed* (inbound apply) or *caused*
+(outbound write), **normalized to RFC 3339 UTC** so lexical comparison is safe — both
+providers' native timestamps parse cleanly with `chrono::DateTime::parse_from_rfc3339`
+(GitHub's `issue.updated_at` and JIRA's `fields.updated` are both RFC 3339 already; this
+normalization step exists so a comparison never silently trusts an un-verified assumption
+about a provider's exact offset/precision formatting). A value that fails to parse is
+treated the same as "no revision" below — never propagated as an opaque raw string that
+`<=` would compare byte-wise against a normalized one. **`IssueSnapshot` gains
+`updated_at: Option<String>`** (raw provider string, parsed at the point of comparison/
+storage, not at parse time — keeping `df-trackers::webhook` provider-format-agnostic per
+its existing design) for this, populated by both `parse_github` and `parse_jira`.
+
+- **Inbound guard:** before applying steps 4–6, parse both the job's stored
+  `remote_revision` (if any) and `event.issue.updated_at` (if any) as RFC 3339. If both
+  parse and the incoming value is `<=` the stored one, drop the event — it is our own
+  write echoing back, or a stale/out-of-order redelivery. If either is missing or fails to
+  parse, the event is still applied and `remote_revision` is left unchanged rather than
+  cleared (not overwritten with an unparseable value); an unguarded apply is a bounded,
+  self-correcting risk (the next well-formed event still compares correctly), while
+  clearing a known-good revision would make every *subsequent* well-formed event look
+  newer than it is and reopen the loop permanently. Documented in Risks & Open Questions.
+- **Outbound guard:** the follow-up write described under "Outbound" below records the
+  resulting `updated_at` into `jobs.remote_revision` in its own short `Tx`, taken
+  immediately after the tracker write succeeds. This is what makes the webhook GitHub/JIRA
+  delivers moments later (an echo of the write this server just made) compare as `<=` and
+  get dropped by the inbound guard above, instead of re-triggering the sync engine's own
+  comment-and-transition as if a human had done it.
+
+**Outbound — job transitions write back, best-effort, after commit.** Only jobs with both
+`tracker` and `ticket_ref` set attempt a tracker write; a job with neither (the common
+case — most jobs have no ticket) is a no-op, checked first, before any tracker client is
+constructed. Resolving which connection to use uses the existing
+`df_core::trackers::resolve_binding(tx, repo_id, provider)` (already shipped in §2 — no
+new accessor needed here, correcting an earlier draft of this section that proposed a
+redundant `binding_for_repo`), and a binding with `connection_id IS NULL` makes the
+write-back a no-op (declared, not active) rather than an error — a job can exist and be
+worked without its ticket ever being reachable, matching the inbound side's same
+tolerance.
+
+**Sequencing, and why it changed from an earlier draft of this section:** `claim_jobs`/
+`complete_job`/`fail_job` keep their existing shape exactly — `self.tx(...)` → `charge`
+→ the `df-core::jobs` status transition → `commit()` — completely unchanged. **After**
+that commit succeeds and the MCP response value is in hand, the tool handler performs the
+tracker write-back as a *separate* step: resolve the binding and connection by opening a
+second, short `Tx` (read-only for this part), release it, make the tracker HTTP call
+outside any `Tx`, then open a third short `Tx` solely to write `jobs.remote_revision` (and,
+for JIRA, a rotated `encrypted_credentials` — see below) and commit. **A tracker-write
+failure is logged at error level and does not fail the tool call** — the job's own
+transition in the queue already succeeded and already is the billed action; an agent must
+not be blocked from claiming or finishing work it owns because a third-party API is slow
+or down. This corrects an earlier draft's design, which held the tracker write inside the
+same `Tx` as the status change specifically so a tracker failure would roll back the
+billed call — that shape requires holding a Postgres transaction open across an
+uncontrolled external HTTP round-trip (a genuine connection-pool-exhaustion risk under
+load, the same class of concern `CLAUDE.md` already documents for `Watcher::spawn`'s
+long-lived `LISTEN` connection) and conflates two different failure domains: "did the
+queue transition happen" (yes, always, if the MCP call returned success) and "did the
+ticket also get updated" (best-effort, may lag or fail). The metering charge in
+Invariant 11 still holds exactly as designed — it is charged for the queue operation,
+which is what actually happened, not for a ticket write-back that is now explicitly
+allowed to fail independently.
+
+- `claim_jobs` → for each claimed job with an active binding: post a comment
+  (`args.agent.map(|a| format!("Claimed by {a}.")).unwrap_or_else(|| "Claimed.".into())`)
+  and, JIRA only, attempt a transition to a status named `"In Progress"`
+  (case-insensitive exact match against the transitions the JIRA REST API reports as
+  reachable from the issue's current status — `crates/df-trackers/src/jira.rs` gains a
+  `list_transitions`/`transition_issue` pair for this, since today's client has neither).
+  GitHub has no built-in "in progress" issue state, so GitHub is comment-only here.
+  If no matching JIRA transition is reachable, skip the transition and post the comment
+  only, logging a warning — a workflow mismatch nobody asked this server to solve is not
+  a `claim_jobs` failure.
+- `complete_job` → post the result summary as a comment
+  (`args.result.unwrap_or("Completed.")`), then: GitHub — close the issue with
+  `state_reason: completed`; JIRA — attempt a transition to a status the workflow's
+  transition graph reports in the `done` status category (JIRA's transition API exposes
+  each candidate transition's target status category; match on category, not name, since
+  "Done"-category status names vary more than "In Progress" does in practice) reachable
+  from the current status, else comment-only + warning, same tolerance as above.
+- `fail_job` → post the error as a comment (`args.error.unwrap_or("Failed.")`), then:
+  GitHub — **does not** close the issue (a failed job leaves the ticket open, since
+  "returns to the backlog" means work remains to be picked up, and GitHub's only closed
+  states are `completed`/`not_planned`, neither of which fits "not done yet"); JIRA —
+  attempt a transition to a status in the `to do` / `new` status category if reachable
+  from the current status, else comment-only + warning.
+- **Retried outbound calls are not deduplicated against a prior partial write.** If the
+  tracker HTTP call itself succeeds but the process crashes before the follow-up
+  `remote_revision` `Tx` commits, a subsequent `sync_ticket` call (Task 5) or another
+  outbound trigger could post a second comment. This is a narrow, one-shot window (there
+  is no automatic retry of the outbound write-back itself — only a *later, separate*
+  MCP call could repeat it), named here rather than solved with idempotency keys neither
+  GitHub's nor JIRA's comment APIs are documented to honor; see Risks & Open Questions.
+
+**JIRA credential write-back (closes Task 2's deferred item).** Before constructing a
+`JiraClient` call, if the stored refresh token has rotated (the client's token-refresh
+path returns a new sealed pair per PR #20's `OAuthTokens`), the caller writes the new
+`encrypted_credentials` back via `df_core::trackers::upsert_connection`, in the same
+short follow-up `Tx` described above that writes `remote_revision` — this is the first
+place in the codebase that both holds a live `Tx` and calls a JIRA API, so it is where
+this plumbing was always going to land, per the Task 2 note.
+
+**GitHub `installation_id` bridging (closes Task 2's other deferred item).**
+`TrackerConnection.external_id: String` is parsed to `i64` before constructing a
+`GithubAppClient` call (`external_id.parse::<i64>()`), failing loudly
+(`Error::Invalid`, naming the connection and the unparseable value — never a silent
+fallback) rather than panicking or defaulting, per Invariant 16. A row that reaches this
+parse with a non-numeric `external_id` is a data-integrity bug (nothing else ever writes a
+non-numeric value there), not a caller-facing input error, but it must still surface as a
+named error rather than an `unwrap()`. For inbound resolution (§5a), `external_id` is
+compared as a string throughout and never parsed — only the outbound GitHub API call
+needs the typed `i64`.
+
 ## §5 What Task 1 does NOT wire up yet
 
 No `df-trackers` dependency is added to `df-web` or `df-mcp` in this task — `df-core` gains
@@ -398,3 +632,11 @@ UI) are recorded in `docs/plans/2026-09-03-df-trackers.md` and build on this fou
   codebase actively defends against elsewhere (`CLAUDE.md`'s account-enumeration and
   redirect-URI-matching sections). Revisit only if a future threat model treats "is this
   JIRA site connected to dark-factory" as itself sensitive.
+- **An inbound event whose payload omits a revision timestamp is applied unconditionally
+  rather than rejected or held.** GitHub's `issues`/`issue_comment` payloads and JIRA
+  Automation's issue payloads have always carried `updated_at`/`fields.updated` in
+  practice, so this is a defensive fallback for a shape not yet observed, not a known gap.
+  If a provider payload shape without it is ever seen, `jobs.remote_revision` is left at
+  its last known-good value rather than cleared (§6) — revisit only if loop reports
+  surface in practice, rather than adding speculative dedup machinery now for a payload
+  shape neither provider currently sends.
