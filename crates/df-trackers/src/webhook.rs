@@ -86,6 +86,8 @@ pub struct IssueSnapshot {
     pub body: Option<String>,
     pub state: String,
     pub labels: Vec<String>,
+    pub updated_at: Option<String>,
+    pub state_reason: Option<String>,
     pub comment: Option<CommentSnapshot>,
 }
 
@@ -205,6 +207,8 @@ fn parse_github(headers: &HeaderMap, raw_body: &[u8]) -> Result<ParsedWebhook> {
                         .into_iter()
                         .map(|label| label.name)
                         .collect(),
+                    updated_at: payload.issue.updated_at,
+                    state_reason: payload.issue.state_reason,
                     comment: None,
                 },
             })))
@@ -229,6 +233,8 @@ fn parse_github(headers: &HeaderMap, raw_body: &[u8]) -> Result<ParsedWebhook> {
                         .into_iter()
                         .map(|label| label.name)
                         .collect(),
+                    updated_at: payload.issue.updated_at,
+                    state_reason: payload.issue.state_reason,
                     comment: Some(CommentSnapshot {
                         id: payload.comment.id.to_string(),
                         body: payload.comment.body,
@@ -252,7 +258,7 @@ fn parse_jira(raw_body: &[u8], site_id: String) -> Result<ParsedWebhook> {
     Ok(ParsedWebhook::Event(Box::new(WebhookEvent {
         provider: Provider::Jira,
         connection_external_id: site_id,
-        binding_external_ref: payload.issue.project_key,
+        binding_external_ref: payload.issue.fields.project.key.clone(),
         action: payload.action,
         kind: if payload.comment.is_some() {
             WebhookEventKind::IssueComment
@@ -262,10 +268,12 @@ fn parse_jira(raw_body: &[u8], site_id: String) -> Result<ParsedWebhook> {
         issue: IssueSnapshot {
             id: payload.issue.id,
             reference: payload.issue.key,
-            title: payload.issue.summary,
-            body: payload.issue.description,
-            state: payload.issue.status,
-            labels: payload.issue.labels,
+            title: payload.issue.fields.summary,
+            body: payload.issue.fields.description,
+            state: payload.issue.fields.status.name,
+            labels: payload.issue.fields.labels,
+            updated_at: payload.issue.fields.updated,
+            state_reason: None,
             comment: payload.comment.map(|comment| CommentSnapshot {
                 id: comment.id,
                 body: comment.body,
@@ -359,6 +367,10 @@ struct GithubIssue {
     title: String,
     body: Option<String>,
     state: String,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    state_reason: Option<String>,
     labels: Vec<GithubLabel>,
 }
 
@@ -387,13 +399,31 @@ struct JiraAutomationPayload {
 struct JiraAutomationIssue {
     id: String,
     key: String,
+    fields: JiraAutomationFields,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JiraAutomationFields {
     summary: String,
     #[serde(default)]
     description: Option<String>,
-    status: String,
+    status: JiraAutomationStatus,
     #[serde(default)]
     labels: Vec<String>,
-    project_key: String,
+    #[serde(default)]
+    updated: Option<String>,
+    project: JiraAutomationProject,
+}
+
+#[derive(Deserialize)]
+struct JiraAutomationStatus {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct JiraAutomationProject {
+    key: String,
 }
 
 #[derive(Deserialize)]
@@ -437,6 +467,11 @@ mod tests {
         assert_eq!(event.kind, WebhookEventKind::Issue);
         assert_eq!(event.issue.reference, "17");
         assert_eq!(event.issue.labels, vec!["bug", "trackers"]);
+        assert_eq!(
+            event.issue.updated_at.as_deref(),
+            Some("2026-09-03T18:00:00Z")
+        );
+        assert_eq!(event.issue.state_reason, None);
     }
 
     #[test]
@@ -494,6 +529,11 @@ mod tests {
         assert_eq!(event.kind, WebhookEventKind::IssueComment);
         assert_eq!(event.action, "created");
         assert_eq!(
+            event.issue.updated_at.as_deref(),
+            Some("2026-09-03T18:05:00Z")
+        );
+        assert_eq!(event.issue.state_reason.as_deref(), Some("reopened"));
+        assert_eq!(
             event
                 .issue
                 .comment
@@ -536,6 +576,11 @@ mod tests {
         );
         assert_eq!(event.issue.state, "In Progress");
         assert_eq!(event.issue.labels, vec!["trackers", "webhooks"]);
+        assert_eq!(
+            event.issue.updated_at.as_deref(),
+            Some("2026-09-03T18:10:00Z")
+        );
+        assert_eq!(event.issue.state_reason, None);
         let comment = event.issue.comment.as_ref().expect("comment present");
         assert_eq!(comment.id, "20002");
         assert_eq!(comment.body, "Sync this change into dark-factory.");

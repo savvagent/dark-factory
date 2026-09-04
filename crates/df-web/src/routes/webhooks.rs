@@ -4,9 +4,11 @@ use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use axum::Json;
+use df_core::jobs::Tracker;
 use df_core::trackers::{
     find_binding_by_external_ref, get_connection, resolve_connection_org, Provider,
 };
+use df_trackers::sync::InboundDecision;
 use df_trackers::webhook::{jira_site_id, verify_and_parse, ParsedWebhook, Verification};
 use serde_json::json;
 
@@ -182,10 +184,77 @@ pub async fn receive(
                     "webhook verified for a connection with no matching repo binding"
                 );
             }
+            if event.kind == df_trackers::webhook::WebhookEventKind::Issue {
+                if let Some(binding) = binding.as_ref() {
+                    if binding.connection_id.is_some() {
+                        let tracker = match provider {
+                            Provider::Github => Tracker::Github,
+                            Provider::Jira => Tracker::Jira,
+                        };
+                        let ticket_ref = df_trackers::sync::ticket_ref(event);
+                        let existing = tx
+                            .get_job_by_ticket_for_repo(binding.repo_id, tracker, &ticket_ref)
+                            .await
+                            .map_err(ApiError::from)?;
 
-            // Task 4 turns a verified tracker event into job-sync work. Task 3
-            // stops at verification, org resolution, and binding lookup so the
-            // inbound surface is correct before it starts mutating queue state.
+                        match df_trackers::sync::inbound_decision(event, binding, existing.as_ref())
+                        {
+                            InboundDecision::Drop | InboundDecision::NoOp => {}
+                            InboundDecision::Create {
+                                title,
+                                description,
+                                ticket_ref,
+                                remote_revision,
+                            } => {
+                                tx.create_from_ticket(
+                                    binding.repo_id,
+                                    tracker,
+                                    &ticket_ref,
+                                    &title,
+                                    description.as_deref(),
+                                    remote_revision.as_deref(),
+                                )
+                                .await
+                                .map_err(ApiError::from)?;
+                            }
+                            InboundDecision::Update {
+                                title,
+                                description,
+                                remote_revision,
+                            } => {
+                                if let Some(existing) = existing.as_ref() {
+                                    tx.update_from_ticket(
+                                        &existing.id,
+                                        &title,
+                                        description.as_deref(),
+                                        remote_revision.as_deref(),
+                                    )
+                                    .await
+                                    .map_err(ApiError::from)?;
+                                }
+                            }
+                            InboundDecision::Close {
+                                to,
+                                result,
+                                error,
+                                remote_revision,
+                            } => {
+                                if let Some(existing) = existing.as_ref() {
+                                    tx.close_from_ticket(
+                                        &existing.id,
+                                        to,
+                                        result.as_deref(),
+                                        error.as_deref(),
+                                        remote_revision.as_deref(),
+                                    )
+                                    .await
+                                    .map_err(ApiError::from)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         ParsedWebhook::Ignored(ignored) => {
             tracing::info!(

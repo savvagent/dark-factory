@@ -116,6 +116,11 @@ fn mcp_config(config: &Config) -> df_mcp::Config {
     mcp.allowed_origins = config.allowed_origins.clone();
     mcp.enforce_quotas = config.enforce_quotas;
     mcp.upgrade_url = config.upgrade_url.clone();
+    mcp.github_app_id = config.github_app_id;
+    mcp.github_app_private_key = config.github_app_private_key.clone();
+    mcp.jira_client_id = config.jira_client_id.clone();
+    mcp.jira_client_secret = config.jira_client_secret.clone();
+    mcp.encryption_key = Some(config.encryption_key.clone());
     mcp
 }
 
@@ -193,6 +198,23 @@ mod tests {
         );
         assert_eq!(web.public_url, config.public_url);
         assert_eq!(web.resource_uri, config.resource_uri);
+    }
+
+    #[test]
+    fn every_tracker_setting_reaches_df_mcp() {
+        let mut config = Config::for_test();
+        config.github_app_id = Some(42);
+        config.github_app_private_key = Some("pem".into());
+        config.jira_client_id = Some("jira-client".into());
+        config.jira_client_secret = Some("jira-secret".into());
+
+        let mcp = mcp_config(&config);
+
+        assert_eq!(mcp.github_app_id, Some(42));
+        assert_eq!(mcp.github_app_private_key.as_deref(), Some("pem"));
+        assert_eq!(mcp.jira_client_id.as_deref(), Some("jira-client"));
+        assert_eq!(mcp.jira_client_secret.as_deref(), Some("jira-secret"));
+        assert_eq!(mcp.encryption_key.as_deref(), Some("k"));
     }
 
     #[test]

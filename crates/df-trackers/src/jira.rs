@@ -6,6 +6,39 @@ use crate::{Error, Result};
 
 const USER_AGENT: &str = "dark-factory/0.1";
 const MAX_ERROR_BODY_BYTES: usize = 256;
+/// The outbound sync path (Task 4) calls into this client synchronously,
+/// after the job's own transaction has already committed, so a stalled
+/// tracker API would otherwise hold the MCP tool call open indefinitely —
+/// reqwest sets no timeout by default. A bounded timeout turns "the tracker
+/// is down" into a logged, best-effort failure instead of a hung agent call.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// JIRA issue keys are spliced unescaped into REST URL paths below. Unlike
+/// the GitHub side (`parse_github_ticket_ref` strictly splits
+/// `"owner/repo#123"`), an issue key arriving from a webhook payload is
+/// whatever the org's own JIRA Automation rule sends — not a value shaped by
+/// Atlassian itself. Refusing anything that isn't `PROJECT-123`-shaped before
+/// it reaches a URL keeps a misconfigured (or hostile) automation rule from
+/// redirecting an outbound call to an unintended path segment.
+fn validate_jira_issue_key(issue_key: &str) -> Result<()> {
+    let valid = issue_key.split_once('-').is_some_and(|(project, number)| {
+        !project.is_empty()
+            && project
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic())
+            && project.chars().all(|c| {
+                c.is_ascii_alphanumeric() && (c.is_ascii_uppercase() || c.is_ascii_digit())
+            })
+            && !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit())
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidJiraIssueKey(issue_key.to_string()))
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -40,6 +73,51 @@ pub struct AccessibleResource {
     pub scopes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transition {
+    pub id: String,
+    pub name: String,
+    pub to_status: String,
+    pub to_status_category: String,
+}
+
+#[derive(Deserialize)]
+struct TransitionListResponse {
+    transitions: Vec<ApiTransition>,
+}
+
+#[derive(Deserialize)]
+struct ApiTransition {
+    id: String,
+    name: String,
+    to: ApiTransitionTo,
+}
+
+#[derive(Deserialize)]
+struct ApiTransitionTo {
+    name: String,
+    #[serde(rename = "statusCategory")]
+    status_category: ApiStatusCategory,
+}
+
+#[derive(Deserialize)]
+struct ApiStatusCategory {
+    #[serde(default)]
+    key: Option<String>,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct JiraIssueResponse {
+    fields: JiraIssueResponseFields,
+}
+
+#[derive(Deserialize)]
+struct JiraIssueResponseFields {
+    #[serde(default)]
+    updated: Option<String>,
+}
+
 pub struct JiraClient {
     client_id: String,
     client_secret: String,
@@ -49,14 +127,23 @@ pub struct JiraClient {
 }
 
 impl JiraClient {
-    pub fn new(client_id: String, client_secret: String) -> Self {
-        Self {
+    pub fn new(client_id: String, client_secret: String) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(|source| Error::Http {
+                provider: "JIRA",
+                action: "building the HTTP client",
+                source,
+            })?;
+        Ok(Self {
             client_id,
             client_secret,
-            http: reqwest::Client::new(),
+            http,
             auth_base: "https://auth.atlassian.com".into(),
             api_base: "https://api.atlassian.com".into(),
-        }
+        })
     }
 
     pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<OAuthTokens> {
@@ -116,6 +203,7 @@ impl JiraClient {
         issue_key: &str,
         body: &str,
     ) -> Result<()> {
+        validate_jira_issue_key(issue_key)?;
         self.send_without_response(
             self.http
                 .post(format!(
@@ -142,6 +230,42 @@ impl JiraClient {
         .await
     }
 
+    pub async fn list_transitions(
+        &self,
+        access_token: &str,
+        cloud_id: &str,
+        issue_key: &str,
+    ) -> Result<Vec<Transition>> {
+        validate_jira_issue_key(issue_key)?;
+        let response: TransitionListResponse = self
+            .send_json(
+                self.http
+                    .get(format!(
+                        "{}/ex/jira/{cloud_id}/rest/api/3/issue/{issue_key}/transitions",
+                        self.api_base
+                    ))
+                    .header(reqwest::header::USER_AGENT, USER_AGENT)
+                    .bearer_auth(access_token),
+                "listing issue transitions",
+            )
+            .await?;
+
+        Ok(response
+            .transitions
+            .into_iter()
+            .map(|transition| Transition {
+                id: transition.id,
+                name: transition.name,
+                to_status: transition.to.name,
+                to_status_category: transition
+                    .to
+                    .status_category
+                    .key
+                    .unwrap_or(transition.to.status_category.name),
+            })
+            .collect())
+    }
+
     pub async fn transition_issue(
         &self,
         access_token: &str,
@@ -149,6 +273,7 @@ impl JiraClient {
         issue_key: &str,
         transition_id: &str,
     ) -> Result<()> {
+        validate_jira_issue_key(issue_key)?;
         self.send_without_response(
             self.http
                 .post(format!(
@@ -165,6 +290,28 @@ impl JiraClient {
             "transitioning an issue",
         )
         .await
+    }
+
+    pub async fn get_issue_updated_at(
+        &self,
+        access_token: &str,
+        cloud_id: &str,
+        issue_key: &str,
+    ) -> Result<Option<String>> {
+        validate_jira_issue_key(issue_key)?;
+        let issue: JiraIssueResponse = self
+            .send_json(
+                self.http
+                    .get(format!(
+                        "{}/ex/jira/{cloud_id}/rest/api/3/issue/{issue_key}?fields=updated",
+                        self.api_base
+                    ))
+                    .header(reqwest::header::USER_AGENT, USER_AGENT)
+                    .bearer_auth(access_token),
+                "fetching an issue revision",
+            )
+            .await?;
+        Ok(issue.fields.updated)
     }
 
     pub fn open_refresh_token(cipher: &Cipher, sealed: &Sealed) -> Result<String> {
@@ -291,6 +438,38 @@ mod tests {
     use super::*;
     use crate::test_support::{MockResponse, TestServer};
 
+    #[test]
+    fn issue_key_validation_accepts_the_project_number_grammar_and_rejects_everything_else() {
+        assert!(validate_jira_issue_key("PROJ-123").is_ok());
+        assert!(validate_jira_issue_key("A1B2-1").is_ok());
+
+        assert!(validate_jira_issue_key("").is_err());
+        assert!(validate_jira_issue_key("PROJ").is_err());
+        assert!(validate_jira_issue_key("PROJ-").is_err());
+        assert!(validate_jira_issue_key("-123").is_err());
+        assert!(validate_jira_issue_key("proj-123").is_err());
+        assert!(validate_jira_issue_key("PROJ-abc").is_err());
+        assert!(validate_jira_issue_key("PROJ-123/../secrets").is_err());
+        assert!(validate_jira_issue_key("PROJ/123").is_err());
+        assert!(validate_jira_issue_key("PROJ-123?evil=1").is_err());
+    }
+
+    #[tokio::test]
+    async fn outbound_calls_refuse_a_malformed_issue_key_before_building_a_url() {
+        let server = TestServer::start().await;
+        let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
+            .with_bases(server.base_url.clone(), server.base_url.clone());
+
+        let error = client
+            .post_comment("token", "cloud-1", "../not-an-issue-key", "hi")
+            .await
+            .expect_err("malformed issue key must be refused");
+        assert!(matches!(error, Error::InvalidJiraIssueKey(_)));
+        // No request was ever sent — the check runs before any HTTP call.
+        assert!(server.requests().is_empty());
+    }
+
     #[tokio::test]
     async fn authorization_code_exchange_parses_token_response() {
         let server = TestServer::start().await;
@@ -304,6 +483,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
         let tokens = client
             .exchange_code("auth-code", "https://example.com/callback")
@@ -348,6 +528,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
         let tokens = client
             .refresh_access_token("refresh-1")
@@ -387,6 +568,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
         let resources = client
             .accessible_resources("access-1")
@@ -417,22 +599,52 @@ mod tests {
             201,
             serde_json::json!({ "id": "comment-1" }),
         ));
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({
+                "transitions": [
+                    {
+                        "id": "31",
+                        "name": "Start progress",
+                        "to": {
+                            "name": "In Progress",
+                            "statusCategory": { "key": "indeterminate", "name": "In Progress" }
+                        }
+                    }
+                ]
+            }),
+        ));
         server.push(MockResponse::text(204, ""));
+        server.push(MockResponse::json(
+            200,
+            serde_json::json!({
+                "fields": { "updated": "2026-09-03T18:10:00Z" }
+            }),
+        ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
 
         client
             .post_comment("access-1", "cloud-1", "ENG-7", "hello jira")
             .await
             .expect("comment succeeds");
+        let transitions = client
+            .list_transitions("access-1", "cloud-1", "ENG-7")
+            .await
+            .expect("transitions succeed");
         client
             .transition_issue("access-1", "cloud-1", "ENG-7", "31")
             .await
             .expect("transition succeeds");
+        let updated_at = client
+            .get_issue_updated_at("access-1", "cloud-1", "ENG-7")
+            .await
+            .expect("issue fetch succeeds");
 
         let requests = server.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].method, "POST");
         assert_eq!(
             requests[0].path,
@@ -454,16 +666,31 @@ mod tests {
                 }
             })
         );
-        assert_eq!(requests[1].method, "POST");
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].id, "31");
+        assert_eq!(transitions[0].to_status, "In Progress");
+        assert_eq!(transitions[0].to_status_category, "indeterminate");
+        assert_eq!(requests[1].method, "GET");
         assert_eq!(
             requests[1].path,
             "/ex/jira/cloud-1/rest/api/3/issue/ENG-7/transitions"
         );
+        assert_eq!(requests[2].method, "POST");
         assert_eq!(
-            serde_json::from_slice::<Value>(&requests[1].body).expect("transition body"),
+            requests[2].path,
+            "/ex/jira/cloud-1/rest/api/3/issue/ENG-7/transitions"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&requests[2].body).expect("transition body"),
             serde_json::json!({
                 "transition": { "id": "31" }
             })
+        );
+        assert_eq!(updated_at.as_deref(), Some("2026-09-03T18:10:00Z"));
+        assert_eq!(requests[3].method, "GET");
+        assert_eq!(
+            requests[3].path,
+            "/ex/jira/cloud-1/rest/api/3/issue/ENG-7?fields=updated"
         );
         server.shutdown().await;
     }
@@ -480,6 +707,7 @@ mod tests {
         ));
 
         let client = JiraClient::new("client-id".into(), "client-secret".into())
+            .unwrap()
             .with_bases(server.base_url.clone(), server.base_url.clone());
         let error = client
             .accessible_resources("access-1")

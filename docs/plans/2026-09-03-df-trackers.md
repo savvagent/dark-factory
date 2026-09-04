@@ -261,18 +261,101 @@ design — verified by signature instead of a session/token) plus its handler mo
 
 ## Task 4 — Two-way sync engine ⬜
 
-**Files:** `crates/df-trackers/src/sync.rs`.
+**Spec:** see §6 ("Two-way sync engine") in `docs/specs/2026-09-03-df-trackers-design.md`
+— read it first. It resolves the design decisions this checklist originally deferred:
+the trigger label (a new per-binding `tracker_bindings.trigger_label` column, defaulted
+to `dark-factory`, not hardcoded), the loop-safety mechanism (`jobs.remote_revision`, an
+RFC 3339 UTC string, parsed and compared as timestamps, not raw strings), how inbound job
+creation/update/close resolves against existing jobs (via a new repo/tracker-scoped
+`ticket_ref` lookup, no new resolution table), and where the outbound write-back — which
+runs **after** the job's own `Tx` commits, not inside it — and Task 2's two deferred items
+(JIRA refresh-token persistence, GitHub `installation_id` bridging) get wired in. A spec
+critique round already caught and corrected: a same-`Tx` outbound design that would have
+held a Postgres transaction open across an external HTTP call; a hardcoded trigger label;
+a nonexistent `binding_for_repo` (the existing `resolve_binding` is what's used); an
+org-wide-only `get_job_by_ticket` that would cross-contaminate repos; a GitHub ticket_ref
+format (`"42"`) that didn't match the `"acme/api#42"` convention `add_job` already
+documents; and a `complete_job`/`fail_job` precondition (`InProgress`-only) that cannot
+fire for a ticket closed before any agent claimed the job. Read §6 in full before touching
+any file below — it is long because each of those corrections is explained in place.
 
-- [ ] Inbound: a labelled issue creates or updates a job through `df-core::jobs`; closing
-      the ticket cancels/completes the job.
-- [ ] Outbound: hook `claim_jobs`/`complete_job`/`fail_job` (called from `df-mcp`) to post
-      a comment and transition the linked ticket, using the tracker client from Task 2.
-- [ ] Loop-safety: every write records the resulting remote revision on the job (a new
-      `jobs` column or a side table — decide and record here before implementing, per the
-      Global Constraints' breaking-change rule if it touches the `jobs` table's public
-      shape); an inbound event carrying a revision this server just wrote is dropped.
-- [ ] Cross-org negative test if any new tenant table is added for revision tracking.
-- [ ] `cargo test --workspace`, clippy, fmt.
+**Files:** `crates/df-core/migrations/0013_jobs_remote_revision.sql` (new, additive:
+`jobs.remote_revision TEXT NULL`) and `crates/df-core/migrations/0014_trigger_label.sql`
+(new, additive: `tracker_bindings.trigger_label TEXT NOT NULL DEFAULT 'dark-factory'`) —
+two migrations, not one, since they touch two different tables and are two different
+concerns per this repo's "one file per concern" convention; `crates/df-core/src/jobs.rs`
+(add `remote_revision` field, `create_from_ticket`, `get_job_by_ticket_for_repo`,
+`close_from_ticket`); `crates/df-core/src/trackers.rs` (add `trigger_label` field to
+`TrackerBinding`, thread it through `upsert_binding`); `crates/df-trackers/src/webhook.rs`
+(extend `IssueSnapshot` with `updated_at` and `state_reason`, extend
+`parse_github`/`parse_jira` to populate them); `crates/df-trackers/src/jira.rs` (add
+`list_transitions`/`transition_issue`); `crates/df-trackers/src/sync.rs` (new — pure
+inbound-mapping and outbound-mapping logic, no SQL/HTTP); `crates/df-web/src/routes/
+webhooks.rs` (call the inbound half inside the existing per-request `Tx`);
+`crates/df-mcp/src/tools/jobs.rs` (call the outbound half after `claim_jobs`/
+`complete_job`/`fail_job`'s existing `Tx` commits).
+
+- [ ] `jobs.remote_revision TEXT NULL` migration; confirm additive (no version bump,
+      no breaking-change writeup, no new RLS policy needed — `jobs` is already governed
+      by an existing tenant-isolation policy over the whole row).
+- [ ] `tracker_bindings.trigger_label TEXT NOT NULL DEFAULT 'dark-factory'` migration
+      (separate file); add the field to `TrackerBinding` and thread it through
+      `upsert_binding`'s existing column list.
+- [ ] `IssueSnapshot` gains `updated_at: Option<String>` and `state_reason: Option<String>`
+      (GitHub only for the latter); update both GitHub payload structs and the JIRA
+      payload struct in `webhook.rs`, and the existing fixture tests' assertions.
+- [ ] `df-core::jobs::get_job_by_ticket_for_repo(tx, repo_id, tracker, ticket_ref) ->
+      Result<Option<Job>>` — `WHERE org_id = $1 AND repo_id = $2 AND tracker = $3 AND
+      ticket_ref = $4 ORDER BY created_at DESC LIMIT 1`, matching the existing
+      `get_job_by_ticket`'s newest-wins tolerance but properly scoped.
+- [ ] `df-core::jobs::create_from_ticket` (title/description/ticket_ref/tracker/
+      remote_revision in one insert, thin wrapper over the existing `NewJob` insert path)
+      and a `remote_revision`(+ title/description)-only update path, both taking `&mut Tx`
+      with an explicit `org_id` bind, matching every other `df-core::jobs` function.
+- [ ] `df-core::jobs::close_from_ticket(tx, id, to: Status, result: Option<&str>, error:
+      Option<&str>) -> Result<Job>` — allows `Pending` *or* `InProgress` → `Completed`/
+      `Failed`, used only by the sync engine; `complete_job`/`fail_job`'s existing
+      `InProgress`-only precondition is unchanged for every other caller.
+- [ ] `crates/df-trackers/src/jira.rs`: `list_transitions(issue_key) ->
+      Vec<Transition>` (each carrying its target status name and category) and
+      `transition_issue(issue_key, transition_id)`, recorded-fixture tested like the
+      rest of the client.
+- [ ] Inbound: a failing test first in `crates/df-trackers/tests/` for the pure mapping
+      function — label-on-event-but-not-matching-binding's-`trigger_label` → dropped;
+      matching label, no existing job → create; matching label, existing non-terminal job
+      → update; GitHub closed + `state_reason` → complete vs fail; JIRA closed-vocabulary
+      state → complete vs fail; unrecognized JIRA "closed-looking" state → left as-is, not
+      guessed; revision `<=` stored (RFC 3339 parsed) → dropped; unparseable/missing
+      revision on either side → applied, stored revision left unchanged. Then implement
+      `df-trackers::sync`'s inbound half against it.
+- [ ] Wire the inbound half into `df-web`'s webhook route: after the existing
+      `resolve_connection_org` → `Tx` → `get_connection` sequence, resolve the binding via
+      `find_binding_by_external_ref`, call the sync engine, write `remote_revision` in the
+      same `Tx`. No binding, `connection_id IS NULL`, or label mismatch → acknowledge
+      (`200`) and no-op, per §6.
+- [ ] Outbound: a failing test first for the pure mapping function (job with no
+      `tracker`/`ticket_ref` → no-op; `claim_jobs`/`complete_job`/`fail_job` → the correct
+      default-vs-supplied comment text + target ticket state/category per provider,
+      matching §6's GitHub/JIRA asymmetry; no reachable transition → comment-only +
+      warning, not a failure). Then implement `df-trackers::sync`'s outbound half against
+      it.
+- [ ] Wire the outbound half into `crates/df-mcp/src/tools/jobs.rs`'s `claim_jobs`/
+      `complete_job`/`fail_job`: **after** the existing `Tx` commits and the MCP response
+      value is already computed, resolve the binding/connection in a short read-only `Tx`,
+      release it, make the tracker HTTP call outside any `Tx`, then open a short follow-up
+      `Tx` to write `remote_revision` (+ a rotated JIRA `encrypted_credentials`, if any)
+      and commit. A tracker-write failure is logged at error level and does **not** fail
+      the tool call or roll back anything already committed.
+- [ ] JIRA refresh-token write-back: on a rotated token, `upsert_connection` the new
+      `encrypted_credentials` in the same short follow-up `Tx` that writes
+      `remote_revision`.
+- [ ] GitHub `installation_id` bridging: `external_id.parse::<i64>()`, failing loudly
+      (`Error::Invalid`, naming the connection) rather than panicking or silently
+      defaulting.
+- [ ] Recorded-fixture tests for the extended `IssueSnapshot` fields and the new JIRA
+      transition calls (no live network), per this crate's existing testing convention.
+- [ ] `cargo test -p df-core`, `cargo test -p df-trackers`, `cargo test -p df-mcp --test tools`,
+      `cargo test -p df-web`, `cargo test --workspace`, clippy, fmt.
 - [ ] Commit.
 
 ## Task 5 — `link_ticket` / `sync_ticket` MCP tools ⬜

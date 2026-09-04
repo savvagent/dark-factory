@@ -36,6 +36,11 @@ pub enum Error {
     #[error("JIRA returned a refresh token that was not valid UTF-8")]
     InvalidJiraRefreshTokenEncoding,
 
+    #[error(
+        "JIRA issue key {0:?} does not match the PROJECT-123 grammar; refusing to build a request URL from it"
+    )]
+    InvalidJiraIssueKey(String),
+
     #[error("{0}")]
     InvalidWebhook(String),
 

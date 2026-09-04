@@ -8,6 +8,8 @@
     "title": "Implement webhook ingest",
     "body": "Wire webhook verification into the tracker sync flow.",
     "state": "open",
+    "updated_at": "2026-09-03T18:05:00Z",
+    "state_reason": "reopened",
     "labels": [
       { "name": "bug" },
       { "name": "trackers" }

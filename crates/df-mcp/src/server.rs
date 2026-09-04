@@ -78,21 +78,41 @@ You are billed for work performed, not for looking: reads, watch, and lease \
 renewals cost nothing, while queueing, claiming, completing and messaging \
 consume the plan's monthly allowance. Call usage to see where you stand.";
 
+#[derive(Debug, Clone, Default)]
+pub struct TrackerSyncConfig {
+    pub github_app_id: Option<i64>,
+    pub github_app_private_key: Option<String>,
+    pub jira_client_id: Option<String>,
+    pub jira_client_secret: Option<String>,
+    pub encryption_key: Option<String>,
+}
+
 /// The service. Cheap to clone, because `rmcp` builds one per session.
 #[derive(Clone)]
 pub struct Factory {
     db: Db,
     watcher: Arc<Watcher>,
     meter: Arc<Meter>,
+    tracker_sync: Arc<TrackerSyncConfig>,
     tool_router: ToolRouter<Self>,
 }
 
 impl Factory {
     pub fn new(db: Db, watcher: Arc<Watcher>, meter: Meter) -> Self {
+        Self::new_with_tracker_sync(db, watcher, meter, TrackerSyncConfig::default())
+    }
+
+    pub fn new_with_tracker_sync(
+        db: Db,
+        watcher: Arc<Watcher>,
+        meter: Meter,
+        tracker_sync: TrackerSyncConfig,
+    ) -> Self {
         Self {
             db,
             watcher,
             meter: Arc::new(meter),
+            tracker_sync: Arc::new(tracker_sync),
             tool_router: crate::tools::router(),
         }
     }
@@ -107,6 +127,10 @@ impl Factory {
 
     pub fn meter(&self) -> &Meter {
         &self.meter
+    }
+
+    pub fn tracker_sync(&self) -> &TrackerSyncConfig {
+        &self.tracker_sync
     }
 
     /// Meter this call inside the tool's own transaction, refusing it if the

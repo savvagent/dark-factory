@@ -2,6 +2,7 @@ mod common;
 
 use axum::body::Body;
 use common::{cipher, Harness, PUBLIC_URL, RESOURCE};
+use df_core::jobs::Tracker;
 use df_core::orgs::Role;
 use df_core::repos::NewRepo;
 use df_core::trackers::{upsert_binding, upsert_connection, Provider};
@@ -70,6 +71,7 @@ async fn github_webhooks_are_public_and_acknowledged_when_verified(pool: PgPool)
         Some(connection.id),
         Provider::Github,
         "acme/api",
+        "trackers",
     )
     .await
     .unwrap();
@@ -146,6 +148,81 @@ async fn github_rejection_and_unknown_connection_share_the_same_public_404(pool:
 }
 
 #[sqlx::test(migrations = "../df-core/migrations")]
+async fn a_labelled_issue_webhook_creates_one_job_and_a_stale_redelivery_does_not_duplicate_it(
+    pool: PgPool,
+) {
+    let h = harness(pool);
+    let org = h.db.create_org("acme", "Acme").await.unwrap();
+    let user =
+        h.db.upsert_user("owner@acme.test", Some("Owner"))
+            .await
+            .unwrap();
+    h.db.add_member(org.id, user.id, Role::Owner).await.unwrap();
+
+    let mut tx = h.db.begin(org.id).await.unwrap();
+    let repo = tx
+        .register_repo(NewRepo {
+            slug: "api".into(),
+            name: Some("Acme API".into()),
+            remotes: vec!["git@github.com:acme/api.git".into()],
+            created_by: Some(user.id),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let connection = upsert_connection(&mut tx, Provider::Github, "123456", None, None)
+        .await
+        .unwrap();
+    upsert_binding(
+        &mut tx,
+        repo.id,
+        Some(connection.id),
+        Provider::Github,
+        "acme/api",
+        "trackers",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    for _ in 0..2 {
+        let reply = post_webhook(
+            &h,
+            "/webhooks/github",
+            GITHUB_ISSUES_FIXTURE,
+            &[
+                ("x-github-event", "issues"),
+                (
+                    "x-hub-signature-256",
+                    &format!("sha256={}", github_signature(GITHUB_ISSUES_FIXTURE)),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::OK);
+    }
+
+    let mut tx = h.db.begin(org.id).await.unwrap();
+    let job = tx
+        .get_job_by_ticket_for_repo(repo.id, Tracker::Github, "acme/api#17")
+        .await
+        .unwrap()
+        .expect("synced job");
+    let jobs = tx
+        .list_jobs(&df_core::jobs::JobFilter {
+            repo_id: Some(repo.id),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(job.title, "Implement webhook ingest");
+    assert_eq!(job.remote_revision.as_deref(), Some("2026-09-03T18:00:00Z"));
+    assert_eq!(jobs.len(), 1);
+}
+
+#[sqlx::test(migrations = "../df-core/migrations")]
 async fn jira_webhooks_require_the_site_and_secret_but_acknowledge_a_valid_request(pool: PgPool) {
     let h = harness(pool);
     let org = h.db.create_org("globex", "Globex").await.unwrap();
@@ -176,9 +253,16 @@ async fn jira_webhooks_require_the_site_and_secret_but_acknowledge_a_valid_reque
     )
     .await
     .unwrap();
-    upsert_binding(&mut tx, repo.id, Some(connection.id), Provider::Jira, "DF")
-        .await
-        .unwrap();
+    upsert_binding(
+        &mut tx,
+        repo.id,
+        Some(connection.id),
+        Provider::Jira,
+        "DF",
+        "trackers",
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 
     let ok = post_webhook(

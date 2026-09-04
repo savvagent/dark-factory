@@ -76,6 +76,7 @@ pub struct Job {
     pub status: Status,
     pub ticket_ref: Option<String>,
     pub tracker: Option<Tracker>,
+    pub remote_revision: Option<String>,
     pub agent_type: Option<String>,
     /// Opaque to dark-factory. Customers' own skills own the shape.
     pub metadata: serde_json::Value,
@@ -127,8 +128,9 @@ pub struct Stats {
 }
 
 const JOB_COLS: &str = "id, org_id, repo_id, team_id, title, description, status, ticket_ref, \
-                        tracker, agent_type, metadata, created_at, started_at, completed_at, \
-                        attempts, result, error, created_by, claimed_by, claimed_by_label";
+                        tracker, remote_revision, agent_type, metadata, created_at, started_at, \
+                        completed_at, attempts, result, error, created_by, claimed_by, \
+                        claimed_by_label";
 
 impl Tx<'_> {
     /// Enqueue a job.
@@ -168,8 +170,8 @@ impl Tx<'_> {
 
         let job: Job = sqlx::query_as(&format!(
             "INSERT INTO jobs (id, org_id, repo_id, team_id, title, description, ticket_ref, \
-                               tracker, agent_type, metadata, created_by) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING {JOB_COLS}"
+                               tracker, remote_revision, agent_type, metadata, created_by) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING {JOB_COLS}"
         ))
         .bind(&id)
         .bind(org)
@@ -179,6 +181,7 @@ impl Tx<'_> {
         .bind(new.description.as_deref())
         .bind(new.ticket_ref.as_deref())
         .bind(new.tracker)
+        .bind(Option::<&str>::None)
         .bind(new.agent_type.as_deref())
         .bind(new.metadata.unwrap_or_else(|| serde_json::json!({})))
         .bind(new.created_by)
@@ -217,6 +220,152 @@ impl Tx<'_> {
         .bind(ticket_ref)
         .fetch_optional(self.conn())
         .await?;
+        Ok(job)
+    }
+
+    /// Look a job up by its tracker ticket reference, scoped to one repo and
+    /// tracker. The org-wide sibling remains for callers whose inputs are
+    /// already unique enough; the sync engine needs the narrower version so two
+    /// repos in one org cannot share a ticket ref by accident.
+    pub async fn get_job_by_ticket_for_repo(
+        &mut self,
+        repo_id: RepoId,
+        tracker: Tracker,
+        ticket_ref: &str,
+    ) -> Result<Option<Job>> {
+        let org = self.org();
+        let job = sqlx::query_as(&format!(
+            "SELECT {JOB_COLS} FROM jobs \
+             WHERE org_id = $1 AND repo_id = $2 AND tracker = $3 AND ticket_ref = $4 \
+             ORDER BY created_at DESC LIMIT 1"
+        ))
+        .bind(org)
+        .bind(repo_id)
+        .bind(tracker)
+        .bind(ticket_ref)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(job)
+    }
+
+    pub async fn create_from_ticket(
+        &mut self,
+        repo_id: RepoId,
+        tracker: Tracker,
+        ticket_ref: &str,
+        title: &str,
+        description: Option<&str>,
+        remote_revision: Option<&str>,
+    ) -> Result<Job> {
+        if title.trim().is_empty() {
+            return Err(Error::Invalid("job title must not be empty".into()));
+        }
+
+        let org = self.org();
+        let repo = self
+            .get_repo(repo_id)
+            .await?
+            .ok_or_else(|| Error::RepoNotFound(repo_id.to_string()))?;
+
+        let seq: i64 = sqlx::query_scalar(
+            "UPDATE orgs SET next_job_seq = next_job_seq + 1 WHERE id = $1 \
+             RETURNING next_job_seq - 1",
+        )
+        .bind(org)
+        .fetch_optional(self.conn())
+        .await?
+        .ok_or(Error::OrgNotFound(org))?;
+
+        let id = JobId::from_seq(seq);
+        // A savepoint, not a bare INSERT: Postgres aborts the *whole*
+        // enclosing transaction on any statement error, so recovering from
+        // a unique-violation by running another query in the same Tx would
+        // otherwise fail with "current transaction is aborted" instead of
+        // ever reaching the recovery query below.
+        sqlx::query("SAVEPOINT create_from_ticket")
+            .execute(self.conn())
+            .await?;
+        let inserted = sqlx::query_as(&format!(
+            "INSERT INTO jobs (id, org_id, repo_id, team_id, title, description, ticket_ref, \
+                               tracker, remote_revision, metadata) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING {JOB_COLS}"
+        ))
+        .bind(&id)
+        .bind(org)
+        .bind(repo_id)
+        .bind(repo.team_id)
+        .bind(title.trim())
+        .bind(description)
+        .bind(ticket_ref)
+        .bind(tracker)
+        .bind(remote_revision)
+        .bind(serde_json::json!({}))
+        .fetch_one(self.conn())
+        .await;
+
+        let job = match inserted {
+            Ok(job) => {
+                sqlx::query("RELEASE SAVEPOINT create_from_ticket")
+                    .execute(self.conn())
+                    .await?;
+                job
+            }
+            // Two concurrent webhook deliveries for the same freshly-labelled
+            // issue can both observe "no existing job" from
+            // get_job_by_ticket_for_repo and both reach this insert;
+            // 0015_jobs_ticket_ref_uniqueness.sql's partial index turns the
+            // loser into a unique-violation instead of a duplicate job. Treat
+            // it as the race it is: hand back the job the other transaction
+            // just created rather than failing the caller (the webhook route
+            // would otherwise 500 on a request that, semantically, succeeded)
+            // — never guessed, since the id burned above is simply unused.
+            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                sqlx::query("ROLLBACK TO SAVEPOINT create_from_ticket")
+                    .execute(self.conn())
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT create_from_ticket")
+                    .execute(self.conn())
+                    .await?;
+                self.get_job_by_ticket_for_repo(repo_id, tracker, ticket_ref)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "create_from_ticket lost a unique-violation race for {ticket_ref:?} \
+                             but no concurrently-created job was found"
+                        ))
+                    })?
+            }
+            Err(error) => return Err(Error::Db(error)),
+        };
+
+        Ok(job)
+    }
+
+    pub async fn update_from_ticket(
+        &mut self,
+        id: &JobId,
+        title: &str,
+        description: Option<&str>,
+        remote_revision: Option<&str>,
+    ) -> Result<Job> {
+        if title.trim().is_empty() {
+            return Err(Error::Invalid("job title must not be empty".into()));
+        }
+
+        let job = sqlx::query_as(&format!(
+            "UPDATE jobs SET title = $3, description = $4, \
+                    remote_revision = COALESCE($5, remote_revision) \
+             WHERE org_id = $1 AND id = $2 RETURNING {JOB_COLS}"
+        ))
+        .bind(self.org())
+        .bind(id)
+        .bind(title.trim())
+        .bind(description)
+        .bind(remote_revision)
+        .fetch_optional(self.conn())
+        .await?
+        .ok_or_else(|| Error::JobNotFound(id.clone()))?;
+
         Ok(job)
     }
 
@@ -382,6 +531,60 @@ impl Tx<'_> {
         Ok(job)
     }
 
+    pub async fn close_from_ticket(
+        &mut self,
+        id: &JobId,
+        to: Status,
+        result: Option<&str>,
+        error: Option<&str>,
+        remote_revision: Option<&str>,
+    ) -> Result<Job> {
+        if !matches!(to, Status::Completed | Status::Failed) {
+            return Err(Error::Invalid(format!(
+                "close_from_ticket must move a job to completed or failed, not {}",
+                to.as_str()
+            )));
+        }
+
+        let org = self.org();
+        let current: Option<Status> =
+            sqlx::query_scalar("SELECT status FROM jobs WHERE org_id = $1 AND id = $2 FOR UPDATE")
+                .bind(org)
+                .bind(id)
+                .fetch_optional(self.conn())
+                .await?;
+
+        let current = current.ok_or_else(|| Error::JobNotFound(id.clone()))?;
+        if !matches!(current, Status::Pending | Status::InProgress) {
+            return Err(Error::WrongStatus {
+                job: id.clone(),
+                actual: current.as_str().to_string(),
+                expected: "pending or in-progress".into(),
+            });
+        }
+
+        // `remote_revision` folds into the same statement as the status
+        // transition (COALESCE, matching `update_from_ticket`) rather than a
+        // follow-up `set_remote_revision` call, so a ticket close and its
+        // revision stamp can never drift apart into two partially-applied
+        // writes.
+        let job = sqlx::query_as(&format!(
+            "UPDATE jobs SET status = $3, completed_at = now(), result = $4, error = $5, \
+                    remote_revision = COALESCE($6, remote_revision) \
+             WHERE org_id = $1 AND id = $2 RETURNING {JOB_COLS}"
+        ))
+        .bind(org)
+        .bind(id)
+        .bind(to)
+        .bind(result)
+        .bind(error)
+        .bind(remote_revision)
+        .fetch_one(self.conn())
+        .await?;
+
+        Ok(job)
+    }
+
     /// Return a terminal job to `pending` for one more dispatch. `attempts` is
     /// preserved so a job that keeps coming back is visible as such.
     pub async fn repend_job(&mut self, id: &JobId) -> Result<Job> {
@@ -424,6 +627,21 @@ impl Tx<'_> {
             .await?
             .rows_affected();
         if n == 0 {
+            return Err(Error::JobNotFound(id.clone()));
+        }
+        Ok(())
+    }
+
+    pub async fn set_remote_revision(&mut self, id: &JobId, revision: &str) -> Result<()> {
+        let updated =
+            sqlx::query("UPDATE jobs SET remote_revision = $3 WHERE org_id = $1 AND id = $2")
+                .bind(self.org())
+                .bind(id)
+                .bind(revision)
+                .execute(self.conn())
+                .await?
+                .rows_affected();
+        if updated == 0 {
             return Err(Error::JobNotFound(id.clone()));
         }
         Ok(())

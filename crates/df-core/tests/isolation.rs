@@ -121,6 +121,83 @@ async fn cross_org_mutation_is_refused(pool: PgPool) {
     assert_eq!(after.status, df_core::jobs::Status::Pending);
 }
 
+/// The tracker-sync accessors added for the two-way sync engine (Task 4) are
+/// fresh SQL entry points on `jobs`, so guard 1 (the explicit `org_id`
+/// predicate) needs its own proof here — the happy-path tests next to these
+/// functions only exercise repo-scoping and status semantics within a single
+/// org.
+#[sqlx::test]
+async fn cross_org_ticket_sync_accessors_are_refused(pool: PgPool) {
+    use df_core::jobs::Tracker;
+
+    let db = db(pool);
+    let a = tenant(&db, "acme", "git@github.com:acme/api.git").await;
+    let b = tenant(&db, "globex", "git@github.com:globex/api.git").await;
+
+    let mut tx = db.begin(a.org).await.unwrap();
+    let acme_job = tx
+        .create_from_ticket(
+            a.repo,
+            Tracker::Github,
+            "acme/api#42",
+            "acme ticket work",
+            Some("body"),
+            Some("2026-09-03T12:00:00Z"),
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // B, operating under its own pinned org, cannot reach A's ticket-linked
+    // job by any of the new accessors.
+    let mut tx = db.begin(b.org).await.unwrap();
+    let by_ticket = tx
+        .get_job_by_ticket_for_repo(a.repo, Tracker::Github, "acme/api#42")
+        .await
+        .unwrap();
+    assert!(
+        by_ticket.is_none(),
+        "org B resolved org A's ticket-linked job: {by_ticket:?}"
+    );
+    // B cannot even create against A's repo id — the repo does not resolve
+    // for B, so this fails closed rather than silently creating on the wrong
+    // side.
+    assert!(tx
+        .create_from_ticket(a.repo, Tracker::Github, "acme/api#42", "pwned", None, None,)
+        .await
+        .is_err());
+    assert!(tx
+        .update_from_ticket(&acme_job.id, "pwned", None, Some("2099-01-01T00:00:00Z"))
+        .await
+        .is_err());
+    assert!(tx
+        .close_from_ticket(
+            &acme_job.id,
+            df_core::jobs::Status::Completed,
+            None,
+            None,
+            None,
+        )
+        .await
+        .is_err());
+    assert!(tx
+        .set_remote_revision(&acme_job.id, "2099-01-01T00:00:00Z")
+        .await
+        .is_err());
+    let _ = tx.rollback().await;
+
+    // A's job is exactly as it was.
+    let mut tx = db.begin(a.org).await.unwrap();
+    let after = tx.get_job(&acme_job.id).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(after.title, "acme ticket work");
+    assert_eq!(after.status, df_core::jobs::Status::Pending);
+    assert_eq!(
+        after.remote_revision.as_deref(),
+        Some("2026-09-03T12:00:00Z")
+    );
+}
+
 /// `update_repo` from the wrong org must not reach the row, and must not be
 /// able to steal a remote either — re-pointing a remote is how you would divert
 /// another tenant's agents to your own queue without ever reading their data.
@@ -516,6 +593,7 @@ async fn rls_scopes_tracker_bindings(pool: PgPool) {
         Some(connection.id),
         Provider::Github,
         "acme/api",
+        "dark-factory",
     )
     .await
     .unwrap();
