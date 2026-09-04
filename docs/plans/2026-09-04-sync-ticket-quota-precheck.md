@@ -74,7 +74,7 @@ Steps:
         `enforcement_stops_work_but_never_reads`'s seed) via the same raw `sqlx::query`
         upsert those existing tests use.
       - Call `sync_ticket`. Assert `code_of(&e) == "quota_exceeded"` — **not**
-        `"tracker_sync_failed"** — and that `e.data["retriable"] == false`, matching every
+        `"tracker_sync_failed"` — and that `e.data["retriable"] == false`, matching every
         other `quota_exceeded` refusal.
       - Run: `cargo test -p df-mcp --test tools sync_ticket_refuses_before_the_outbound_call_when_over_budget`
         — expect a compile error (`would_refuse` does not exist yet) or a runtime failure

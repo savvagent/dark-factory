@@ -1690,11 +1690,16 @@ async fn sync_ticket_refuses_before_the_outbound_call_when_over_budget(pool: PgP
         .await);
 
     // Now spend the rest of the Free plan's bucket, so the org is exactly at
-    // its limit by the time `sync_ticket` is called.
+    // its limit by the time `sync_ticket` is called. This test has already
+    // made a few real billable calls (add_job, link_ticket, claim_jobs), so
+    // both billable_count and total_count are updated together here — an
+    // update that only touched billable_count would leave total_count below
+    // billable_count, an impossible state for this table since every
+    // billable call is also a total one.
     sqlx::query(
         "INSERT INTO org_period_usage (org_id, period_start, billable_count, total_count) \
          VALUES ($1, date_trunc('month', now() AT TIME ZONE 'utc')::date, 500, 500) \
-         ON CONFLICT (org_id, period_start) DO UPDATE SET billable_count = 500",
+         ON CONFLICT (org_id, period_start) DO UPDATE SET billable_count = 500, total_count = 500",
     )
     .bind(caller.org_id)
     .execute(env.db.pool())
