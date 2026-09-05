@@ -75,8 +75,10 @@ Single task: this is one YAML addition to one existing file. No sequencing decis
       inside the same PR as the new gate. Expect: build completes successfully (it already did as
       of #37's fix; this is a regression check, not new ground).
 - [ ] Format and commit: `git commit -m "ci: build the Docker image on every PR/push touching Dockerfile, Cargo manifests, or web/"`.
-      (No `cargo fmt`/`clippy`/`cargo test` gate applies — no Rust source changed. No `web/` gate
-      applies — no console source changed.)
+      Vacuous gates, stated explicitly rather than silently skipped: `cargo test --workspace`,
+      `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --all` do not apply (no Rust
+      source changed); `cd web && npm run check && npm run lint && npm test && npm run build` does
+      not apply (no console source changed).
 
 ## Out-of-band verification (Phase 5, step 14)
 
