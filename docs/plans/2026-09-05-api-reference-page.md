@@ -9,7 +9,7 @@ JSON. `/api/openapi.json` itself is untouched.
 
 ## Status — 2026-09-05
 
-🚧 Not yet started.
+✅ Both tasks implemented; shipping via `savvagent/dark-factory#43`.
 
 **Spec:** `docs/specs/2026-09-05-api-reference-page-design.md` — read it first. This plan
 implements it exactly.
@@ -61,7 +61,7 @@ the page and the layout change on top of it, because the page can't be written m
 `groupByTag`/`schemaSummary` existing, and the layout change is small enough to land with the page
 it exists to unblock rather than as a third task.
 
-## Task 1 — `groupByTag` / `schemaSummary` and their unit test ⬜
+## Task 1 — `groupByTag` / `schemaSummary` and their unit test ✅
 
 **Files:** `web/src/lib/openapi.ts` (new), `web/src/lib/openapi.test.ts` (new)
 **Interfaces:** produces `OpenApiDocument`, `EndpointEntry`, `TagGroup`, `groupByTag()`,
@@ -175,7 +175,7 @@ plain object).
 - [ ] Format and commit: `cd web && npx prettier --write src/lib/openapi.ts src/lib/openapi.test.ts`
       then `git commit -m "web: add openapi document grouping helpers"`.
 
-## Task 2 — `/docs/api` page, layout wiring, and the render-level test ⬜
+## Task 2 — `/docs/api` page, layout wiring, and the render-level test ✅
 
 **Files:** `web/src/routes/docs/api/+page.svelte` (new), `web/src/routes/docs/api/page.render.test.ts`
 (new), `web/src/routes/+layout.svelte` (modify), `web/package.json` (modify)
