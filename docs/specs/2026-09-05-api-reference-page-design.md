@@ -1,6 +1,6 @@
 # API reference page design
 
-> **Status:** DRAFT — render `/api/openapi.json` as a human-readable console page instead of
+> **Status:** APPROVED — render `/api/openapi.json` as a human-readable console page instead of
 > linking the footer straight at the raw document
 
 ## Premise corrections
