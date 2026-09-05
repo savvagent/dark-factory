@@ -7,7 +7,7 @@ theme-aware rendering of the logo mark, preserving an accessible name on the hea
 
 ## Status — 2026-09-05
 
-Not started. One task.
+✅ Shipped in `savvagent/dark-factory#44`.
 
 **Spec:** `docs/specs/2026-09-05-header-logo-design.md` — read it first. This plan implements it
 exactly.
@@ -38,7 +38,7 @@ exactly.
 Single task — the component and its one call site are tightly coupled and small enough to land
 together; there is no intermediate state worth a checkpoint between them.
 
-## Task 1 — Add `Logo` component and use it in the header
+## Task 1 — Add `Logo` component and use it in the header ✅
 
 **Files:** `web/src/lib/components/Logo.svelte` (new), `web/src/routes/+layout.svelte` (modify)
 **Interfaces:** `Logo` consumes a `class` prop (pass-through sizing/color); produces an inline

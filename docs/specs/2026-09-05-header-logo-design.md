@@ -1,6 +1,6 @@
 # Header logo design
 
-> **Status:** APPROVED — replace the "dark-factory" wordmark in the console header with the logo mark
+> **Status:** IMPLEMENTED — replace the "dark-factory" wordmark in the console header with the logo mark
 
 ## Scope
 
