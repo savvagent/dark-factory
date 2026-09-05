@@ -9,7 +9,7 @@ JSON. `/api/openapi.json` itself is untouched.
 
 ## Status — 2026-09-05
 
-✅ Both tasks implemented; shipping via `savvagent/dark-factory#43`.
+✅ Both tasks implemented and shipped via `savvagent/dark-factory#47`, closing `savvagent/dark-factory#43`.
 
 **Spec:** `docs/specs/2026-09-05-api-reference-page-design.md` — read it first. This plan
 implements it exactly.
