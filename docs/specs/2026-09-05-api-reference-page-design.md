@@ -18,8 +18,11 @@ None — the issue's description of the current state matches the code: the foot
   and response schema references, and its `x-dark-factory-auth` level.
 - The footer link in `web/src/routes/+layout.svelte` repointed from `/api/openapi.json` to
   `/docs/api`.
-- `/docs/api` added to the layout's `PUBLIC` route list so it renders without a session and
-  without redirecting to `/login`.
+- `/docs/api` exempted from the layout's routing guard so it renders without a session, without
+  redirecting to `/login`, and — unlike `/login`/`/signup`/`/claim` — without being redirected
+  away to `/` for a signed-in visitor either (see Design below; simply adding it to the existing
+  `PUBLIC` array is wrong, because that array's second effect is "bounce a signed-in visitor away
+  from this page," which would make the footer link unusable once signed in).
 - Deep-linking to one endpoint via `#operationId` in the URL hash, working on a hard refresh (not
   only client-side navigation).
 - A pure, unit-testable grouping function that the page's rendering is built on top of, so a test
@@ -78,11 +81,14 @@ human reading the console's own REST API, so coding-agent agnosticism (constrain
   needs" (verb, path, summary, description, params, request/response shape, auth level) without
   building a general JSON Schema viewer. Nested `$ref`s inside a schema's properties render as
   their type name rather than expanding further.
-- Because this route is added to `PUBLIC`, it inherits the layout's existing behavior for public
-  pages: it still waits for `session.ready` to resolve once (a `Loading` flash), then renders
-  regardless of the outcome — it is never redirected to `/login`, unlike a non-public route. This
-  matches how `/login` and `/signup` already behave, and is the smallest change that satisfies
-  "reachable without a session" without introducing a second routing-guard code path.
+- "Must render before `session.ready` resolves" (the issue's own wording) is read literally, not as
+  "eventually renders once resolved without redirecting." `/login` and `/signup` still show a brief
+  `Loading` flash while `session.refresh()` is in flight; `/docs/api` must not — a footer link
+  that only works once the session call finishes (or shows a spinner while a slow/failing network
+  resolves the session) is exactly what the raw-JSON link avoided by not touching session state at
+  all. So `/docs/api` is exempted from the main-content gate itself (the `{#if fatal} … {:else if
+  !session.ready} … {:else} children` chain), not merely added to the redirect-skip list — see
+  Design.
 
 ## The two constraints that decide the shape
 
@@ -90,8 +96,10 @@ Both from the issue, both satisfied by this design:
 
 1. **The page cannot live under `/api`.** `/docs/api` is a SvelteKit route, not proxied by
    `API_PREFIXES`, so the console SPA fallback continues to apply there as intended.
-2. **It has to be reachable without a session.** Added to `PUBLIC` in `+layout.svelte`, alongside
-   `/login`, `/signup`, `/claim`.
+2. **It has to be reachable without a session.** `/docs/api` is exempted from the routing guard's
+   redirect logic and the main-content session gate entirely (a new `UNGATED` list, not the
+   existing `PUBLIC` array — see Design), so it renders regardless of sign-in state and without
+   waiting on `session.ready`.
 
 ## Design
 
@@ -144,7 +152,44 @@ responseSchema?: string }`.
 
 ### `web/src/routes/+layout.svelte` changes
 
-- `PUBLIC` gains `/docs/api`.
+Three distinct behaviors are currently conflated in one `PUBLIC` array, and `/docs/api` needs only
+one of them — so the array is split rather than overloaded:
+
+- **`PUBLIC`** (existing name, existing purpose, unchanged list: `['/login', '/signup', '/claim']`)
+  — paths exempt from "redirect to `/login`" when signed out, *and* redirected to `/` when signed
+  in (the auth-flow pages). `/docs/api` is deliberately **not** added here: adding it would make
+  the routing effect redirect a signed-in visitor away from the page it just navigated to, which
+  is the bug the spec critique caught in the first draft.
+- **`UNGATED`** (new, one entry: `['/docs/api']`) — paths that skip the routing-guard `$effect`
+  entirely (no redirect either direction, signed in or out) *and* skip the main-content
+  `fatal` / `!session.ready` gate, rendering `{@render children()}` unconditionally. This is what
+  makes the page "render before `session.ready` resolves": it is not merely fast, it does not wait
+  on session state at all, matching the reasoning that the JSON endpoint it mirrors is
+  `Auth::Public` and untouched by session machinery.
+
+  ```svelte
+  const UNGATED = ['/docs/api'];
+  const isUngated = $derived(UNGATED.some((p) => page.url.pathname === p));
+  ```
+
+  The routing-guard `$effect` gains an early return: `if (isUngated) return;` before its existing
+  body. The main-content template becomes:
+
+  ```svelte
+  {#if isUngated}
+    {@render children()}
+  {:else if fatal}
+    ...
+  {:else if !session.ready}
+    ...
+  {:else}
+    {@render children()}
+  {/if}
+  ```
+
+  The header (org nav, sign-out button) still renders around it unchanged — those already read
+  `session.signedIn` reactively and degrade to their signed-out appearance on their own; nothing
+  about `/docs/api` needs to suppress them.
 - The footer link's `href` changes from `/api/openapi.json` to `/docs/api`; link text unchanged
   ("API reference").
 
@@ -185,6 +230,28 @@ responseSchema?: string }`.
   `catalog.rs` produces, which is the property the DoD is actually asking for — a stronger
   guarantee than a snapshot against today's specific catalog, which would need updating by hand
   every time a route is added (the exact drift the catalog/document pairing was built to prevent).
+- **Component render test — `web/src/routes/docs/api/page.render.test.ts` (new, vitest +
+  jsdom):** the pure-function test above proves data isn't lost between the fetched document and
+  the grouped structure, but not that the Svelte template itself renders every group/entry it is
+  given (a template bug — e.g. an early truncation, a stray `{#if}` — would still pass the pure
+  test). This gains one devDependency, `jsdom` (test-only, never bundled), which is the smallest
+  addition that lets a component actually mount in vitest; it deliberately does not add
+  `@testing-library/svelte` — Svelte 5's own `mount`/`unmount` (from `'svelte'`) are sufficient to
+  mount the page component against a stubbed `fetch` returning a synthetic document and read the
+  rendered DOM back with plain `document.getElementById`/`querySelectorAll`. The test:
+  - Stubs `globalThis.fetch` to resolve the same multi-tag, multi-verb fixture document used by
+    the pure-function test.
+  - Mounts `+page.svelte` into a detached container, awaits the fetch microtask, and asserts one
+    DOM element exists per fixture endpoint's `operationId` (`document.getElementById(id)`) —
+    i.e., the anchor targets deep-linking depends on are actually present, not just present in the
+    intermediate data structure.
+  - Asserts each rendered endpoint element's text content includes its `x-dark-factory-auth` value,
+    since that is the field the issue calls out as the one raw JSON buries and the one this page
+    exists to surface.
+  - This file needs the `jsdom` test environment; add `// @vitest-environment jsdom` at its top
+    (vitest's per-file pragma) rather than switching the whole suite's default environment, so
+    `worker/index.test.ts` (a Workers/service-worker environment concern, unrelated to a DOM)
+    keeps its current default.
 - `npm run check` — svelte-check + tsc must accept the new route and lib module.
 - `npm run lint` — prettier.
 - `npm test` — vitest, includes the new `openapi.test.ts`.
