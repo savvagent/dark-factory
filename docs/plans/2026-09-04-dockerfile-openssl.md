@@ -15,13 +15,14 @@ went undetected by CI; it was only caught by attempting a fresh Fly deploy.
 
 ## Spec
 
-None — this qualifies under `dark-factory-development`'s Fast-Path: Trivial Tasks criteria
-(single file, no new public interface, no schema/config/auth-spine/tenant-isolation/metering
-change, no crate-boundary change, no behavior change on a tested code path, one-sentence AC:
-"the Docker image builds successfully from current `master`").
+`docs/specs/2026-09-04-dockerfile-openssl-design.md` — read it first. This plan implements it
+exactly.
 
-Fast-path: no design spec per dark-factory-development trivial-task criteria — a Dockerfile
-build-dependency fix with a one-sentence acceptance criterion and no interface change.
+**Correction:** an earlier draft of this plan claimed fast-path eligibility. That was wrong —
+`dark-factory-development`'s fast-path criteria explicitly exclude changes to deploy/distribution
+shape, and `Dockerfile` is named explicitly. The change's *content* is trivial (one dependency
+install, no interface change), but its *surface* disqualifies the carve-out, so the design spec
+above was written and critiqued rather than skipped.
 
 ## Global Constraints
 
