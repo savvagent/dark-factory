@@ -6,9 +6,10 @@ describe('groupByTag', () => {
   it('keeps exactly one entry per path+verb pair, with nothing dropped or duplicated', () => {
     const groups = groupByTag(fixtureDoc);
     const flat = groups.flatMap((g) => g.endpoints);
-    expect(flat).toHaveLength(3);
+    expect(flat).toHaveLength(4);
     const pairs = flat.map((e) => `${e.method} ${e.path}`).sort();
     expect(pairs).toEqual([
+      'delete /api/orgs/{org}/teams/{team}',
       'get /api/orgs/{org}/repos',
       'post /api/orgs/{org}/repos',
       'post /api/orgs/{org}/webhooks'
@@ -33,7 +34,7 @@ describe('groupByTag', () => {
 
   it('sorts groups alphabetically by tag and endpoints by path then verb order', () => {
     const groups = groupByTag(fixtureDoc);
-    expect(groups.map((g) => g.tag)).toEqual(['a-brand-new-tag-nobody-has-seen', 'repos']);
+    expect(groups.map((g) => g.tag)).toEqual(['a-brand-new-tag-nobody-has-seen', 'repos', 'teams']);
 
     const repos = groups.find((g) => g.tag === 'repos');
     expect(repos?.endpoints.map((e) => e.method)).toEqual(['get', 'post']);
@@ -48,6 +49,16 @@ describe('groupByTag', () => {
     const listRepos = flat.find((e) => e.operationId === 'listRepos');
     expect(listRepos?.requestSchema).toBeUndefined();
     expect(listRepos?.responseSchema).toBe('RepoList');
+  });
+
+  it('does not mistake an error-only response for a success response schema', () => {
+    // A 204-no-body success alongside 400/401/404/500 responses that all
+    // reference `Error` — every DELETE endpoint in the real catalog is shaped
+    // this way. `responseSchema` must stay undefined, never resolve to
+    // `Error`, regardless of how a JS engine orders these numeric-looking keys.
+    const flat = groupByTag(fixtureDoc).flatMap((g) => g.endpoints);
+    const deleteTeam = flat.find((e) => e.operationId === 'deleteTeam');
+    expect(deleteTeam?.responseSchema).toBeUndefined();
   });
 });
 

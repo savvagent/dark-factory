@@ -40,6 +40,30 @@ export const fixtureDoc: OpenApiDocument = {
         responses: { '200': {} },
         'x-dark-factory-auth': 'public'
       }
+    },
+    '/api/orgs/{org}/teams/{team}': {
+      delete: {
+        operationId: 'deleteTeam',
+        summary: 'Delete a team',
+        description: 'Removes it.',
+        tags: ['teams'],
+        responses: {
+          '204': {},
+          '400': {
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } }
+          },
+          '401': {
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } }
+          },
+          '404': {
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } }
+          },
+          '500': {
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } }
+          }
+        },
+        'x-dark-factory-auth': 'org admin'
+      }
     }
   },
   components: {

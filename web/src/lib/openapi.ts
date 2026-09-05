@@ -89,8 +89,20 @@ function refName(schema?: { $ref?: string }): string | undefined {
   return i === -1 ? ref : ref.slice(i + 1);
 }
 
+/**
+ * Only the endpoint's success response can be its "response body" — `df-web`
+ * gives every endpoint `400`/`500` (and often `401`/`403`/`404`) entries that
+ * all reference the shared `Error` schema, and iterating
+ * `Object.values(operation.responses)` without filtering would visit those
+ * before (or instead of) a schema-less `2xx` success response in some
+ * engines, since integer-like object keys enumerate in ascending numeric
+ * order. Restricting to `2xx` keys is what keeps a `DELETE` endpoint with no
+ * response body (`204`, no schema) from being mislabeled as returning
+ * `Error`.
+ */
 function firstResponseSchema(operation: OpenApiOperation): string | undefined {
-  for (const response of Object.values(operation.responses ?? {})) {
+  for (const [status, response] of Object.entries(operation.responses ?? {})) {
+    if (!status.startsWith('2')) continue;
     const name = refName(response.content?.['application/json']?.schema);
     if (name) return name;
   }
