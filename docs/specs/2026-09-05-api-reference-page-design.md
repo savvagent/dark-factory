@@ -144,12 +144,14 @@ responseSchema?: string }`.
   - "Request body" / "Response body" sub-sections when `requestSchema` / `responseSchema` are
     present, each rendering `schemaSummary()`'s property list as a small table (name, type,
     required, description).
-- On mount, if `location.hash` is set and matches a rendered `id`, scroll it into view
-  (`document.getElementById(hash)?.scrollIntoView()`), after the fetch resolves and the DOM has the
-  target element — this is what makes a hard refresh onto `#operationId` work, not only
-  client-side navigation (where the browser's own hash-scroll already works because the element
-  exists at navigation time coincidentally... on a hard refresh the element doesn't exist until the
-  fetch resolves, so the browser's native scroll-on-load has nothing to find yet).
+- On mount, if `location.hash` is set and matches a rendered `id`, scroll it into view — the hash
+  includes its leading `#`, which `getElementById` never matches, so it must be stripped first:
+  `document.getElementById(location.hash.slice(1))?.scrollIntoView()`. Runs after the fetch
+  resolves and the DOM has the target element — this is what makes a hard refresh onto
+  `#operationId` work, not only client-side navigation (where the browser's own hash-scroll already
+  works because the element exists at navigation time coincidentally... on a hard refresh the
+  element doesn't exist until the fetch resolves, so the browser's native scroll-on-load has
+  nothing to find yet).
 
 ### `web/src/routes/+layout.svelte` changes
 
