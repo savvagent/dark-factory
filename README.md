@@ -39,10 +39,8 @@ Build order: [`docs/plans/2026-09-01-milestone-1.md`](docs/plans/2026-09-01-mile
 
 Milestone 1, tasks 2–12 of 13 complete. `df-server` binds a port and serves every surface
 on it, and two real coding agents have coordinated on one queue through it — see
-[`docs/clients/matrix.md`](docs/clients/matrix.md). What remains of Milestone 1 is the
-first live deploy (task 13) and CI (task 1). Milestone 2 (GitHub App + JIRA two-way sync,
-plus the console UI for it) is complete —
-[`docs/plans/2026-09-03-df-trackers.md`](docs/plans/2026-09-03-df-trackers.md).
+[`docs/clients/matrix.md`](docs/clients/matrix.md). What remains is the first live deploy
+(task 13) and CI (task 1).
 
 | Crate | State |
 |---|---|
@@ -50,8 +48,8 @@ plus the console UI for it) is complete —
 | `df-auth` | ✅ OAuth 2.1 AS, TOTP + recovery, PATs |
 | `df-mcp` | ✅ Streamable HTTP MCP, 27 tools, resource-server middleware |
 | `df-billing` | ✅ usage metering, free/billable split, tier buckets |
-| `df-trackers` | ✅ GitHub App + JIRA two-way sync (milestone 2) |
-| `df-web` | ✅ console API, session cookies, the AS's browser endpoints, tracker console |
+| `df-trackers` | ⬜ GitHub App + JIRA two-way sync (milestone 2) |
+| `df-web` | ✅ console API, session cookies, the AS's browser endpoints |
 | `df-server` | ✅ config, startup migrations, router assembly, health, deploy |
 | `web/` | ✅ SvelteKit 2 / Svelte 5 console |
 
