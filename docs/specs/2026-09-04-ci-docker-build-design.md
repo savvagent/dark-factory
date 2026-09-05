@@ -1,6 +1,6 @@
 # CI Docker image build gate design
 
-> **Status:** DRAFT — adds a build-verification job so the deploy artifact is exercised on every PR/push
+> **Status:** IMPLEMENTED — shipped in savvagent/dark-factory#39
 > **Depends on:** `docs/specs/2026-09-04-dockerfile-openssl-design.md` (the incident this closes the gap for)
 
 ## Assumptions

@@ -10,7 +10,9 @@ dev headers the container's build stage lacked.
 
 ## Status — 2026-09-04
 
-✅ Done — job committed, verified locally with `podman build`; awaiting merge for the `push`-to-`master` path to run for real.
+✅ Done — merged as savvagent/dark-factory#39. Confirmed the `push`-to-`master` path actually runs
+the build (not skipped) on the merge commit's own CI run (job ID 101232544964, `docker-build` in
+4m22s), and re-verified locally with `podman build` on the updated `master`.
 
 ## Spec
 
