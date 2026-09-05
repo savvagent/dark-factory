@@ -17,6 +17,15 @@ RUN npm run build
 # ---------------------------------------------------------------- server
 FROM rust:1-slim-bookworm AS build
 
+# webauthn-rs pulls in webauthn-attestation-ca, which links openssl (not just
+# reqwest's rustls-tls) for attestation certificate verification. openssl-sys
+# builds from source here rather than against a vendored copy, so it needs a
+# real OpenSSL and pkg-config to find it — without both, linking passkeys in
+# is a container image that cannot be built at all, not a warning.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY . .
 
