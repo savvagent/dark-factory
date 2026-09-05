@@ -8,6 +8,7 @@
   import { session } from '$lib/session.svelte';
   import Alert from '$lib/components/Alert.svelte';
   import Loading from '$lib/components/Loading.svelte';
+  import Logo from '$lib/components/Logo.svelte';
 
   let { children }: { children: Snippet } = $props();
 
@@ -107,9 +108,8 @@
 <div class="flex min-h-full flex-col">
   <header class="border-b border-edge/60 bg-surface/40">
     <div class="mx-auto flex w-full max-w-6xl items-center gap-4 px-4 py-3">
-      <a href="/" class="flex items-center gap-2 text-sm font-semibold tracking-tight">
-        <span class="inline-block size-2.5 rounded-sm bg-accent"></span>
-        dark-factory
+      <a href="/" class="flex items-center gap-2" aria-label="dark-factory">
+        <Logo class="size-6 text-accent" />
       </a>
 
       {#if session.signedIn}
