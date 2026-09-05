@@ -1,0 +1,274 @@
+# API reference page — render `/api/openapi.json` for humans
+
+## Goal
+
+Replace the footer's raw `/api/openapi.json` link with a console page, `/docs/api`, that renders
+the same document grouped by tag, with each endpoint's method, path, summary, description,
+parameters, request/response schema shape, and `x-dark-factory-auth` level visible without reading
+JSON. `/api/openapi.json` itself is untouched.
+
+## Status — 2026-09-05
+
+🚧 Not yet started.
+
+**Spec:** `docs/specs/2026-09-05-api-reference-page-design.md` — read it first. This plan
+implements it exactly.
+
+## Global Constraints
+
+- `web/` conventions: Svelte 5 runes only (`$state`/`$derived`/`$props`/`$effect`), no
+  `export let`, no Svelte 4 stores, Tailwind v4, `adapter-static` (no SvelteKit server).
+- No AI self-attribution anywhere (commits, comments, docs).
+- Run `npm run lint` (prettier) before committing any `web/` change.
+- Nothing about the deployment is baked into the bundle: the page fetches `/api/openapi.json` at
+  runtime, exactly like the MCP endpoint/scopes are read at runtime from
+  `/.well-known/oauth-protected-resource` elsewhere in this console.
+- `/docs/api` must be reachable without a session and without waiting on `session.ready` — it is
+  exempted from the routing guard via a new `UNGATED` list in `+layout.svelte`, distinct from the
+  existing `PUBLIC` list (which also redirects signed-in visitors away — `/docs/api` must not be
+  redirected either direction). See the spec's Design section for the exact `$effect` and template
+  changes.
+- This touches only `web/` — no SQL, no MCP tool, no console API route in `catalog.rs`, no
+  migration, no config surface, no server-side Rust change at all. Tenant isolation, metering, and
+  the public-interface rule (Non-Negotiable Rule 6) do not apply; no cross-org test and no
+  `df-billing::classify` step are needed. `cargo test` / `cargo clippy --all-targets -- -D
+  warnings` are run once at the end as a vacuous-pass confirmation that nothing regressed
+  server-side, not because this plan changes any Rust code.
+- Gates: `npm run check` (svelte-check + tsc over `worker/`), `npm run lint` (prettier), `npm test`
+  (vitest — gains real coverage from this change, unlike most prior `web/`-only tasks), `npm run
+  build`.
+- One new devDependency: `jsdom` (test-only, never bundled) — needed to mount a Svelte component in
+  vitest for the render-level test. No other new dependency (no `@testing-library/svelte`, no
+  API-doc renderer).
+
+## File Structure
+
+| File                                              | Responsibility                                                                                 |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `web/src/lib/openapi.ts`                           | **Create.** Pure types + `groupByTag()` + `schemaSummary()` — the data shaping the page renders. |
+| `web/src/lib/openapi.test.ts`                      | **Create.** Unit test: every fixture endpoint survives `groupByTag()` losslessly.                |
+| `web/src/routes/docs/api/+page.svelte`             | **Create.** Fetches the document, renders grouped endpoints, handles `#operationId` deep links.  |
+| `web/src/routes/docs/api/page.render.test.ts`      | **Create.** Mounts `+page.svelte` in jsdom against a stubbed fetch; asserts DOM coverage.         |
+| `web/src/routes/+layout.svelte`                    | **Modify.** Split `PUBLIC`/`UNGATED`, repoint the footer link.                                   |
+| `web/package.json`                                 | **Modify.** Add `jsdom` devDependency.                                                            |
+
+## Task Order & Rationale
+
+Two tasks. Task 1 lands the pure data layer and its unit test first (failing-test-first is
+meaningful here — the grouping function's contract is exactly what the test asserts). Task 2 builds
+the page and the layout change on top of it, because the page can't be written meaningfully without
+`groupByTag`/`schemaSummary` existing, and the layout change is small enough to land with the page
+it exists to unblock rather than as a third task.
+
+## Task 1 — `groupByTag` / `schemaSummary` and their unit test ⬜
+
+**Files:** `web/src/lib/openapi.ts` (new), `web/src/lib/openapi.test.ts` (new)
+**Interfaces:** produces `OpenApiDocument`, `EndpointEntry`, `TagGroup`, `groupByTag()`,
+`schemaSummary()` — consumed by Task 2's page component; consumes nothing (pure functions over a
+plain object).
+
+- [ ] Write the failing test first, `web/src/lib/openapi.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest';
+  import { groupByTag, schemaSummary, type OpenApiDocument } from './openapi';
+
+  const doc: OpenApiDocument = {
+    paths: {
+      '/api/orgs/{org}/repos': {
+        get: {
+          operationId: 'listRepos',
+          summary: 'List repos',
+          description: 'Every repo in the org.',
+          tags: ['repos'],
+          parameters: [{ name: 'org', in: 'path', description: 'Org slug.' }],
+          responses: { '200': { content: { 'application/json': { schema: { $ref: '#/components/schemas/RepoList' } } } } }
+        },
+        post: {
+          operationId: 'createRepo',
+          summary: 'Create a repo',
+          description: 'Register one.',
+          tags: ['repos'],
+          requestBody: { content: { 'application/json': { schema: { $ref: '#/components/schemas/CreateRepo' } } } },
+          responses: { '201': { content: { 'application/json': { schema: { $ref: '#/components/schemas/Repo' } } } } },
+          'x-dark-factory-auth': 'org admin'
+        }
+      },
+      '/api/orgs/{org}/webhooks': {
+        post: {
+          operationId: 'ingestWebhook',
+          summary: 'Ingest',
+          description: 'From a tracker.',
+          tags: ['a-brand-new-tag-nobody-has-seen'],
+          responses: { '200': {} },
+          'x-dark-factory-auth': 'public'
+        }
+      }
+    },
+    components: {
+      schemas: {
+        Repo: {
+          type: 'object',
+          properties: { id: { type: 'string' }, slug: { type: 'string', description: 'Handle.' } },
+          required: ['id', 'slug']
+        }
+      }
+    }
+  };
+
+  describe('groupByTag', () => {
+    it('keeps exactly one entry per path+verb pair, with nothing dropped or duplicated', () => {
+      const groups = groupByTag(doc);
+      const flat = groups.flatMap((g) => g.endpoints);
+      expect(flat).toHaveLength(3);
+      const pairs = flat.map((e) => `${e.method} ${e.path}`).sort();
+      expect(pairs).toEqual([
+        'get /api/orgs/{org}/repos',
+        'post /api/orgs/{org}/repos',
+        'post /api/orgs/{org}/webhooks'
+      ]);
+    });
+
+    it('preserves each entry auth level', () => {
+      const flat = groupByTag(doc).flatMap((g) => g.endpoints);
+      const createRepo = flat.find((e) => e.operationId === 'createRepo');
+      expect(createRepo?.auth).toBe('org admin');
+    });
+
+    it('gives an unrecognized tag its own group rather than dropping or misfiling it', () => {
+      const groups = groupByTag(doc);
+      const novel = groups.find((g) => g.tag === 'a-brand-new-tag-nobody-has-seen');
+      expect(novel?.endpoints).toHaveLength(1);
+    });
+  });
+
+  describe('schemaSummary', () => {
+    it('flattens top-level properties with required flags', () => {
+      const props = schemaSummary(doc, 'Repo');
+      expect(props).toEqual([
+        { name: 'id', type: 'string', description: undefined, required: true },
+        { name: 'slug', type: 'string', description: 'Handle.', required: true }
+      ]);
+    });
+
+    it('returns an empty list for a schema name that does not exist', () => {
+      expect(schemaSummary(doc, 'NoSuchSchema')).toEqual([]);
+    });
+  });
+  ```
+
+- [ ] Run `cd web && npm test -- openapi.test` — confirm it fails (module `./openapi` does not
+      exist yet).
+- [ ] Implement `web/src/lib/openapi.ts` per the spec's Design section: `OpenApiDocument` type,
+      `EndpointEntry`/`TagGroup`/`SchemaProperty` interfaces, `groupByTag()` (flatten every verb
+      present on every path into one `EndpointEntry`, group by `tags[0]` — falling back to the
+      literal string `'untagged'` if a tag is ever absent — sort groups alphabetically by tag and
+      endpoints within a group by path then by verb order `get, post, put, patch, delete`), and
+      `schemaSummary()` (resolve `components.schemas[refName]`, map `properties` to
+      `{ name, type, description, required }` using the schema's `required` array membership, `[]`
+      if the schema is missing or not an object).
+- [ ] Run `cd web && npm test -- openapi.test` — confirm it passes.
+- [ ] Run `cd web && npm run check` — confirm the new module type-checks cleanly.
+- [ ] Format and commit: `cd web && npx prettier --write src/lib/openapi.ts src/lib/openapi.test.ts`
+      then `git commit -m "web: add openapi document grouping helpers"`.
+
+## Task 2 — `/docs/api` page, layout wiring, and the render-level test ⬜
+
+**Files:** `web/src/routes/docs/api/+page.svelte` (new), `web/src/routes/docs/api/page.render.test.ts`
+(new), `web/src/routes/+layout.svelte` (modify), `web/package.json` (modify)
+**Interfaces:** consumes `groupByTag`/`schemaSummary` from Task 1; consumes `Loading`/`Alert` from
+`web/src/lib/components/`; no other route or component consumes this page.
+
+- [ ] Add the `jsdom` devDependency: `cd web && npm install --save-dev jsdom`.
+- [ ] Write the failing render test first, `web/src/routes/docs/api/page.render.test.ts`
+      (`// @vitest-environment jsdom` pragma at the top of the file):
+
+  ```ts
+  // @vitest-environment jsdom
+  import { mount, unmount } from 'svelte';
+  import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+  import Page from './+page.svelte';
+
+  const fixtureDoc = {
+    /* same shape as web/src/lib/openapi.test.ts's `doc`, reused inline or imported if that file
+       exports its fixture — at least two tags, one path with two verbs, one with an
+       x-dark-factory-auth of "org admin" and one of "public" */
+  };
+
+  describe('/docs/api page', () => {
+    let container: HTMLElement;
+
+    beforeEach(() => {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(fixtureDoc) })
+      );
+    });
+
+    afterEach(() => {
+      container.remove();
+      vi.unstubAllGlobals();
+    });
+
+    it('renders one element per fixture endpoint operationId', async () => {
+      const instance = mount(Page, { target: container });
+      await vi.waitFor(() => {
+        expect(container.querySelector('#listRepos')).not.toBeNull();
+      });
+      expect(container.querySelector('#createRepo')).not.toBeNull();
+      expect(container.querySelector('#ingestWebhook')).not.toBeNull();
+      unmount(instance);
+    });
+
+    it('surfaces the auth level in the rendered text for each endpoint', async () => {
+      const instance = mount(Page, { target: container });
+      await vi.waitFor(() => {
+        expect(container.querySelector('#createRepo')).not.toBeNull();
+      });
+      expect(container.querySelector('#createRepo')?.textContent).toContain('org admin');
+      expect(container.querySelector('#ingestWebhook')?.textContent).toContain('public');
+      unmount(instance);
+    });
+  });
+  ```
+
+- [ ] Run `cd web && npm test -- page.render` — confirm it fails (`+page.svelte` does not exist
+      yet).
+- [ ] Implement `web/src/routes/docs/api/+page.svelte` per the spec's Design section: on-mount
+      `fetch('/api/openapi.json')` → `groupByTag()` → render one `<section>` per `TagGroup` and one
+      `<article id={operationId}>` per endpoint (verb badge + path, prominent auth-level badge,
+      summary/description, parameters table when non-empty, request/response `schemaSummary()`
+      tables when present), `Loading`/`Alert` for the fetch's pending/error states, and an
+      on-mount `location.hash` scroll (`document.getElementById(hash)?.scrollIntoView()`) once the
+      fetch resolves.
+- [ ] Run `cd web && npm test -- page.render` and `npm test -- openapi.test` together — confirm
+      both pass.
+- [ ] Modify `web/src/routes/+layout.svelte` exactly per the spec's Design section: split the
+      routing-guard exemption into the existing `PUBLIC` (`['/login', '/signup', '/claim']`,
+      unchanged) and a new `UNGATED` (`['/docs/api']`); add `if (isUngated) return;` as the first
+      line of the routing-guard `$effect`; change the main-content template to
+      `{#if isUngated} {@render children()} {:else if fatal} … {:else if !session.ready} … {:else}
+      {@render children()} {/if}`; change the footer `<a>`'s `href` from `/api/openapi.json` to
+      `/docs/api`, text unchanged.
+- [ ] Run `cd web && npm run check` — confirm the new route and the layout change type-check.
+- [ ] Run `cd web && npm test` (full suite) — confirm `openapi.test.ts`, `page.render.test.ts`, and
+      the existing `worker/index.test.ts` all pass together (the `jsdom` pragma must not affect the
+      worker test's environment).
+- [ ] Run `cd web && npm run build` — confirms the SPA still builds with the new route.
+- [ ] Manual check: `cd web && npm run dev` (with `df-server` running for the API proxy), visit
+      `/docs/api` signed out and signed in, confirm groups render and the auth badge is visible;
+      confirm the footer link on `/login` points at `/docs/api` and renders there; confirm a hard
+      refresh onto `/docs/api#<a real operationId from the running server>` scrolls to that
+      endpoint.
+- [ ] Format and commit: `cd web && npx prettier --write src/routes/docs/api src/routes/+layout.svelte package.json`
+      then `git commit -m "web: render the API reference as a console page"`.
+
+## Final Verification (after both tasks)
+
+- [ ] `cd web && npm run check && npm run lint && npm test && npm run build` — all green.
+- [ ] `cargo test --workspace` and `cargo clippy --all-targets -- -D warnings` from the repo root —
+      vacuous-pass confirmation; this plan touches no Rust code.
+- [ ] Confirm `docs/specs/2026-09-05-api-reference-page-design.md`'s `> **Status:**` is `APPROVED`
+      (flip to `IMPLEMENTED` at record-as-shipped, per house style, not before merge).
