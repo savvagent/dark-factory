@@ -1,6 +1,6 @@
 # Header logo design
 
-> **Status:** DRAFT — replace the "dark-factory" wordmark in the console header with the logo mark
+> **Status:** APPROVED — replace the "dark-factory" wordmark in the console header with the logo mark
 
 ## Scope
 
@@ -28,15 +28,16 @@
 
 ## Assumptions
 
-- The mark reads clearly at a small size (roughly 20–24px tall) next to the org nav links; if it
-  did not, the fallback would be to keep it paired with a short label, which is what this design
-  does (see below) — so legibility risk is covered either way.
-- The wordmark is not dropped entirely: the header keeps a short text label ("dark-factory") next
-  to the mark, matching how the rest of the console pairs the accent dot with the name today. Pure
-  icon-only branding without any adjacent text is a bigger visual change than "adapt the logo... use
-  it instead of the text" calls for, and dropping the text would remove the only header-level
-  accessible name if the SVG were ever mis-labeled. Rationale: lower risk, satisfies "use the logo
-  instead of the accent dot" literally, keeps brand recognition during the transition.
+- The task brief is explicit: "use the logo instead of 'dark-factory' in the header" — so the
+  visible accent-dot **and** the visible "dark-factory" text are both replaced by the logo mark.
+  No visible wordmark remains next to it.
+- The mark reads clearly at header scale (roughly 20–24px tall) next to the org nav links — it is
+  a solid, simple silhouette (see `web/static/logo.svg`), not fine detail that would blur down.
+- Removing the visible text must not remove the link's accessible name. The `<a href="/">` gets an
+  explicit `aria-label="dark-factory"` (or an `sr-only` text node) so the brand name is still
+  present for screen readers and in the accessibility tree, even though nothing is visibly printed.
+  This is what keeps the header a single link with one clear purpose ("go home") while satisfying
+  the brief literally.
 - `currentColor` fill (rather than the file's hardcoded `#FFFFFF`) is used so the mark inherits the
   header's ink color instead of only rendering on a dark background, since `--color-accent` and
   `--color-ink` vary with the app's light/dark theme.
@@ -61,18 +62,16 @@ static asset for the favicon, this is a second, small copy tailored for UI scale
 </svg>
 ```
 
-`aria-hidden="true"` on the `<svg>` because the enclosing `<a>` carries the accessible name via
-adjacent text (see Assumptions) — the icon does not need to repeat it via `role="img"` +
-`aria-label`.
+`aria-hidden="true"` on the `<svg>` because the accessible name is supplied by the enclosing `<a>`
+(see Header change below) — the icon does not need to repeat it via `role="img"` + `aria-label`.
 
 ## Header change
 
 `web/src/routes/+layout.svelte`, in the header `<a href="/">`:
 
 ```svelte
-<a href="/" class="flex items-center gap-2 text-sm font-semibold tracking-tight">
-  <Logo class="size-5 text-accent" />
-  dark-factory
+<a href="/" class="flex items-center gap-2" aria-label="dark-factory">
+  <Logo class="size-6 text-accent" />
 </a>
 ```
 
@@ -84,6 +83,9 @@ Replaces:
   dark-factory
 </a>
 ```
+
+No visible text remains next to the mark — `aria-label` on the anchor is the accessible name,
+matching the brief's "use the logo instead of 'dark-factory'".
 
 ## Testing
 
