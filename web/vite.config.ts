@@ -28,6 +28,12 @@ const proxied = {
 
 export default defineConfig({
   plugins: [tailwindcss(), sveltekit()],
+  // Vitest resolves package `exports` with a "node" condition by default,
+  // which is what mounting a Svelte component needs to avoid — Svelte's
+  // package exports a server-only build under "default", and only the
+  // "browser" condition resolves to the client build that has `mount`.
+  // Scoped to `process.env.VITEST` so dev/build keep their normal resolution.
+  resolve: process.env.VITEST ? { conditions: ['browser'] } : undefined,
   server: {
     port: 5173,
     proxy: {

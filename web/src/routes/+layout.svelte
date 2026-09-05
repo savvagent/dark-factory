@@ -27,10 +27,25 @@
    * session whose address matches the one invited, so it sends the visitor to
    * sign in first. That check is what keeps a code that goes astray from being
    * a free seat.
+   *
+   * A signed-in visitor on one of these gets bounced to `/` below — they are
+   * auth *flow* pages, not places to linger once signed in.
    */
   const PUBLIC = ['/login', '/signup', '/claim'];
 
+  /**
+   * Pages that skip the routing guard entirely, in both directions — no
+   * redirect to `/login` when signed out, no redirect to `/` when signed in,
+   * and no wait on `session.ready` before rendering (see the main-content
+   * template below). `/docs/api` mirrors an `Auth::Public` server endpoint
+   * that has nothing to do with session state, so unlike `PUBLIC` above it is
+   * never redirected away from — a signed-in visitor following the footer
+   * link must land on the page, not bounce back to `/`.
+   */
+  const UNGATED = ['/docs/api'];
+
   const isPublic = $derived(PUBLIC.some((p) => page.url.pathname === p));
+  const isUngated = $derived(UNGATED.some((p) => page.url.pathname === p));
 
   $effect(() => {
     void resolve();
@@ -62,7 +77,7 @@
     // whatever org page the button was pressed on, and rewrites the destination
     // to `/login?next=/o/acme` — so someone who deliberately signed out is told
     // to "sign in to continue" and sent back where they left.
-    if (!session.ready || fatal || signingOut) return;
+    if (isUngated || !session.ready || fatal || signingOut) return;
 
     if (!session.signedIn) {
       if (!isPublic) {
@@ -150,7 +165,9 @@
   </header>
 
   <main class="mx-auto w-full max-w-6xl flex-1 px-4 py-6">
-    {#if fatal}
+    {#if isUngated}
+      {@render children()}
+    {:else if fatal}
       <Alert>
         {fatal}
         <button class="ml-2 underline" onclick={() => location.reload()}>Try again</button>
@@ -163,6 +180,6 @@
   </main>
 
   <footer class="border-t border-edge/40 px-4 py-4 text-center text-xs text-faint">
-    <a class="hover:text-muted" href="/api/openapi.json">API reference</a>
+    <a class="hover:text-muted" href="/docs/api">API reference</a>
   </footer>
 </div>
