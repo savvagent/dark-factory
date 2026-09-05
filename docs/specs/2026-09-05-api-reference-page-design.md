@@ -45,8 +45,9 @@ None — the issue's description of the current state matches the code: the foot
 - No localization. Per the issue's own note (referencing #42), the summaries/descriptions are
   English prose written for an API reader; this task explicitly leaves that question to whatever
   resolves #42 and renders the document's strings as-is, in whatever language they are written in.
-- No change to the console's routing guard structure beyond adding one path to the existing
-  `PUBLIC` array — no new bypass mechanism, no new auth concept.
+- No new *auth* concept — the routing guard gains one new list (`UNGATED`, a single-entry array)
+  purely to exempt one path from session-based gating; it introduces no new authentication or
+  authorization state, just a rendering exemption for a page that talks to no session-gated data.
 - No server-side change. `crates/df-web` gains no new route; the existing `/api/openapi.json`
   handler is the only server surface this page talks to. Consistent with constraint 2 (substrate,
   not workflow): this is a console rendering concern, not new server behavior.
