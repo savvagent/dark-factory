@@ -22,11 +22,13 @@
   rebuild from scratch on every PR otherwise, and BuildKit's GHA cache backend is the
   first-party-documented way to do this without standing up any external registry or storage.
 - Path filtering: the job runs on any push to `master`, and on PRs that touch `Dockerfile`,
-  `Cargo.toml`, `Cargo.lock`, or `web/**` — exactly the surfaces the issue names, because those
-  are the only inputs to the image build (`web/` for the console stage, `Cargo.toml`/`Cargo.lock`
-  for the dependency graph the rust stage compiles, `Dockerfile` for the build recipe itself). A
-  change to, say, `docs/**` or a test-only Rust file with no `Cargo.lock` delta gets no image
-  build — it can't affect the image.
+  `**/Cargo.toml` (root workspace manifest **and** every crate manifest under `crates/*/Cargo.toml`
+  — the workspace has seven member crates, and a per-crate manifest edit, e.g. adding a dependency
+  or feature flag inside an already-locked version range, is exactly the kind of change that broke
+  the image before without necessarily producing a `Cargo.lock` delta of its own), `Cargo.lock`, or
+  `web/**` — the surfaces the issue names, generalized to the workspace's actual manifest layout
+  rather than the root manifest alone. A change to, say, `docs/**` or a test-only Rust file with no
+  manifest/lockfile delta gets no image build — it can't affect the image.
 - The new job is independent of (does not depend on / is not depended on by) the existing `rust`
   and `web` jobs — it runs in parallel, matching this workflow's existing structure where `rust`
   and `web` already run as independent jobs with no `needs:`.
@@ -49,7 +51,10 @@
 - A new `docker-build` job in `.github/workflows/ci.yml` that builds the full multi-stage image
   (`console` → `build` → `runtime`) via `docker/build-push-action@v6` with `push: false`.
 - Path-filtered triggers: always on `push` to `master`; on `pull_request` only when the diff
-  touches `Dockerfile`, `Cargo.toml`, `Cargo.lock`, or `web/**`.
+  touches `Dockerfile`, `**/Cargo.toml` (root manifest and every `crates/*/Cargo.toml`),
+  `Cargo.lock`, or `web/**`. Adding this job introduces one new CI check name (`docker-build`) —
+  it is not, by itself, added to any required-status-check branch protection rule; that is a
+  separate repo-settings decision left to whoever administers branch protection, out of scope here.
 - GitHub Actions cache (`cache-from`/`cache-to: type=gha`) so repeated builds of an unchanged
   layer (e.g. the `console` stage's `npm ci` when only Rust source changed within a triggering
   `Cargo.lock` bump) don't pay full cost every run.
@@ -94,7 +99,7 @@ Add to `.github/workflows/ci.yml`, alongside the existing `rust` and `web` jobs:
           filters: |
             image:
               - 'Dockerfile'
-              - 'Cargo.toml'
+              - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'web/**'
 
