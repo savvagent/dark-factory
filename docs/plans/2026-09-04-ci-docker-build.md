@@ -10,7 +10,7 @@ dev headers the container's build stage lacked.
 
 ## Status — 2026-09-04
 
-⬜ Not started.
+✅ Done — job committed, verified locally with `podman build`; awaiting merge for the `push`-to-`master` path to run for real.
 
 ## Spec
 
@@ -42,7 +42,7 @@ dev headers the container's build stage lacked.
 
 Single task: this is one YAML addition to one existing file. No sequencing decision to make.
 
-## Task 1 — Add the `docker-build` CI job — ⬜
+## Task 1 — Add the `docker-build` CI job — ✅
 
 **Files:** `.github/workflows/ci.yml`
 
@@ -50,7 +50,7 @@ Single task: this is one YAML addition to one existing file. No sequencing decis
 `master`. Consumes nothing new — no new secrets, no new repo settings required (`docker/build-push-action@v6`'s GHA cache backend uses the workflow's own ambient
 `ACTIONS_CACHE_URL`/`ACTIONS_RUNTIME_TOKEN`, already available to every job).
 
-- [ ] Add the `docker-build` job to `.github/workflows/ci.yml`, placed after the existing `web`
+- [x] Add the `docker-build` job to `.github/workflows/ci.yml`, placed after the existing `web`
       job, exactly per spec §1:
       - `runs-on: ubuntu-latest`
       - `actions/checkout@v4`
@@ -66,15 +66,15 @@ Single task: this is one YAML addition to one existing file. No sequencing decis
         of break; this job proves the image itself builds)
       - the job carries **no job-level `if:`** — only its steps skip, so a PR untouched by the
         filter still reports a real (not disappeared) success, per spec §1/Error Handling
-- [ ] Validate the YAML parses: `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"`
+- [x] Validate the YAML parses: `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"`
       — expect no exception, and manually re-read the rendered job to confirm the `rust` and `web`
       jobs are byte-for-byte unchanged (no accidental reflow/indentation change from an editor).
-- [ ] Local equivalence check (no GitHub Actions runner available here): confirm the Dockerfile
+- [x] Local equivalence check (no GitHub Actions runner available here): confirm the Dockerfile
       itself still builds with the engine available on this machine — `podman build -t
       dark-factory-ci-check .` from the repo root — so a locally-detectable break isn't shipped
       inside the same PR as the new gate. Expect: build completes successfully (it already did as
       of #37's fix; this is a regression check, not new ground).
-- [ ] Format and commit: `git commit -m "ci: build the Docker image on every PR/push touching Dockerfile, Cargo manifests, or web/"`.
+- [x] Format and commit: `git commit -m "ci: build the Docker image on every PR/push touching Dockerfile, Cargo manifests, or web/"`.
       Vacuous gates, stated explicitly rather than silently skipped: `cargo test --workspace`,
       `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --all` do not apply (no Rust
       source changed); `cd web && npm run check && npm run lint && npm test && npm run build` does
@@ -83,8 +83,9 @@ Single task: this is one YAML addition to one existing file. No sequencing decis
 ## Out-of-band verification (Phase 5, step 14)
 
 - **CI** — `.github/workflows/` changed: confirm the workflow parses (done above) and that it
-  actually runs on this PR. Because this PR's own diff is `.github/workflows/ci.yml` only (not
-  `Dockerfile`/`Cargo.lock`/`web/**`), the new job will report success via its no-op path on this
+  actually runs on this PR. Because this PR's diff doesn't touch any of the filtered paths
+  (`Dockerfile`/`**/Cargo.toml`/`Cargo.lock`/`web/**` — only `.github/workflows/ci.yml` and the
+  accompanying `docs/` spec/plan), the new job will report success via its no-op path on this
   PR itself (per spec §Risks) — check the Actions run for this PR shows `docker-build` present and
   green, with its build step skipped (not run), and separately confirm via local `podman build`
   that the image itself is buildable, since this PR cannot self-exercise the "PR touching

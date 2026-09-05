@@ -180,21 +180,23 @@ per the issue's second acceptance criterion.
 - **`dorny/paths-filter` on a push event.** The action's path-filtering step is itself gated to
   `if: github.event_name == 'pull_request'`, so it never runs (and never needs a base ref to diff
   against) on `push` — the push path always builds unconditionally per the acceptance criterion.
-- **This PR itself.** Since this PR's diff is `.github/workflows/ci.yml` only, the new job will
-  report success without actually invoking a build on this PR (filter says no match). This is
-  called out explicitly in the PR body and verified out-of-band (Phase 5, step 14) by running
-  `docker build .` locally (or `podman build .`, this machine's available engine) instead of
-  relying on this PR's own check run to prove the job works end-to-end.
+- **This PR itself.** This PR's diff touches `.github/workflows/ci.yml` plus this design spec and
+  its plan under `docs/` — none of the filtered paths (`Dockerfile`, `**/Cargo.toml`, `Cargo.lock`,
+  `web/**`) — so the new job will report success without actually invoking a build on this PR
+  (filter says no match). This is called out explicitly in the PR body and verified out-of-band
+  (Phase 5, step 14) by running `docker build .` locally (or `podman build .`, this machine's
+  available engine) instead of relying on this PR's own check run to prove the job works
+  end-to-end.
 
 ## Risks & Open Questions
 
-- **This PR can't self-verify the "PR touching Dockerfile" trigger path**, since it only touches
-  the workflow file. Mitigated by local verification (`podman build -t dark-factory .`, this
-  machine's available engine — functionally equivalent to `docker build` for this Dockerfile) and
-  by the `push`-to-`master` path being unconditional, which the merge of this very PR will
-  exercise for real once it lands. Whoever authors the next PR touching `Dockerfile`/`Cargo.lock`/
-  `web/**` gets the first real end-to-end proof of the filtered path; noted for the architect
-  reviewer as an accepted gap rather than a defect.
+- **This PR can't self-verify the "PR touching Dockerfile" trigger path**, since it doesn't touch
+  any of the filtered paths itself. Mitigated by local verification (`podman build -t dark-factory
+  .`, this machine's available engine — functionally equivalent to `docker build` for this
+  Dockerfile) and by the `push`-to-`master` path being unconditional, which the merge of this very
+  PR will exercise for real once it lands. Whoever authors the next PR touching
+  `Dockerfile`/`Cargo.lock`/`web/**` gets the first real end-to-end proof of the filtered path;
+  noted for the architect reviewer as an accepted gap rather than a defect.
 - **`dorny/paths-filter@v3` is a third-party action**, not a GitHub-authored one. It's a widely
   used (thousands of dependents), narrowly-scoped action (path-diffing only, no code execution
   beyond that) and is the standard idiom for job-level path filtering since GitHub Actions has no
