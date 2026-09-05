@@ -101,3 +101,36 @@ jobs:
       - run: npm run lint
 
       - run: npm test
+
+  # Proves the deploy artifact actually builds. cargo test above can stay
+  # green while the container fails if the host has OpenSSL headers the image
+  # build stage lacks, so this job closes that gap by proving Dockerfile
+  # itself builds.
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for image-relevant changes
+        if: github.event_name == 'pull_request'
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            image:
+              - 'Dockerfile'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'web/**'
+
+      - uses: docker/setup-buildx-action@v3
+        if: github.event_name == 'push' || steps.filter.outputs.image == 'true'
+
+      - name: Build image
+        if: github.event_name == 'push' || steps.filter.outputs.image == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
