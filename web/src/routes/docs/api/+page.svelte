@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { groupByTag, schemaSummary, type OpenApiDocument, type TagGroup } from '$lib/openapi';
   import Alert from '$lib/components/Alert.svelte';
   import Loading from '$lib/components/Loading.svelte';
@@ -37,7 +38,11 @@
       // The element the hash targets doesn't exist until this render commits,
       // so a hard refresh onto `#operationId` needs its own scroll — the
       // browser's native scroll-on-load has nothing to find at load time.
-      queueMicrotask(scrollToHash);
+      // `tick()` explicitly waits for Svelte's pending DOM flush from the
+      // `groups` assignment above, rather than racing it with a bare
+      // microtask that only happens to be scheduled after Svelte's own.
+      await tick();
+      scrollToHash();
     } catch (e) {
       error = e instanceof Error ? e.message : 'The API reference could not be loaded.';
     } finally {
